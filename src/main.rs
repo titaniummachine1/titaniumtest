@@ -449,10 +449,26 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
 }
 
 // ============================================================================
-// 2. HTTP Job Coordinator & Live Dashboard
+// 2. HTTP Job Coordinator & Live Dashboard (SPRT Preemption + Relabel Queue)
 // ============================================================================
 
+struct ActiveSprtJob {
+    candidate_spec: String,
+    baseline_spec: String,
+    book_lines: Vec<String>,
+    time_ms: u64,
+    nodes: u64,
+    max_pairs: usize,
+    elo0: f64,
+    elo1: f64,
+    next_pair: usize,
+    leased_pairs: HashMap<usize, (String, u64)>,
+    tally: SprtTally,
+    finished: bool,
+}
+
 struct CoordinatorState {
+    sprt_job: Option<ActiveSprtJob>,
     relabel_bin_path: Option<String>,
     relabel_out_dir: Option<String>,
     relabel_nodes: u64,
@@ -478,6 +494,44 @@ fn run_coordinator(args: &[String]) -> ExitCode {
     let relabel_out = flag_str(args, "--relabel-out");
     let relabel_nodes = flag_u64(args, "--relabel-nodes").unwrap_or(5000);
 
+    let sprt_cand = flag_str(args, "--candidate");
+    let sprt_base = flag_str(args, "--baseline");
+    let sprt_book = flag_str(args, "--book");
+    let sprt_time = flag_u64(args, "--time-ms").unwrap_or(100);
+    let sprt_nodes = flag_u64(args, "--nodes").unwrap_or(0);
+    let sprt_max_games = flag_u64(args, "--max-games").unwrap_or(400) as usize;
+    let sprt_elo0 = flag_f64(args, "--elo0").unwrap_or(0.0);
+    let sprt_elo1 = flag_f64(args, "--elo1").unwrap_or(5.0);
+
+    let sprt_job = match (sprt_cand, sprt_base) {
+        (Some(cand), Some(base)) => {
+            let book_lines = match sprt_book {
+                Some(p) => fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("coordinator: failed to read book {p}: {e}"))
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect(),
+                None => vec![Board::start().to_string()],
+            };
+            Some(ActiveSprtJob {
+                candidate_spec: cand,
+                baseline_spec: base,
+                book_lines,
+                time_ms: sprt_time,
+                nodes: sprt_nodes,
+                max_pairs: (sprt_max_games + 1) / 2,
+                elo0: sprt_elo0,
+                elo1: sprt_elo1,
+                next_pair: 0,
+                leased_pairs: HashMap::new(),
+                tally: SprtTally::default(),
+                finished: false,
+            })
+        }
+        _ => None,
+    };
+
     let (total_positions, total_chunks, completed_chunks) = match (&relabel_bin, &relabel_out) {
         (Some(bin_p), Some(out_d)) => {
             fs::create_dir_all(out_d).expect("coordinator: create relabel-out dir");
@@ -486,8 +540,9 @@ fn run_coordinator(args: &[String]) -> ExitCode {
             let n_chunks = (n_pos + RELABEL_CHUNK_SIZE - 1) / RELABEL_CHUNK_SIZE;
             let mut done = vec![false; n_chunks];
             for cid in 0..n_chunks {
-                let p = format!("{out_d}/chunk_{cid:05}.txt");
-                if Path::new(&p).exists() {
+                let p_c = format!("{out_d}/c_{cid}.txt");
+                let p_chunk = format!("{out_d}/chunk_{cid:05}.txt");
+                if Path::new(&p_c).exists() || Path::new(&p_chunk).exists() {
                     done[cid] = true;
                 }
             }
@@ -500,10 +555,13 @@ fn run_coordinator(args: &[String]) -> ExitCode {
     println!(
         "=== TitaniumTest Coordinator ===\n\
          Listening : http://{bind_addr}\n\
-         Relabel   : {done_init}/{total_chunks} chunks done ({total_positions} positions, {relabel_nodes} nodes/pos)"
+         SPRT Job  : {}\n\
+         Relabel   : {done_init}/{total_chunks} chunks done ({total_positions} positions, {relabel_nodes} nodes/pos)",
+        if sprt_job.is_some() { "ACTIVE (preempts relabel)" } else { "NONE" }
     );
 
     let state = Arc::new(Mutex::new(CoordinatorState {
+        sprt_job,
         relabel_bin_path: relabel_bin,
         relabel_out_dir: relabel_out,
         relabel_nodes,
@@ -570,6 +628,35 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
             } else {
                 0.0
             };
+            let sprt_html = if let Some(job) = &st.sprt_job {
+                let s = job.tally.compute(job.elo0, job.elo1, 0.05, 0.05);
+                format!(
+                    "<div class='card'><h2>Active SPRT Gate ({})</h2>\
+                     <p>Candidate: <code>{}</code> vs Baseline: <code>{}</code></p>\
+                     <p>Games: <b>{} / {}</b> (+{} -{} ={}, {:.1}%)</p>\
+                     <p>Elo: <b>{:+.1} +- {:.1}</b> | LOS: <b>{:.1}%</b> | Penta: <code>{:?}</code></p>\
+                     <p>LLR: <b>{:+.2}</b> [{:.2}, {:.2}] &rarr; <b>{:?}</b></p></div>",
+                    if job.finished { "FINISHED" } else { "RUNNING - HIGH PRIORITY" },
+                    job.candidate_spec,
+                    job.baseline_spec,
+                    s.games,
+                    job.max_pairs * 2,
+                    job.tally.wins,
+                    job.tally.losses,
+                    job.tally.draws,
+                    s.score_rate * 100.0,
+                    s.elo,
+                    s.elo_ci95,
+                    s.los * 100.0,
+                    job.tally.penta,
+                    s.llr,
+                    s.lower_bound,
+                    s.upper_bound,
+                    s.verdict
+                )
+            } else {
+                "<div class='card'><h2>SPRT Gate</h2><p>No active SPRT gate.</p></div>".to_string()
+            };
             let html = format!(
                 "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='5'>\
                  <title>TitaniumTest Coordinator</title>\
@@ -577,6 +664,7 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
                  .card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px;}}\
                  h1{{color:#58a6ff;margin-top:0;}}</style></head><body>\
                  <h1>TitaniumTest Compute Network</h1>\
+                 {sprt_html}\
                  <div class='card'><h2>Relabel Queue</h2>\
                  <p>Progress: <b>{done} / {}</b> chunks ({pct:.2}%)</p>\
                  <p>In-flight leases: <b>{}</b> | Active workers: <b>{}</b> | Session completed: <b>{}</b></p>\
@@ -594,6 +682,26 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
             let now = now_epoch_secs();
             let mut st = state.lock().unwrap();
             st.workers_seen.insert(worker_id.clone(), now);
+
+            // Priority 1: Active SPRT Gate Job (preempts background relabeling)
+            if let Some(job) = &mut st.sprt_job {
+                job.leased_pairs
+                    .retain(|_, (_, ts)| now.saturating_sub(*ts) < LEASE_TTL_SECS);
+                if !job.finished && job.next_pair < job.max_pairs {
+                    let pid = job.next_pair;
+                    job.next_pair += 1;
+                    job.leased_pairs.insert(pid, (worker_id, now));
+                    let board_line = job.book_lines[pid % job.book_lines.len()].clone();
+                    let payload = format!(
+                        "SPRT {pid} {} {}\n{}\n{}\n{}\n",
+                        job.time_ms, job.nodes, job.candidate_spec, job.baseline_spec, board_line
+                    );
+                    send_http(&mut stream, 200, "text/plain", payload.as_bytes());
+                    return;
+                }
+            }
+
+            // Priority 2: Background Relabel Queue
             st.leased_chunks
                 .retain(|_, (_, ts)| now.saturating_sub(*ts) < LEASE_TTL_SECS);
 
@@ -631,6 +739,45 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
             payload.extend_from_slice(&slice);
             send_http(&mut stream, 200, "application/octet-stream", &payload);
         }
+        ("POST", "/api/submit_sprt") => {
+            let text = String::from_utf8_lossy(&body);
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if parts.len() < 4 || parts[0] != "PAIR" {
+                send_http(&mut stream, 400, "text/plain", b"ERR bad sprt report");
+                return;
+            }
+            let pid: usize = parts[1].parse().unwrap_or(usize::MAX);
+            let g1: u8 = parts[2].parse().unwrap_or(1);
+            let g2: u8 = parts[3].parse().unwrap_or(1);
+            let mut st = state.lock().unwrap();
+            if let Some(job) = &mut st.sprt_job {
+                job.leased_pairs.remove(&pid);
+                if !job.finished {
+                    job.tally.record_pair(g1, g2);
+                    let status = job.tally.compute(job.elo0, job.elo1, 0.05, 0.05);
+                    println!(
+                        "[SPRT Pair {:>3}] +{} -{} ={} ({:.1}%) | Elo {:+.1} +- {:.1} | LLR {:+.2} [{:.2}, {:.2}] | Penta {:?} -> {:?}",
+                        status.pairs,
+                        job.tally.wins,
+                        job.tally.losses,
+                        job.tally.draws,
+                        status.score_rate * 100.0,
+                        status.elo,
+                        status.elo_ci95,
+                        status.llr,
+                        status.lower_bound,
+                        status.upper_bound,
+                        job.tally.penta,
+                        status.verdict
+                    );
+                    if status.verdict != SprtVerdict::Continue || status.pairs >= job.max_pairs {
+                        job.finished = true;
+                        println!(">>> COORDINATOR SPRT FINISHED: {:?} (resuming relabel queue) <<<", status.verdict);
+                    }
+                }
+            }
+            send_http(&mut stream, 200, "text/plain", b"OK");
+        }
         ("POST", "/api/submit_relabel") => {
             let text = String::from_utf8_lossy(&body);
             let mut lines = text.lines();
@@ -656,8 +803,8 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
                 return;
             }
             if let Some(out_d) = &st.relabel_out_dir {
-                let tmp = format!("{out_d}/chunk_{cid:05}.tmp");
-                let final_p = format!("{out_d}/chunk_{cid:05}.txt");
+                let tmp = format!("{out_d}/c_{cid}.tmp");
+                let final_p = format!("{out_d}/c_{cid}.txt");
                 let mut out_str = String::with_capacity(rows.len() * 16);
                 for r in &rows {
                     out_str.push_str(r);
@@ -747,6 +894,41 @@ fn run_worker(args: &[String]) -> ExitCode {
         };
         let hdr_str = String::from_utf8_lossy(&resp[..nl_pos]);
         let hdr: Vec<&str> = hdr_str.split_whitespace().collect();
+        if hdr.len() >= 4 && hdr[0] == "SPRT" {
+            let pid: usize = hdr[1].parse().expect("pid");
+            let time_ms_val: u64 = hdr[2].parse().expect("time_ms");
+            let nodes_val: u64 = hdr[3].parse().expect("nodes");
+            let time_ms = if time_ms_val > 0 { Some(time_ms_val) } else { None };
+            let nodes = if nodes_val > 0 { Some(nodes_val) } else { None };
+            let rest = String::from_utf8_lossy(&resp[nl_pos + 1..]);
+            let lines: Vec<&str> = rest.lines().collect();
+            if lines.len() >= 3 {
+                let cand_spec = lines[0].trim();
+                let base_spec = lines[1].trim();
+                let board_line = lines[2].trim();
+                if let Some(board) = Board::from_str(board_line) {
+                    let t0 = Instant::now();
+                    let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
+                    let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
+                    let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, nodes)
+                        .expect("worker: sprt game 1");
+                    let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, nodes)
+                        .expect("worker: sprt game 2");
+                    let submit = format!("PAIR {pid} {g1} {g2}\n");
+                    match http_post(&host_port, "/api/submit_sprt", submit.as_bytes()) {
+                        Ok(r) if r == b"OK" => {
+                            println!(
+                                "[{worker_id}] completed SPRT pair {pid} (g1={g1}, g2={g2}) in {:.1}s",
+                                t0.elapsed().as_secs_f64()
+                            );
+                        }
+                        Ok(r) => eprintln!("[{worker_id}] submit SPRT {pid} rejected: {}", String::from_utf8_lossy(&r)),
+                        Err(e) => eprintln!("[{worker_id}] submit SPRT {pid} error: {e}"),
+                    }
+                }
+            }
+            continue;
+        }
         if hdr.len() >= 4 && hdr[0] == "RELABEL" {
             let cid: usize = hdr[1].parse().expect("cid");
             let count: usize = hdr[2].parse().expect("count");
