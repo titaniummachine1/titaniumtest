@@ -770,7 +770,7 @@ fn handle_http_client(mut stream: TcpStream, state: Arc<Mutex<CoordinatorState>>
                         job.tally.penta,
                         status.verdict
                     );
-                    if status.verdict != SprtVerdict::Continue || status.pairs >= job.max_pairs {
+                    if status.verdict != SprtVerdict::Continue || (status.pairs as usize) >= job.max_pairs {
                         job.finished = true;
                         println!(">>> COORDINATOR SPRT FINISHED: {:?} (resuming relabel queue) <<<", status.verdict);
                     }
