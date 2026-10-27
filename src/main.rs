@@ -12,6 +12,7 @@
 //!   titaniumtest worker --server http://127.0.0.1:8080 [--threads 4] [--worker-id NAME]
 
 mod sprt;
+mod train;
 
 use sprt::{SprtTally, SprtVerdict};
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("help");
     match sub {
         "sprt" => run_sprt_cli(&args[1..]),
+        "train" => run_train_subcmd(&args[1..]),
         "coordinator" => run_coordinator(&args[1..]),
         "worker" => run_worker(&args[1..]),
         _ => {
@@ -45,19 +47,80 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "titaniumtest — Fishtest/Fishnet-style SPRT & Teacher Relabeling System for Titanium Ataxx\n\
+        "titaniumtest — Fishtest/Fishnet/Bullet-style SPRT, Relabeling & NNUE Trainer for Titanium Ataxx\n\
          \n\
          SUBCOMMANDS:\n\
          \x20 sprt         Run a multi-threaded Pentanomial SPRT gate locally\n\
+         \x20 train        Bullet-style native Rust sparse-feature NNUE trainer (+ optional --auto-sprt)\n\
          \x20 coordinator  Start the HTTP job coordinator + live web dashboard (:8080)\n\
          \x20 worker       Connect to a coordinator and execute SPRT / relabel jobs\n\
          \n\
          EXAMPLES:\n\
          \x20 titaniumtest sprt --candidate self --baseline \"./old_titanium serve --network bundled\" \\\n\
-         \x20                   --book data/nnue/book100.txt --time-ms 100 --elo0 0 --elo1 10 --threads 4\n\
+         \x20                   --book data/nnue/book100.txt --time-ms 100 --elo0 0 --elo1 10 --hyperthread\n\
+         \x20 titaniumtest train --init bundled --bin dis_positions.bin --labels-dir out_dir --out cand.tnn --auto-sprt\n\
          \x20 titaniumtest coordinator --bind 0.0.0.0:8080 --relabel-bin dis_positions.bin --relabel-out out_dir\n\
-         \x20 titaniumtest worker --server http://127.0.0.1:8080 --threads 8"
+         \x20 titaniumtest worker --server http://127.0.0.1:8080 --hyperthread"
     );
+}
+
+fn run_train_subcmd(args: &[String]) -> ExitCode {
+    let init_spec = flag_str(args, "--init").unwrap_or_else(|| "bundled".to_string());
+    let Some(bin_path) = flag_str(args, "--bin") else {
+        eprintln!("train: --bin <dis_positions.bin> is required");
+        return ExitCode::FAILURE;
+    };
+    let Some(labels_dir) = flag_str(args, "--labels-dir") else {
+        eprintln!("train: --labels-dir <out_dir> is required");
+        return ExitCode::FAILURE;
+    };
+    let out_path = flag_str(args, "--out").unwrap_or_else(|| "nnue_candidate.tnn".to_string());
+    let epochs = flag_u64(args, "--epochs").unwrap_or(3).max(1) as usize;
+    let batch_size = flag_u64(args, "--batch-size").unwrap_or(1024).max(1) as usize;
+    let lr = flag_f64(args, "--lr").unwrap_or(0.0002) as f32;
+    let wd = flag_f64(args, "--wd").unwrap_or(0.0001) as f32;
+    let max_chunks = flag_u64(args, "--max-chunks").map(|v| v as usize);
+    let threads = resolve_threads(args);
+
+    let code = train::run_train_cli(
+        &init_spec,
+        &bin_path,
+        &labels_dir,
+        &out_path,
+        epochs,
+        batch_size,
+        lr,
+        wd,
+        threads,
+        max_chunks,
+    );
+    if code != ExitCode::SUCCESS {
+        return code;
+    }
+    if has_flag(args, "--auto-sprt") {
+        let book = flag_str(args, "--book")
+            .unwrap_or_else(|| "C:\\gitProjects\\titanium-ataxx\\data\\nnue\\book100.txt".to_string());
+        let sprt_args = vec![
+            "--candidate".to_string(),
+            out_path,
+            "--baseline".to_string(),
+            "self".to_string(),
+            "--book".to_string(),
+            book,
+            "--threads".to_string(),
+            threads.to_string(),
+            "--time-ms".to_string(),
+            flag_u64(args, "--time-ms").unwrap_or(50).to_string(),
+            "--max-games".to_string(),
+            flag_u64(args, "--max-games").unwrap_or(100).to_string(),
+            "--elo0".to_string(),
+            "0.0".to_string(),
+            "--elo1".to_string(),
+            "5.0".to_string(),
+        ];
+        return run_sprt_cli(&sprt_args);
+    }
+    ExitCode::SUCCESS
 }
 
 fn flag_str(args: &[String], name: &str) -> Option<String> {
@@ -310,6 +373,13 @@ impl PlayerSlot {
     fn create(spec: &str) -> Result<Self, String> {
         if spec == "self" {
             Ok(PlayerSlot::InProcess(Searcher::with_main_network()))
+        } else if spec.ends_with(".tnn") || spec.starts_with("tnn:") {
+            let path = spec.strip_prefix("tnn:").unwrap_or(spec);
+            let loaded = Nnue::load(path).map_err(|e| format!("load tnn '{path}': {e}"))?;
+            let leaked: &'static Nnue = Box::leak(Box::new(loaded));
+            let mut s = Searcher::new_unconfigured();
+            s.set_nnue(Some(leaked));
+            Ok(PlayerSlot::InProcess(s))
         } else {
             Ok(PlayerSlot::External(UaiEngine::spawn(spec)?))
         }
