@@ -75,6 +75,109 @@ fn flag_f64(args: &[String], name: &str) -> Option<f64> {
     flag_str(args, name).and_then(|v| v.parse().ok())
 }
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+/// Automatically hill-climbs thread count from physical cores (`logical / 2`) up to
+/// `logical` hyperthreads, stopping as soon as throughput hits diminishing returns (< 2% gain)
+/// or regresses due to SMT / L3 cache contention.
+fn autotune_threads() -> usize {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    if logical <= 2 {
+        return logical;
+    }
+    let phys = (logical / 2).max(1);
+    let step = if logical - phys >= 4 { 2 } else { 1 };
+    let mut candidates: Vec<usize> = (phys..=logical).step_by(step).collect();
+    if *candidates.last().unwrap_or(&0) != logical {
+        candidates.push(logical);
+    }
+
+    println!(
+        "[Autotune] Probing hyperthread scaling across {:?} threads (1 thread/search, parallel queues)...",
+        candidates
+    );
+    let nn = Nnue::bundled_static();
+    let probe_board = Board::start();
+    let mut best_threads = phys;
+    let mut best_nps = 0.0f64;
+
+    for &t in &candidates {
+        let stop = AtomicBool::new(false);
+        let total_nodes = std::sync::atomic::AtomicU64::new(0);
+        let t0 = Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..t {
+                let stop = &stop;
+                let total_nodes = &total_nodes;
+                sc.spawn(move || {
+                    let mut searcher = Searcher::with_tt_bits_unconfigured(18);
+                    searcher.set_nnue(Some(nn));
+                    let limits = SearchLimits {
+                        time: None,
+                        max_nodes: Some(2500),
+                        max_depth: u8::MAX,
+                    };
+                    while !stop.load(Ordering::Relaxed) {
+                        searcher.reset_for_new_game();
+                        let r = searcher.search(&probe_board, &limits);
+                        total_nodes.fetch_add(r.nodes, Ordering::Relaxed);
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(280));
+            stop.store(true, Ordering::Relaxed);
+        });
+        let elapsed = t0.elapsed().as_secs_f64().max(1e-6);
+        let nodes = total_nodes.load(Ordering::Relaxed);
+        let mnps = (nodes as f64 / elapsed) / 1_000_000.0;
+        let gain_pct = if best_nps > 0.0 {
+            (mnps - best_nps) * 100.0 / best_nps
+        } else {
+            100.0
+        };
+        println!("  -> {t:>2} threads: {mnps:>6.2} Mnps ({gain_pct:+.1}%)");
+
+        if best_nps == 0.0 {
+            best_nps = mnps;
+            best_threads = t;
+        } else if gain_pct >= 2.0 {
+            best_nps = mnps;
+            best_threads = t;
+        } else {
+            println!(
+                "[Autotune] Diminishing returns / contention at {t} threads ({gain_pct:+.1}%); locking best={best_threads} threads ({best_nps:.2} Mnps)."
+            );
+            return best_threads;
+        }
+    }
+    println!(
+        "[Autotune] Locked optimal thread count: {best_threads} threads ({best_nps:.2} Mnps)."
+    );
+    best_threads
+}
+
+/// Resolves worker concurrency:
+/// - Explicit `--threads N` overrides everything.
+/// - `--hyperthread` / `--autotune` runs the hill-climbing throughput probe.
+/// - Otherwise defaults to `std::thread::available_parallelism()`.
+fn resolve_threads(args: &[String]) -> usize {
+    if let Some(t) = flag_u64(args, "--threads") {
+        return t.max(1) as usize;
+    }
+    if has_flag(args, "--hyperthread") || has_flag(args, "--autotune") {
+        return autotune_threads();
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1)
+}
+
 // ============================================================================
 // UAI External Engine Process Driver
 // ============================================================================
@@ -316,7 +419,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let elo0 = flag_f64(args, "--elo0").unwrap_or(0.0);
     let elo1 = flag_f64(args, "--elo1").unwrap_or(10.0);
     let max_games = flag_u64(args, "--max-games").unwrap_or(200) as usize;
-    let threads = flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
+    let threads = resolve_threads(args);
     let out_path = flag_str(args, "--out");
 
     let book_boards: Vec<Board> = match &book_path {
@@ -867,13 +970,53 @@ fn http_post(host_port: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String
     Ok(resp[sep + 4..].to_vec())
 }
 
+fn execute_sprt_pair_payload(
+    worker_id: &str,
+    host_port: &str,
+    hdr: &[&str],
+    body_after_nl: &[u8],
+) {
+    let pid: usize = hdr[1].parse().expect("pid");
+    let time_ms_val: u64 = hdr[2].parse().expect("time_ms");
+    let nodes_val: u64 = hdr[3].parse().expect("nodes");
+    let time_ms = if time_ms_val > 0 { Some(time_ms_val) } else { None };
+    let nodes = if nodes_val > 0 { Some(nodes_val) } else { None };
+    let rest = String::from_utf8_lossy(body_after_nl);
+    let lines: Vec<&str> = rest.lines().collect();
+    if lines.len() >= 3 {
+        let cand_spec = lines[0].trim();
+        let base_spec = lines[1].trim();
+        let board_line = lines[2].trim();
+        if let Some(board) = Board::from_str(board_line) {
+            let t0 = Instant::now();
+            let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
+            let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
+            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, nodes)
+                .expect("worker: sprt game 1");
+            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, nodes)
+                .expect("worker: sprt game 2");
+            let submit = format!("PAIR {pid} {g1} {g2}\n");
+            match http_post(host_port, "/api/submit_sprt", submit.as_bytes()) {
+                Ok(r) if r == b"OK" => {
+                    println!(
+                        "[{worker_id}] completed SPRT pair {pid} (g1={g1}, g2={g2}) in {:.1}s",
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                Ok(r) => eprintln!("[{worker_id}] submit SPRT {pid} rejected: {}", String::from_utf8_lossy(&r)),
+                Err(e) => eprintln!("[{worker_id}] submit SPRT {pid} error: {e}"),
+            }
+        }
+    }
+}
+
 fn run_worker(args: &[String]) -> ExitCode {
     let server = flag_str(args, "--server").unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let threads = flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
+    let threads = resolve_threads(args);
     let worker_id = flag_str(args, "--worker-id").unwrap_or_else(|| format!("worker-{}", std::process::id()));
     let host_port = parse_host_port(&server);
 
-    println!("=== TitaniumTest Worker ({worker_id}) -> {host_port} ({threads} threads) ===");
+    println!("=== TitaniumTest Worker ({worker_id}) -> {host_port} ({threads} parallel threads, 1 thread/search) ===");
     let nn = Nnue::bundled_static();
 
     loop {
@@ -895,38 +1038,39 @@ fn run_worker(args: &[String]) -> ExitCode {
         let hdr_str = String::from_utf8_lossy(&resp[..nl_pos]);
         let hdr: Vec<&str> = hdr_str.split_whitespace().collect();
         if hdr.len() >= 4 && hdr[0] == "SPRT" {
-            let pid: usize = hdr[1].parse().expect("pid");
-            let time_ms_val: u64 = hdr[2].parse().expect("time_ms");
-            let nodes_val: u64 = hdr[3].parse().expect("nodes");
-            let time_ms = if time_ms_val > 0 { Some(time_ms_val) } else { None };
-            let nodes = if nodes_val > 0 { Some(nodes_val) } else { None };
-            let rest = String::from_utf8_lossy(&resp[nl_pos + 1..]);
-            let lines: Vec<&str> = rest.lines().collect();
-            if lines.len() >= 3 {
-                let cand_spec = lines[0].trim();
-                let base_spec = lines[1].trim();
-                let board_line = lines[2].trim();
-                if let Some(board) = Board::from_str(board_line) {
-                    let t0 = Instant::now();
-                    let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
-                    let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
-                    let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, nodes)
-                        .expect("worker: sprt game 1");
-                    let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, nodes)
-                        .expect("worker: sprt game 2");
-                    let submit = format!("PAIR {pid} {g1} {g2}\n");
-                    match http_post(&host_port, "/api/submit_sprt", submit.as_bytes()) {
-                        Ok(r) if r == b"OK" => {
-                            println!(
-                                "[{worker_id}] completed SPRT pair {pid} (g1={g1}, g2={g2}) in {:.1}s",
-                                t0.elapsed().as_secs_f64()
-                            );
+            // Drain SPRT pairs across all `threads` concurrently until the SPRT job finishes!
+            std::thread::scope(|sc| {
+                let first_resp = &resp;
+                let host_port = &host_port;
+                let worker_id = &worker_id;
+                sc.spawn(move || {
+                    let h_str = String::from_utf8_lossy(&first_resp[..nl_pos]);
+                    let h_parts: Vec<&str> = h_str.split_whitespace().collect();
+                    execute_sprt_pair_payload(worker_id, host_port, &h_parts, &first_resp[nl_pos + 1..]);
+                });
+                for tid in 0..threads {
+                    let host_port = &host_port;
+                    let worker_id = &worker_id;
+                    sc.spawn(move || {
+                        let sub_id = format!("{worker_id}-t{tid}");
+                        loop {
+                            let Ok(r) = http_post(host_port, "/api/lease", sub_id.as_bytes()) else {
+                                break;
+                            };
+                            let Some(nl) = r.iter().position(|&b| b == b'\n') else {
+                                break;
+                            };
+                            let hs = String::from_utf8_lossy(&r[..nl]);
+                            let hp: Vec<&str> = hs.split_whitespace().collect();
+                            if hp.len() >= 4 && hp[0] == "SPRT" {
+                                execute_sprt_pair_payload(&sub_id, host_port, &hp, &r[nl + 1..]);
+                            } else {
+                                break;
+                            }
                         }
-                        Ok(r) => eprintln!("[{worker_id}] submit SPRT {pid} rejected: {}", String::from_utf8_lossy(&r)),
-                        Err(e) => eprintln!("[{worker_id}] submit SPRT {pid} error: {e}"),
-                    }
+                    });
                 }
-            }
+            });
             continue;
         }
         if hdr.len() >= 4 && hdr[0] == "RELABEL" {
