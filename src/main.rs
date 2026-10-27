@@ -1039,22 +1039,20 @@ fn run_worker(args: &[String]) -> ExitCode {
         let hdr: Vec<&str> = hdr_str.split_whitespace().collect();
         if hdr.len() >= 4 && hdr[0] == "SPRT" {
             // Drain SPRT pairs across all `threads` concurrently until the SPRT job finishes!
+            let first_resp = &resp;
+            let host_port_ref = host_port.as_str();
+            let worker_id_ref = worker_id.as_str();
             std::thread::scope(|sc| {
-                let first_resp = &resp;
-                let host_port = &host_port;
-                let worker_id = &worker_id;
                 sc.spawn(move || {
                     let h_str = String::from_utf8_lossy(&first_resp[..nl_pos]);
                     let h_parts: Vec<&str> = h_str.split_whitespace().collect();
-                    execute_sprt_pair_payload(worker_id, host_port, &h_parts, &first_resp[nl_pos + 1..]);
+                    execute_sprt_pair_payload(worker_id_ref, host_port_ref, &h_parts, &first_resp[nl_pos + 1..]);
                 });
                 for tid in 0..threads {
-                    let host_port = &host_port;
-                    let worker_id = &worker_id;
                     sc.spawn(move || {
-                        let sub_id = format!("{worker_id}-t{tid}");
+                        let sub_id = format!("{worker_id_ref}-t{tid}");
                         loop {
-                            let Ok(r) = http_post(host_port, "/api/lease", sub_id.as_bytes()) else {
+                            let Ok(r) = http_post(host_port_ref, "/api/lease", sub_id.as_bytes()) else {
                                 break;
                             };
                             let Some(nl) = r.iter().position(|&b| b == b'\n') else {
@@ -1063,7 +1061,7 @@ fn run_worker(args: &[String]) -> ExitCode {
                             let hs = String::from_utf8_lossy(&r[..nl]);
                             let hp: Vec<&str> = hs.split_whitespace().collect();
                             if hp.len() >= 4 && hp[0] == "SPRT" {
-                                execute_sprt_pair_payload(&sub_id, host_port, &hp, &r[nl + 1..]);
+                                execute_sprt_pair_payload(&sub_id, host_port_ref, &hp, &r[nl + 1..]);
                             } else {
                                 break;
                             }

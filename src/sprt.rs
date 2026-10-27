@@ -85,15 +85,16 @@ impl SprtTally {
         let clamped_s = score.clamp(1e-6, 1.0 - 1e-6);
         let elo = -400.0 * (1.0 / clamped_s - 1.0).log10();
 
-        // Pentanomial mean and variance (Stockfish Fishtest formulation)
+        // Pentanomial mean and variance (Stockfish Fishtest regularized formulation)
         let (elo_ci95, los, llr) = if total_pairs >= 2 {
             let n_p = total_pairs as f64;
+            let denom = n_p + 0.25;
             let probs: [f64; 5] = [
-                self.penta[0] as f64 / n_p,
-                self.penta[1] as f64 / n_p,
-                self.penta[2] as f64 / n_p,
-                self.penta[3] as f64 / n_p,
-                self.penta[4] as f64 / n_p,
+                (self.penta[0] as f64 + 0.05) / denom,
+                (self.penta[1] as f64 + 0.05) / denom,
+                (self.penta[2] as f64 + 0.05) / denom,
+                (self.penta[3] as f64 + 0.05) / denom,
+                (self.penta[4] as f64 + 0.05) / denom,
             ];
             let values: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
             let mu: f64 = probs.iter().zip(values.iter()).map(|(p, v)| p * v).sum();
@@ -102,7 +103,7 @@ impl SprtTally {
                 .zip(values.iter())
                 .map(|(p, v)| p * (v - mu) * (v - mu))
                 .sum::<f64>()
-                .max(1e-6);
+                .max(1e-4);
             let sigma_pair = (var / n_p).sqrt();
 
             let s_hi = (mu + 1.95996 * sigma_pair).clamp(1e-6, 1.0 - 1e-6);
@@ -116,14 +117,15 @@ impl SprtTally {
 
             let s0 = 1.0 / (1.0 + 10.0f64.powf(-elo0 / 400.0));
             let s1 = 1.0 / (1.0 + 10.0f64.powf(-elo1 / 400.0));
-            // Gaussian/Brownian approximation of LLR on pentanomial variance (exact Fishtest asymptotic LLR)
             let llr_val = n_p * ((mu - s0) * (mu - s0) - (mu - s1) * (mu - s1)) * 0.5 / var;
             (ci95, los_val, llr_val)
         } else {
             (0.0, 0.5, 0.0)
         };
 
-        let verdict = if llr >= upper_bound {
+        let verdict = if total_pairs < 8 {
+            SprtVerdict::Continue
+        } else if llr >= upper_bound {
             SprtVerdict::Pass
         } else if llr <= lower_bound {
             SprtVerdict::Fail
