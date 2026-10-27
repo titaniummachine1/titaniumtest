@@ -163,8 +163,9 @@ fn autotune_threads() -> usize {
 
 /// Resolves worker concurrency:
 /// - Explicit `--threads N` overrides everything.
-/// - `--hyperthread` / `--autotune` runs the hill-climbing throughput probe.
-/// - Otherwise defaults to `std::thread::available_parallelism()`.
+/// - `--hyperthread` / `--autotune` runs the hill-climbing throughput probe into the SMT range.
+/// - Otherwise defaults safely to physical cores (`(logical / 2).max(1)`) so hyperthreading is never
+///   used unless explicitly requested.
 fn resolve_threads(args: &[String]) -> usize {
     if let Some(t) = flag_u64(args, "--threads") {
         return t.max(1) as usize;
@@ -172,10 +173,11 @@ fn resolve_threads(args: &[String]) -> usize {
     if has_flag(args, "--hyperthread") || has_flag(args, "--autotune") {
         return autotune_threads();
     }
-    std::thread::available_parallelism()
+    let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .max(1)
+        .max(1);
+    (logical / 2).max(1)
 }
 
 // ============================================================================
