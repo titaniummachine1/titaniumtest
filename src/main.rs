@@ -36,6 +36,7 @@ fn main() -> ExitCode {
     match sub {
         "sprt" => run_sprt_cli(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
+        "relabel" => run_relabel_local(&args[1..]),
         "coordinator" => run_coordinator(&args[1..]),
         "worker" => run_worker(&args[1..]),
         _ => {
@@ -51,6 +52,7 @@ fn print_help() {
          \n\
          SUBCOMMANDS:\n\
          \x20 sprt         Run a multi-threaded Pentanomial SPRT gate locally\n\
+         \x20 relabel      Zero-overhead persistent multi-threaded local relabeler (reads .bin once!)\n\
          \x20 train        Bullet-style native Rust sparse-feature NNUE trainer (+ optional --auto-sprt)\n\
          \x20 coordinator  Start the HTTP job coordinator + live web dashboard (:8080)\n\
          \x20 worker       Connect to a coordinator and execute SPRT / relabel jobs\n\
@@ -58,10 +60,113 @@ fn print_help() {
          EXAMPLES:\n\
          \x20 titaniumtest sprt --candidate self --baseline \"./old_titanium serve --network bundled\" \\\n\
          \x20                   --book data/nnue/book100.txt --time-ms 100 --elo0 0 --elo1 10 --hyperthread\n\
+         \x20 titaniumtest relabel --bin dis_positions.bin --out out_dir --nodes 5000 --hyperthread\n\
          \x20 titaniumtest train --init bundled --bin dis_positions.bin --labels-dir out_dir --out cand.tnn --auto-sprt\n\
          \x20 titaniumtest coordinator --bind 0.0.0.0:8080 --relabel-bin dis_positions.bin --relabel-out out_dir\n\
          \x20 titaniumtest worker --server http://127.0.0.1:8080 --hyperthread"
     );
+}
+
+fn run_relabel_local(args: &[String]) -> ExitCode {
+    let Some(bin_path) = flag_str(args, "--bin") else {
+        eprintln!("relabel: --bin <dis_positions.bin> is required");
+        return ExitCode::FAILURE;
+    };
+    let Some(out_dir) = flag_str(args, "--out") else {
+        eprintln!("relabel: --out <out_dir> is required");
+        return ExitCode::FAILURE;
+    };
+    let nodes = flag_u64(args, "--nodes").unwrap_or(5000);
+    let threads = resolve_threads(args);
+
+    fs::create_dir_all(&out_dir).expect("relabel: create out_dir");
+    let data = fs::read(&bin_path).unwrap_or_else(|e| panic!("relabel: read {bin_path}: {e}"));
+    let total_rows = data.len() / 25;
+    let total_chunks = (total_rows + RELABEL_CHUNK_SIZE - 1) / RELABEL_CHUNK_SIZE;
+
+    let mut todo_chunks = Vec::new();
+    for cid in 0..total_chunks {
+        let p_c = format!("{out_dir}/c_{cid}.txt");
+        if !Path::new(&p_c).exists() {
+            todo_chunks.push(cid);
+        }
+    }
+    let done_init = total_chunks - todo_chunks.len();
+    println!(
+        "=== TitaniumTest Persistent Relabeler ===\n\
+         Bin File : {bin_path} ({total_rows} rows, {:.1} MB loaded ONCE in RAM)\n\
+         Out Dir  : {out_dir}\n\
+         Progress : {done_init}/{total_chunks} chunks already done ({} remaining)\n\
+         Config   : {nodes} nodes/pos, {threads} persistent Searcher threads (1 thread/search)",
+        data.len() as f64 / 1_048_576.0,
+        todo_chunks.len()
+    );
+
+    let nn = Nnue::bundled_static();
+    let t0 = Instant::now();
+    for (k, &cid) in todo_chunks.iter().enumerate() {
+        let p_c = format!("{out_dir}/c_{cid}.txt");
+        if Path::new(&p_c).exists() {
+            continue;
+        }
+        let lo = cid * RELABEL_CHUNK_SIZE;
+        let hi = ((cid + 1) * RELABEL_CHUNK_SIZE).min(total_rows);
+        let count = hi.saturating_sub(lo);
+        let results: Vec<Mutex<(i32, u32, u64)>> = (0..count).map(|_| Mutex::new((0, 0, 0))).collect();
+        let next_idx = AtomicUsize::new(0);
+        let t_chunk = Instant::now();
+
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                let data_ref = &data;
+                let results_ref = &results;
+                let next_idx_ref = &next_idx;
+                sc.spawn(move || {
+                    let mut searcher = Searcher::with_tt_bits_unconfigured(18);
+                    searcher.set_nnue(Some(nn));
+                    let limits = SearchLimits {
+                        time: None,
+                        max_nodes: Some(nodes),
+                        max_depth: u8::MAX,
+                    };
+                    loop {
+                        let i = next_idx_ref.fetch_add(32, Ordering::Relaxed);
+                        if i >= count {
+                            break;
+                        }
+                        for j in i..(i + 32).min(count) {
+                            let row = lo + j;
+                            let rec = &data_ref[row * 25..row * 25 + 25];
+                            let u = |off: usize| u64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
+                            let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
+                            searcher.reset_for_new_game();
+                            let r = searcher.search(&b, &limits);
+                            *results_ref[j].lock().unwrap() = (r.score, r.depth, r.nodes);
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut out_str = String::with_capacity(count * 16);
+        for slot in &results {
+            let (sc, d, n) = *slot.lock().unwrap();
+            out_str.push_str(&format!("{sc} {d} {n}\n"));
+        }
+        let tmp_p = format!("{out_dir}/c_{cid}.tmp");
+        fs::write(&tmp_p, out_str).expect("write tmp chunk");
+        fs::rename(&tmp_p, &p_c).expect("rename final chunk");
+
+        let dt = t_chunk.elapsed().as_secs_f64();
+        let total_done = done_init + k + 1;
+        println!(
+            "[Chunk {cid:>4} | {total_done}/{total_chunks} ({:.1}%)] {count} pos in {dt:.1}s ({:.0} pos/s, elapsed {:.1}m)",
+            total_done as f64 * 100.0 / total_chunks as f64,
+            count as f64 / dt.max(1e-6),
+            t0.elapsed().as_secs_f64() / 60.0
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_train_subcmd(args: &[String]) -> ExitCode {
