@@ -526,8 +526,11 @@ fn play_single_game(
     candidate_is_black: bool,
     cand: &mut PlayerSlot,
     base: &mut PlayerSlot,
-    time_ms: Option<u64>,
+    cand_time_ms: Option<u64>,
+    base_time_ms: Option<u64>,
     nodes: Option<u64>,
+    cand_reset_every_move: bool,
+    base_reset_every_move: bool,
 ) -> Result<(u8, u32, u32, u16), String> {
     cand.reset()?;
     base.reset()?;
@@ -542,9 +545,15 @@ fn play_single_game(
         }
         let cand_turn = (side == 0) == candidate_is_black;
         let mv = if cand_turn {
-            cand.best_move(&b, time_ms, nodes)?
+            if cand_reset_every_move {
+                cand.reset()?;
+            }
+            cand.best_move(&b, cand_time_ms, nodes)?
         } else {
-            base.best_move(&b, time_ms, nodes)?
+            if base_reset_every_move {
+                base.reset()?;
+            }
+            base.best_move(&b, base_time_ms, nodes)?
         };
         match mv {
             Some(m) => {
@@ -593,6 +602,10 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     } else {
         time_ms
     };
+    let cand_time_ms = flag_u64(args, "--cand-time-ms").or(time_ms);
+    let base_time_ms = flag_u64(args, "--base-time-ms").or(time_ms);
+    let cand_reset_every_move = has_flag(args, "--cand-reset-every-move");
+    let base_reset_every_move = has_flag(args, "--base-reset-every-move");
     let elo0 = flag_f64(args, "--elo0").unwrap_or(0.0);
     let elo1 = flag_f64(args, "--elo1").unwrap_or(10.0);
     let max_games = flag_u64(args, "--max-games").unwrap_or(200) as usize;
@@ -617,9 +630,9 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let max_pairs = (max_games + 1) / 2;
     println!(
         "=== TitaniumTest SPRT Gate ===\n\
-         Candidate : {cand_spec}\n\
-         Baseline  : {base_spec}\n\
-         Limits    : time_ms={time_ms:?}, nodes={nodes:?}, threads={threads}\n\
+         Candidate : {cand_spec} (time_ms={cand_time_ms:?}, reset_every_move={cand_reset_every_move})\n\
+         Baseline  : {base_spec} (time_ms={base_time_ms:?}, reset_every_move={base_reset_every_move})\n\
+         Limits    : nodes={nodes:?}, threads={threads}\n\
          SPRT      : elo0={elo0:.1}, elo1={elo1:.1} (alpha=0.05, beta=0.05, bounds [-2.94, +2.94])\n\
          Book      : {} positions (max {max_pairs} pairs = {} games)\n",
         book_boards.len(),
@@ -654,13 +667,33 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         break;
                     }
                     let board = &book_boards[pair_idx % book_boards.len()];
-                    let (g1, b1, w1, p1) = play_single_game(board, true, &mut cand, &mut base, time_ms, nodes)
-                        .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 1 failed: {e}"));
+                    let (g1, b1, w1, p1) = play_single_game(
+                        board,
+                        true,
+                        &mut cand,
+                        &mut base,
+                        cand_time_ms,
+                        base_time_ms,
+                        nodes,
+                        cand_reset_every_move,
+                        base_reset_every_move,
+                    )
+                    .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 1 failed: {e}"));
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    let (g2, b2, w2, p2) = play_single_game(board, false, &mut cand, &mut base, time_ms, nodes)
-                        .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 2 failed: {e}"));
+                    let (g2, b2, w2, p2) = play_single_game(
+                        board,
+                        false,
+                        &mut cand,
+                        &mut base,
+                        cand_time_ms,
+                        base_time_ms,
+                        nodes,
+                        cand_reset_every_move,
+                        base_reset_every_move,
+                    )
+                    .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 2 failed: {e}"));
 
                     let mut guard = tally.lock().unwrap();
                     guard.record_pair(g1, g2);
@@ -1245,9 +1278,9 @@ fn execute_sprt_pair_payload(
             let t0 = Instant::now();
             let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
             let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
-            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, nodes)
+            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, time_ms, nodes, false, false)
                 .expect("worker: sprt game 1");
-            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, nodes)
+            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, time_ms, nodes, false, false)
                 .expect("worker: sprt game 2");
             let submit = format!("PAIR {pid} {g1} {g2}\n");
             match http_post(host_port, "/api/submit_sprt", submit.as_bytes()) {
