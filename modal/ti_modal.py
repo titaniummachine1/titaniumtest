@@ -1,12 +1,17 @@
-"""Thin Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs `ti`
-commands; all training logic is in the Rust hub. Cost rules (engine repo docs/MODAL.md): one container, L4,
-hard timeout, $30/month cap.
+"""The ONE Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs a
+`ti` command line in it; all logic (training, export, parity, preflight) is in the Rust hub. A new job = new `ti`
+arguments or a new `ti` subcommand, never a new script. Drive it with `ti train modal ...` (src/modal.rs), not by hand.
 
-    python -m modal run modal/ti_modal.py::bench      # GPU parity + throughput smoke on the small val file (no big upload)
+Cost rules (engine repo docs/MODAL.md): one container, hard `timeout` around the command, GPU fallback list, $30/month cap.
 
-The image compiles `ti --features cuda` once; Modal caches the layer until the sources change.
-The hub is built from a `git archive` snapshot of the committed HEAD, never from the live folder: an edit during upload
-aborts the build (2026-10-31), the live `.cargo/config.toml` points at a Windows path, and a run must map to a git ref.
+Layout on the Volume `ti-data`:   /vol/data/*.tdat|.manifest.json   packed datasets (uploaded ONCE, `ti train modal put`)
+                                  /vol/nets/*.tnn                    init nets
+                                  /vol/runs/<tag>/                   outputs of a run (`ti train modal fetch --tag`)
+
+Image: engine crate + nets -> dependency layer (hub Cargo.toml/lock + dummy main: bullet, flate2, CUDA build) -> hub src.
+The dependency layer is cached by Modal until Cargo.toml/Cargo.lock/engine change, so a hub source edit rebuilds only `ti`.
+The hub is built from a `git archive` snapshot of the committed HEAD (an edit during upload aborts the build; a run
+must map to a git ref); uncommitted changes are NOT shipped (a warning is printed).
 """
 import os
 
@@ -14,9 +19,11 @@ import modal
 
 HUB_REPO = r"C:\gitProjects\titaniumtest"
 ENGINE = r"C:\gitProjects\hub-ataxx"  # engine crate the hub is patched to locally (see .cargo/config.toml)
-PACKED = r"C:\gitProjects\titanium-ataxx\data\nnue\packed"
 SNAP_ROOT = r"C:\gitProjects\logs\ti_snap"
 PATCH = '[patch."https://github.com/titaniummachine1/titanium-ataxx"]\ntitanium = { path = "/src/engine/crates/titanium" }\n'
+CPU = float(os.environ.get("TI_CPU", "4"))  # vCPUs of the container (loader threads); the loader may be the cap, see REVIEW_NOTES N4
+RUSTFLAGS = "-C target-cpu=x86-64-v3 -L /usr/local/cuda/lib64/stubs"
+BUILD = "cd /src/hub && CUDA_PATH=/usr/local/cuda RUSTFLAGS='%s' $HOME/.cargo/bin/cargo build --release --features cuda" % RUSTFLAGS
 
 
 def _snapshot():
@@ -51,14 +58,19 @@ image = (
     .add_local_dir(ENGINE + r"\crates\titanium", "/src/engine/crates/titanium", copy=True, ignore=["target"])
     .add_local_file(ENGINE + r"\data\nnue\nnue_main.tnn", "/src/engine/data/nnue/nnue_main.tnn", copy=True)
     .add_local_file(ENGINE + r"\data\nnue\fut_small.tsn", "/src/engine/data/nnue/fut_small.tsn", copy=True)
-    .add_local_dir(HUB, "/src/hub", copy=True, ignore=["target"])
+    # dependency layer: only the manifest + a dummy main, so bullet/CUDA/flate2 are compiled once and cached
+    .add_local_file(HUB + r"\Cargo.toml", "/src/hub/Cargo.toml", copy=True)
+    .add_local_file(HUB + r"\Cargo.lock", "/src/hub/Cargo.lock", copy=True)
+    .add_local_file(HUB + r"\.cargo\config.toml", "/src/hub/.cargo/config.toml", copy=True)
     .run_commands(
-        "cd /src/hub && CUDA_PATH=/usr/local/cuda RUSTFLAGS='-C target-cpu=x86-64-v3 -L /usr/local/cuda/lib64/stubs' "
-        "$HOME/.cargo/bin/cargo build --release --features cuda && cp target/release/ti /usr/local/bin/ti"
+        "mkdir -p /src/hub/src && echo 'fn main(){}' > /src/hub/src/main.rs",
+        BUILD,
+        "rm -rf /src/hub/src /src/hub/target/release/ti /src/hub/target/release/deps/ti-* /src/hub/target/release/.fingerprint/titanium-hub-*",
     )
-    .add_local_file(PACKED + r"\val_v9.tdat", "/data/val_v9.tdat")
-    .add_local_file(PACKED + r"\val_v9.manifest.json", "/data/val_v9.manifest.json")
+    .add_local_dir(HUB + r"\src", "/src/hub/src", copy=True)
+    .run_commands(BUILD + " && cp target/release/ti /usr/local/bin/ti")
 )
+vol = modal.Volume.from_name("ti-data", create_if_missing=True)
 app = modal.App("ti-train", image=image)
 
 
@@ -73,21 +85,22 @@ def sh(cmd):
     return r.returncode
 
 
-# GPU fallback list: L4 queues sometimes (2026-10-31: 6+ min); T4 is cheapest, the net is tiny. Modal tries them in order.
-@app.function(gpu=["L4", "T4", "A10G"], cpu=4.0, memory=16384, timeout=40 * 60)
-def bench():
-    sh("nvidia-smi --query-gpu=name,memory.total --format=csv; nproc; grep -m1 'model name' /proc/cpuinfo")
-    net = "/src/engine/data/nnue/nnue_main.tnn"
-    if sh("ti train gpu-parity --init %s --tdat /data/val_v9 --n 512" % net) != 0:
-        return "PARITY FAILED"
-    sh("ti train check --data /data/val_v9 --val /data/val_v9 --init %s" % net)
-    for threads in (4, 8):
-        sh("ti train run --backend cuda --data /data/val_v9 --val /data/val_v9 --init %s --out /tmp/b%d "
-           "--bs 16384 --steps 600 --eval-every 200 --lr 1e-4 --lr-min 1e-5 --warmup 50 --threads %d --val-rows 16384 --ram"
-           % (net, threads, threads))
-    return "done"
+# GPU fallback list: L4 queues sometimes (2026-10-31: 6+ min); the net is tiny so any of them is enough. Memory: the whole
+# training .tdat (1.4 GB) lives in RAM (`--ram`), 16 GiB is plenty.
+@app.function(gpu=["L4", "T4", "A10G"], cpu=CPU, memory=16384, timeout=3 * 3600, volumes={"/vol": vol})
+def run(tag: str, args: str, timeout_min: int = 30) -> int:
+    """Run `ti <args>` under a hard `timeout`; outputs belong in /vol/runs/<tag> (the caller puts --out there)."""
+    sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; nproc")
+    os.makedirs("/vol/runs/%s" % tag, exist_ok=True)
+    rc = sh("timeout %dm ti %s" % (timeout_min, args))
+    if rc == 124:
+        print("TIMEOUT: killed after %d min (cost cap)" % timeout_min)
+    vol.commit()
+    return rc
 
 
 @app.local_entrypoint()
-def main():
-    print(bench.remote())
+def main(tag: str, args: str, timeout_min: int = 30):
+    rc = run.remote(tag, args, timeout_min)
+    print("RUN %s exit code %d" % (tag, rc))
+    raise SystemExit(rc)

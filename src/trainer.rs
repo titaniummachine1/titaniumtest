@@ -176,6 +176,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 d4: !crate::has_flag(args, "--no-d4"),
                 resume: crate::has_flag(args, "--resume"),
                 ram: crate::has_flag(args, "--ram"),
+                wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
+                ema: crate::flag_f64(args, "--ema").unwrap_or(0.0) as f32,
+                guard: crate::flag_f64(args, "--guard").unwrap_or(1.15) as f32,
             });
         }
         #[cfg(not(feature = "gpu"))]
@@ -198,6 +201,8 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let seed = crate::flag_u64(args, "--seed").unwrap_or(7);
     let d4 = !crate::has_flag(args, "--no-d4");
     let resume = crate::has_flag(args, "--resume");
+    let wsum_clip = crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32;
+    let guard = crate::flag_f64(args, "--guard").unwrap_or(1.15);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
 
     let bytes = if init == "bundled" { BUNDLED_NNUE.to_vec() } else { std::fs::read(&init).map_err(|e| format!("{init}: {e}"))? };
@@ -257,7 +262,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                         let (mut l, mut wsum) = (0f64, 0f64);
                         for (r, &m) in rs.iter().zip(ms) {
                             let t = target_of(r);
-                            let w = r.wsum.max(0.0);
+                            let w = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
                             if w == 0.0 {
                                 continue;
                             }
@@ -292,6 +297,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         if done % eval_every == 0 || done == steps {
             let v = evaluate(&net, &val, threads);
             println!("[val step {done}] mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
+            if guard > 0.0 && v.mse > v0.mse * guard {
+                return Err(format!("GUARD TRIPPED at step {done}: val mse {:.6} > {guard} x init {:.6} (Mistake 39)", v.mse, v0.mse));
+            }
             if v.mse < best {
                 best = v.mse;
                 std::fs::write(format!("{out}/best.tnn"), net.to_tnn_bytes()).map_err(|e| e.to_string())?;

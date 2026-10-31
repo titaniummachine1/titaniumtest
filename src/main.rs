@@ -16,6 +16,7 @@ mod data;
 mod export;
 mod layout;
 mod mapper;
+mod modal;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod trainer;
@@ -193,6 +194,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("parity") => return trainer::run_parity(&args[1..]),
         Some("check") => return trainer::run_check(&args[1..]),
         Some("export") => return export::run_export(&args[1..]),
+        Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {
             let a = &args[1..];
@@ -594,7 +596,7 @@ fn parse_info(line: &str, t: &mut Thought) {
     }
 }
 
-fn json_str(s: &str) -> String {
+pub fn json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {

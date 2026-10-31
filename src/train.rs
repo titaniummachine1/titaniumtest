@@ -181,6 +181,24 @@ impl TrainableNet {
         }
     }
 
+    /// EMA/SWA step over every trained tensor: `self = d * self + (1 - d) * cur`. The dis head is not trained here.
+    pub fn blend_from(&mut self, cur: &TrainableNet, d: f32) {
+        let mix = |a: &mut Vec<f32>, b: &Vec<f32>| {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x = d * *x + (1.0 - d) * *y;
+            }
+        };
+        mix(&mut self.ft, &cur.ft);
+        mix(&mut self.ftb, &cur.ftb);
+        mix(&mut self.psqt, &cur.psqt);
+        mix(&mut self.l1_w, &cur.l1_w);
+        mix(&mut self.l1_b, &cur.l1_b);
+        mix(&mut self.l2_w, &cur.l2_w);
+        mix(&mut self.l2_b, &cur.l2_b);
+        mix(&mut self.out_w, &cur.out_w);
+        mix(&mut self.out_b, &cur.out_b);
+    }
+
     /// Forward only: the network output `y` in sigmoid units (cp = 400 y), f32 weights.
     pub fn forward_y(&self, b: &Board) -> f32 {
         self.forward_full(b).y

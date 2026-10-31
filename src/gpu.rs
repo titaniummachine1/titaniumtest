@@ -80,12 +80,18 @@ pub struct GpuCfg {
     pub d4: bool,
     pub resume: bool,
     pub ram: bool,
+    /// cap on the per-row loss weight (0 = off); Opus review: max wsum is 37.7, mean 1.2
+    pub wsum_clip: f32,
+    /// EMA of the weights over superbatches (0 = off): ema = d*ema + (1-d)*live, validated next to the live weights
+    pub ema: f32,
+    /// abort when val mse > guard * initial val mse (0 = off). Mistake 39 / D153: a bad fine-tune showed 0.0204 -> 0.0216 in epoch 1
+    pub guard: f32,
 }
 
 const NB: usize = 8;
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, wsum_clip: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     assert!(!net.pairwise && net.s57w.is_empty() && net.buckets == NB && net.num_feats == NUM_FEATS,
         "graph covers non-pairwise nets without the S57 skip, 8 buckets, 26196 features (TNN1/TNN3)");
@@ -115,7 +121,7 @@ fn build(net: &TrainableNet, d4: bool) -> (ModelInputsMapper<Rec>, ModelDefiniti
         }
         bk[0] = s.bucket as i32;
         target[0] = target_of(r).target;
-        wt[0] = r.wsum.max(0.0);
+        wt[0] = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
     });
 
     let defn = ModelDefinition::build(&inputs, move |b, ((((stm, ntm), bucket), target), wt)| {
@@ -199,7 +205,7 @@ pub fn run(c: GpuCfg) -> Result<(), String> {
 
 fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let base = load_init(&c.init)?;
-    let (mapper, defn) = build(&base, c.d4);
+    let (mapper, defn) = build(&base, c.d4, c.wsum_clip);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -228,28 +234,52 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     };
     let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
     let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
-    let (out, threads) = (c.out.clone(), c.threads);
+    let (out, threads, ema_d, guard) = (c.out.clone(), c.threads, c.ema, c.guard);
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
+    let mut ema_net: Option<TrainableNet> = None;
+    let init_mse = trainer::evaluate(&load_init(&c.init)?, &val, threads).mse;
+    println!("[init] val mse {init_mse:.6} (guard {})", if guard > 0.0 { format!("{:.0}% of init", guard * 100.0) } else { "off".into() });
     train(&mut opt, schedule, loader, |_, _, _| {}, move |o, step| {
         let cpu = o.cpu_weights().expect("sync weights");
         let net = extract(&cpu, &base);
         drop(cpu);
+        let sbn = step.total_batches() / sb;
         let v = trainer::evaluate(&net, &val, threads);
-        println!("[val superbatch {}] mse {:.6} proven {:.6} other {:.6}", step.total_batches() / sb, v.mse, v.mse_proven, v.mse_other);
-        // keep only the newest checkpoint + best.tnn (N1: ~28 MB each)
+        let mut line = format!("[val superbatch {sbn}] live mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
+        let (mut pick, mut pick_mse) = (net.clone(), v.mse);
+        if ema_d > 0.0 {
+            match ema_net.as_mut() {
+                Some(e) => e.blend_from(&net, ema_d),
+                None => ema_net = Some(net.clone()),
+            }
+            let ev = trainer::evaluate(ema_net.as_ref().unwrap(), &val, threads);
+            line += &format!(" | ema mse {:.6}", ev.mse);
+            if ev.mse < pick_mse {
+                pick = ema_net.clone().unwrap();
+                pick_mse = ev.mse;
+            }
+        }
+        println!("{line}");
+        // keep only the newest checkpoint + best.tnn (~28 MB each)
         let cur = format!("{out}/ckpt_{}.tnn", step.total_batches());
-        let _ = std::fs::write(&cur, net.to_tnn_bytes());
+        let _ = std::fs::write(&cur, pick.to_tnn_bytes());
         if let Some(p) = last.replace(cur) {
             let _ = std::fs::remove_file(p);
         }
-        if v.mse < best {
-            best = v.mse;
-            let _ = std::fs::write(format!("{out}/best.tnn"), net.to_tnn_bytes());
+        if pick_mse < best {
+            best = pick_mse;
+            let _ = std::fs::write(format!("{out}/best.tnn"), pick.to_tnn_bytes());
         }
         let _ = std::fs::create_dir_all(&ckpt);
         if o.write_to_checkpoint(&ckpt).is_ok() {
-            let _ = std::fs::write(format!("{out}/gpu_state.txt"), format!("{}", step.total_batches() / sb));
+            let _ = std::fs::write(format!("{out}/gpu_state.txt"), format!("{sbn}"));
+        }
+        if guard > 0.0 && v.mse > init_mse * guard as f64 {
+            let msg = format!("GUARD TRIPPED at superbatch {sbn}: live val mse {:.6} > {:.2} x init {:.6}. Run aborted to save money (Mistake 39: lower the LR / check the data).", v.mse, guard, init_mse);
+            eprintln!("{msg}");
+            let _ = std::fs::write(format!("{out}/GUARD_TRIPPED.txt"), &msg);
+            std::process::exit(3);
         }
     })
     .map_err(|_| "bullet training failed (TrainingError<G> has no Debug bound here; see the console log above)".to_string())?;
@@ -267,7 +297,7 @@ fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -
     use bullet_trainer::model::ModelEvaluator;
     use bullet_trainer::run::{HostPool, Step};
     let net = load_init(init)?;
-    let (mapper, defn) = build(&net, false);
+    let (mapper, defn) = build(&net, false, 0.0);
     let mut w = ModelWeights::new(&defn, 1);
     load_into(&mut w, &net);
     let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;
