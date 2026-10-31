@@ -225,3 +225,4 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 - Eval-quality-only changes (same width/arch, same nps) may be proven at 5k nodes alone; width/speed changes need timed legs (user 2026-10-31).
 - BEHAVIOR 35b: ahead = presumed pass until proven otherwise; extend unresolved gates first, fresh openings via --book0.
 - Screening gates are NOT SPRTs unless run to a bound: every unresolved gate (LLR inside +-2.94) is continued on fresh openings (--book0) until bound or 2000 games, positives first (user 2026-10-31). logs/gates/resolve.sh is the stopgap.
+- USER REJECTION 2026-10-31: fut80 (DIS_FUT_NUM 80; 5k -18.5, 100ms -53.7 LOS 0.3%) and rfp16 (DIS_RFP_NUM 16; 5k -16.2) rejected; removed from queues. fut24 5k +40.7 (pass), 100ms +5.8 (unresolved) still live.
