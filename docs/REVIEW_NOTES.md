@@ -131,3 +131,12 @@ afterwards speed work towards 400k-1M nps. Opus view:
   STILL UNCHECKED (b): game-level split. v9 split is a contiguous index cut (assemble_v7_dataset.py:238, train 0..T, val T..N)
   inherited from v8; no game ids in the npz, so neighbouring positions of one game can sit on both sides. Treat val as a
   plateau detector, not an absolute quality number. If it matters: rebuild val from games never used in train (needs game ids).
+
+## SMOKE RESULT 2026-10-31 (Modal T4, W=512 8AB5B82E, 1500 steps lr 1e-5, hub 343e423, ~100 s)
+- Launcher path PROVEN end to end (image build from git snapshot, Volume mounts, timeout wrapper, outputs in /vol/runs/<tag>).
+- 512-wide GPU throughput 278k pos/s on T4 (GPU assigned from the fallback list was a T4, not the A10 of the 256 bench): v9 epoch ~104 s.
+  UNKNOWN whether T4 or the 4-vCPU loader is the cap; L4/A10G would tell (cost per epoch may still favour T4).
+- Probes cost 0.4 s per 30 s superbatch (1.4%): fine. D4 val spread 1.3-1.4% (threshold 5%). Train-probe is HARDER than val
+  (0.0244 vs 0.0176): different data mix, so the val-train "gap" is negative; watch its trend, not its sign.
+- lr 1e-5 moved val by +-0.00002 in 1500 steps: safe but nearly inert. The real run needs a larger LR (guard 1.15 protects).
+- Launch footgun: Git Bash rewrites `/data/..` arguments to `C:/Program Files/Git/data/..`; use `ti train modal put` or MSYS_NO_PATHCONV=1.
