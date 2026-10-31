@@ -29,11 +29,16 @@ const BLOCK: usize = 1024;
 pub struct TdatReader {
     path: String,
     seed: u64,
+    /// shared RAM copy (`--ram`), None = stream from disk
+    ram: Option<std::sync::Arc<Tdat>>,
 }
 
 impl DataReader<Rec> for TdatReader {
     fn read_chunks<F: FnMut(&[Rec]) -> bool>(&self, skip_count: usize, mut f: F) {
-        let mut t = Tdat::open(&self.path).expect("open tdat");
+        let mut t = match &self.ram {
+            Some(r) => r.share(&self.path).expect("share tdat"),
+            None => Tdat::open(&self.path).expect("open tdat"),
+        };
         let nblk = t.rows / BLOCK;
         let mut s = (self.seed ^ (skip_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
         let mut next = move || {
@@ -74,6 +79,7 @@ pub struct GpuCfg {
     pub seed: u64,
     pub d4: bool,
     pub resume: bool,
+    pub ram: bool,
 }
 
 const NB: usize = 8;
@@ -218,16 +224,23 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         lr_schedule: Box::new(move |s| lr_at(s.total_batches(), total, lr, lr_min, warmup)),
         track_grad_norms: false,
     };
-    let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed }, mapper, c.threads.min(255) as u8);
+    let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
+    let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
     let (out, threads) = (c.out.clone(), c.threads);
     let mut best = f64::MAX;
+    let mut last: Option<String> = None;
     train(&mut opt, schedule, loader, |_, _, _| {}, move |o, step| {
         let cpu = o.cpu_weights().expect("sync weights");
         let net = extract(&cpu, &base);
         drop(cpu);
         let v = trainer::evaluate(&net, &val, threads);
         println!("[val superbatch {}] mse {:.6} proven {:.6} other {:.6}", step.total_batches() / sb, v.mse, v.mse_proven, v.mse_other);
-        let _ = std::fs::write(format!("{out}/ckpt_{}.tnn", step.total_batches()), net.to_tnn_bytes());
+        // keep only the newest checkpoint + best.tnn (N1: ~28 MB each)
+        let cur = format!("{out}/ckpt_{}.tnn", step.total_batches());
+        let _ = std::fs::write(&cur, net.to_tnn_bytes());
+        if let Some(p) = last.replace(cur) {
+            let _ = std::fs::remove_file(p);
+        }
         if v.mse < best {
             best = v.mse;
             let _ = std::fs::write(format!("{out}/best.tnn"), net.to_tnn_bytes());

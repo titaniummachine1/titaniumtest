@@ -15,8 +15,11 @@ use titanium::nnue::{Nnue, BUNDLED_NNUE};
 
 const BLOCK: usize = 1024;
 
+/// `.tdat` reader. `open` streams from disk (16 GB home box); `open_ram` reads the whole file once (Modal: RAM is
+/// ~$0.008/GiB-h, far cheaper than a GPU waiting on disk seeks).
 pub struct Tdat {
-    f: File,
+    f: Option<File>,
+    mem: Option<std::sync::Arc<Vec<u8>>>,
     pub rows: usize,
 }
 
@@ -28,13 +31,35 @@ impl Tdat {
         if len % REC != 0 {
             return Err(format!("{p}: size {len} is not a multiple of {REC}"));
         }
-        Ok(Tdat { f, rows: len / REC })
+        Ok(Tdat { f: Some(f), mem: None, rows: len / REC })
+    }
+    pub fn open_ram(stem_or_file: &str) -> Result<Tdat, String> {
+        let p = if stem_or_file.ends_with(".tdat") { stem_or_file.to_string() } else { format!("{stem_or_file}.tdat") };
+        let t = Instant::now();
+        let b = std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?;
+        if b.len() % REC != 0 {
+            return Err(format!("{p}: size {} is not a multiple of {REC}", b.len()));
+        }
+        println!("[ram] {p}: {} MB in {:.1} s", b.len() >> 20, t.elapsed().as_secs_f64());
+        Ok(Tdat { f: None, rows: b.len() / REC, mem: Some(std::sync::Arc::new(b)) })
+    }
+    /// Cheap clone for loader threads: shares the RAM copy, reopens the file when streaming.
+    pub fn share(&self, stem_or_file: &str) -> Result<Tdat, String> {
+        match &self.mem {
+            Some(m) => Ok(Tdat { f: None, mem: Some(m.clone()), rows: self.rows }),
+            None => Tdat::open(stem_or_file),
+        }
     }
     pub fn read_block(&mut self, start: usize, n: usize, out: &mut Vec<Rec>) -> Result<(), String> {
         let n = n.min(self.rows - start);
-        self.f.seek(SeekFrom::Start((start * REC) as u64)).map_err(|e| e.to_string())?;
+        if let Some(m) = &self.mem {
+            out.extend(m[start * REC..(start + n) * REC].chunks_exact(REC).map(Rec::from_bytes));
+            return Ok(());
+        }
+        let f = self.f.as_mut().unwrap();
+        f.seek(SeekFrom::Start((start * REC) as u64)).map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; n * REC];
-        self.f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         out.extend(buf.chunks_exact(REC).map(Rec::from_bytes));
         Ok(())
     }
@@ -150,6 +175,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 seed: g("--seed", 7) as u64,
                 d4: !crate::has_flag(args, "--no-d4"),
                 resume: crate::has_flag(args, "--resume"),
+                ram: crate::has_flag(args, "--ram"),
             });
         }
         #[cfg(not(feature = "gpu"))]
@@ -187,7 +213,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             println!("[resume] step {step0} from {p} (optimizer moments restart)");
         }
     }
-    let mut train = Tdat::open(&data)?;
+    let mut train = if crate::has_flag(args, "--ram") { Tdat::open_ram(&data)? } else { Tdat::open(&data)? };
     let mut valf = Tdat::open(&val_stem)?;
     let val = load_val(&mut valf, val_rows)?;
     println!("[train] rows {} val {} bs {bs} steps {steps} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len());

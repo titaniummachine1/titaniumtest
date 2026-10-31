@@ -19,7 +19,7 @@ image = (
     .add_local_dir(ENGINE + r"\crates\titanium", "/src/engine/crates/titanium", copy=True, ignore=["target"])
     .add_local_file(ENGINE + r"\data\nnue\nnue_main.tnn", "/src/engine/data/nnue/nnue_main.tnn", copy=True)
     .add_local_file(ENGINE + r"\data\nnue\fut_small.tsn", "/src/engine/data/nnue/fut_small.tsn", copy=True)
-    .add_local_dir(HUB, "/src/hub", copy=True, ignore=["target", ".git", ".cargo", "*.log", "*.bat", "*.ps1", "modal"])
+    .add_local_dir(HUB, "/src/hub", copy=True, ignore=["target", ".cargo", "modal"])
     .run_commands(
         "mkdir -p /src/hub/.cargo && printf '[patch.\"https://github.com/titaniummachine1/titanium-ataxx\"]\n"
         "titanium = { path = \"/src/engine/crates/titanium\" }\n' > /src/hub/.cargo/config.toml",
@@ -52,7 +52,7 @@ def bench():
     sh("ti train check --data /data/val_v9 --val /data/val_v9 --init %s" % net)
     for threads in (4, 8):
         sh("ti train run --backend cuda --data /data/val_v9 --val /data/val_v9 --init %s --out /tmp/b%d "
-           "--bs 16384 --steps 600 --eval-every 200 --lr 1e-4 --lr-min 1e-5 --warmup 50 --threads %d --val-rows 16384"
+           "--bs 16384 --steps 600 --eval-every 200 --lr 1e-4 --lr-min 1e-5 --warmup 50 --threads %d --val-rows 16384 --ram"
            % (net, threads, threads))
     return "done"
 
