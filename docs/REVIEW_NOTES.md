@@ -103,3 +103,31 @@ NEW (not in Sonnet's list):
 - N4 GPU RESULT (2026-10-31): note 13 (column-major layout) CONFIRMED: graph vs hub max diff 7.2e-7 on 512 rows. A10: 1.85M pos/s,
   same at 4 and 8 loader threads on 4 vCPU, so the loader may be the cap. Next measurement: cpu=8 to see if it scales.
   v9 epoch ~16 s, ~$0.006/epoch.
+
+## Breathing-cycle plan (user idea 2026-10-31, Opus opinion, OPEN DECISION, nothing launched)
+User: train the champion to saturation and/or upscale it to 512, train more, then Net2Net downscale (never from scratch);
+afterwards speed work towards 400k-1M nps. Opus view:
+- Do NOT upscale 7AE0122F: it IS the W=256 downscale of the W=512 ep7 net 8AB5B82E. Upscaling it back gives a 512 that only
+  knows what survived the downscale. Start the grow phase from 8AB5B82E itself (+52 Elo/node vs champion, D151).
+- Grow: continue 8AB5B82E on v9, small LR (Mistake 39), --ram --guard --ema, stop when val loss plateaus. If 512 saturates
+  early, the next grow step is Net2Net 512->1024 (a teacher does not need to be fast).
+- Shrink: the teacher -> 256 (or smaller for speed) needs DISTILLATION, not just a downscale. MISSING IN THE HUB: no `ti` Net2Net
+  up/downscale (only training/net2net_*.py) and no distill mode (the trainer learns data targets, not teacher outputs).
+- W=512 GPU throughput not measured yet (256 = 1.85M pos/s on A10).
+
+## Overfit probes (added 2026-10-31 after user go "yes exactly as you said", UNCOMMITTED until smoke, UNTESTED on GPU)
+- D4 VERIFIED ON in code: CPU `rng.below(8)` per sample, GPU per-visit hash of (occ, batch) -> mode 0..7; `--no-d4` turns it off.
+- Each superbatch now also prints: train-probe MSE (16k fixed train rows) + val-train gap, val MSE under all 8 D4 modes
+  (8k rows each) + spread (WARNING > 5%, threshold is a guess), probe time. The GPU idles during the callback: superbatch =
+  eval_every (500) x 16384 = 8.2M rows ~ 4.4 s GPU at 256-wide, so the probes may cost a noticeable share. MEASURE IN SMOKE.
+- `--holdout-mode k` (user idea): never train orientation k, report its val MSE vs the 7 trained ones. DIAGNOSTIC ONLY.
+  LIMIT: our inits (8AB5B82E, 7AE0122F) already trained on all 8 orientations, so from them the held-out gap can only show
+  FORGETTING, not failure to learn the symmetry. A true test needs a net that never saw mode k. Low value for this cycle.
+- MEASURED 2026-10-31 (`ti data check-leak`, src/leak.rs): v9 val is NOT position-disjoint. Exact copies in train 10 rows
+  (0.002%), but D4-EQUIVALENT copies 37,123 of 601,957 = 6.17% (12.4% at 8-15 stones, 5.4% at 24-31, 4.5% at 40-47: all phases,
+  so it is rotated duplicates in the data, not just symmetric openings). Train itself repeats 3.77% of its positions up to D4.
+  Since training applies D4, those val rows are positions the net trains on in every orientation -> val loss is optimistic and
+  hides overfit. FIX: `--write-clean` wrote data/nnue/packed/val_v9_clean.tdat (564,834 rows) -> use `--val /vol/data/val_v9_clean`.
+  STILL UNCHECKED (b): game-level split. v9 split is a contiguous index cut (assemble_v7_dataset.py:238, train 0..T, val T..N)
+  inherited from v8; no game ids in the npz, so neighbouring positions of one game can sit on both sides. Treat val as a
+  plateau detector, not an absolute quality number. If it matters: rebuild val from games never used in train (needs game ids).

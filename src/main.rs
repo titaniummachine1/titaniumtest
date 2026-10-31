@@ -15,6 +15,7 @@ mod book;
 mod data;
 mod export;
 mod layout;
+mod leak;
 mod mapper;
 mod modal;
 #[cfg(feature = "gpu")]

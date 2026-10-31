@@ -78,6 +78,9 @@ pub struct GpuCfg {
     pub threads: usize,
     pub seed: u64,
     pub d4: bool,
+    /// DIAGNOSTIC ONLY: never train on D4 orientation k, validate it separately. A big gap = the net memorised orientations
+    /// instead of learning the symmetry. Production runs train on all 8 (search meets every orientation).
+    pub holdout: Option<usize>,
     pub resume: bool,
     pub ram: bool,
     /// cap on the per-row loss weight (0 = off); Opus review: max wsum is 37.7, mean 1.2
@@ -91,7 +94,7 @@ pub struct GpuCfg {
 const NB: usize = 8;
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool, wsum_clip: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     assert!(!net.pairwise && net.s57w.is_empty() && net.buckets == NB && net.num_feats == NUM_FEATS,
         "graph covers non-pairwise nets without the S57 skip, 8 buckets, 26196 features (TNN1/TNN3)");
@@ -106,7 +109,14 @@ fn build(net: &TrainableNet, d4: bool, wsum_clip: f32) -> (ModelInputsMapper<Rec
     let mapper = ModelInputsMapper::build(&inputs, move |r: &Rec, step, ((((stm, ntm), bk), target), wt)| {
         let mode = if d4 {
             let h = (r.occ0 ^ r.occ1.rotate_left(23)).wrapping_add(step.total_batches() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            ((h >> 40) & 7) as usize
+            match holdout {
+                // 7 trained orientations: draw 0..6 and skip over the held-out one
+                Some(k) => {
+                    let m = ((h >> 40) % 7) as usize;
+                    if m >= k { m + 1 } else { m }
+                }
+                None => ((h >> 40) & 7) as usize,
+            }
         } else {
             0
         };
@@ -205,7 +215,13 @@ pub fn run(c: GpuCfg) -> Result<(), String> {
 
 fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let base = load_init(&c.init)?;
-    let (mapper, defn) = build(&base, c.d4, c.wsum_clip);
+    if let Some(k) = c.holdout {
+        if !c.d4 || k > 7 {
+            return Err("--holdout-mode needs D4 on and a mode 0..7".into());
+        }
+        println!("[holdout] DIAGNOSTIC RUN: D4 orientation {k} is never trained, it is validated separately");
+    }
+    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -234,10 +250,15 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     };
     let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
     let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
-    let (out, threads, ema_d, guard) = (c.out.clone(), c.threads, c.ema, c.guard);
+    let (out, threads, ema_d, guard, holdout) = (c.out.clone(), c.threads, c.ema, c.guard, c.holdout);
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
     let mut ema_net: Option<TrainableNet> = None;
+    // fixed probe of TRAINING rows (same size as val): val - train gap = overfit signal
+    let probe = {
+        let mut t = trainer::Tdat::open(&c.data)?;
+        trainer::load_val(&mut t, c.val_rows.min(16384))?
+    };
     let init_mse = trainer::evaluate(&load_init(&c.init)?, &val, threads).mse;
     println!("[init] val mse {init_mse:.6} (guard {})", if guard > 0.0 { format!("{:.0}% of init", guard * 100.0) } else { "off".into() });
     train(&mut opt, schedule, loader, |_, _, _| {}, move |o, step| {
@@ -247,6 +268,20 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         let sbn = step.total_batches() / sb;
         let v = trainer::evaluate(&net, &val, threads);
         let mut line = format!("[val superbatch {sbn}] live mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
+        let tr = trainer::evaluate(&net, &probe, threads).mse;
+        // the GPU idles while this callback runs: keep the extra probes small and print their cost
+        let t_probe = std::time::Instant::now();
+        let modes = trainer::d4_modes(&net, &val, threads, 8192);
+        let (dlo, dhi) = (modes.iter().cloned().fold(f64::MAX, f64::min), modes.iter().cloned().fold(0.0, f64::max));
+        line += &format!(" | train-probe {:.6} gap {:+.6} | d4 val {:.6}..{:.6} spread {:.1}%", tr, v.mse - tr, dlo, dhi, 100.0 * (dhi - dlo) / dlo.max(1e-12));
+        if let Some(k) = holdout {
+            let rest: f64 = (0..8).filter(|&m| m != k).map(|m| modes[m]).sum::<f64>() / 7.0;
+            line += &format!(" | HELD-OUT mode {k} {:.6} vs trained-modes {:.6} ({:+.1}%)", modes[k], rest, 100.0 * (modes[k] - rest) / rest.max(1e-12));
+        }
+        line += &format!(" | probes {:.1} s", t_probe.elapsed().as_secs_f64());
+        if (dhi - dlo) / dlo.max(1e-12) > 0.05 {
+            line += " | WARNING orientation spread >5%: net may be overfitting the stored orientation";
+        }
         let (mut pick, mut pick_mse) = (net.clone(), v.mse);
         if ema_d > 0.0 {
             match ema_net.as_mut() {
@@ -297,7 +332,7 @@ fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -
     use bullet_trainer::model::ModelEvaluator;
     use bullet_trainer::run::{HostPool, Step};
     let net = load_init(init)?;
-    let (mapper, defn) = build(&net, false, 0.0);
+    let (mapper, defn) = build(&net, false, None, 0.0);
     let mut w = ModelWeights::new(&defn, 1);
     load_into(&mut w, &net);
     let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;

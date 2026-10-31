@@ -99,6 +99,23 @@ pub fn load_val(val: &mut Tdat, rows: usize) -> Result<Vec<Rec>, String> {
 }
 
 pub fn evaluate(net: &TrainableNet, val: &[Rec], threads: usize) -> ValStats {
+    evaluate_mode(net, val, threads, 0)
+}
+
+/// Orientation-overfit probe: val MSE of the same rows under each of the 8 D4 modes (strided subset). A net that only
+/// knows the stored orientation shows a large max-min spread; a net trained with D4 stays flat. Returns (min, max).
+pub fn d4_modes(net: &TrainableNet, val: &[Rec], threads: usize, rows: usize) -> Vec<f64> {
+    let step = (val.len() / rows.max(1)).max(1);
+    let sub: Vec<Rec> = val.iter().step_by(step).copied().collect();
+    (0..8).map(|mode| evaluate_mode(net, &sub, threads, mode).mse).collect()
+}
+
+pub fn d4_spread(net: &TrainableNet, val: &[Rec], threads: usize, rows: usize) -> (f64, f64) {
+    let m = d4_modes(net, val, threads, rows);
+    (m.iter().cloned().fold(f64::MAX, f64::min), m.iter().cloned().fold(0.0, f64::max))
+}
+
+pub fn evaluate_mode(net: &TrainableNet, val: &[Rec], threads: usize, mode: usize) -> ValStats {
     let part = (val.len() + threads - 1) / threads;
     let res: Vec<(f64, f64, usize, f64)> = std::thread::scope(|s| {
         val.chunks(part.max(1))
@@ -107,7 +124,7 @@ pub fn evaluate(net: &TrainableNet, val: &[Rec], threads: usize) -> ValStats {
                     let (mut a, mut p, mut np, mut o) = (0f64, 0f64, 0usize, 0f64);
                     for r in ch {
                         let t = target_of(r);
-                        let y = net.forward_y(&mapper::board_of(r, 0));
+                        let y = net.forward_y(&mapper::board_of(r, mode));
                         let e = (1.0 / (1.0 + (-y as f64).exp()) - t.target as f64).powi(2);
                         a += e;
                         if t.proven >= 0 {
@@ -174,6 +191,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 threads: g("--threads", 8),
                 seed: g("--seed", 7) as u64,
                 d4: !crate::has_flag(args, "--no-d4"),
+                holdout: crate::flag_u64(args, "--holdout-mode").map(|v| v as usize),
                 resume: crate::has_flag(args, "--resume"),
                 ram: crate::has_flag(args, "--ram"),
                 wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
