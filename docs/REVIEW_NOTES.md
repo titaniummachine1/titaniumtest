@@ -229,3 +229,10 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 - Label depth for Texel/calibration (user 2026-10-31 asked 5k or 20k): use existing 5k cp5k labels (99.7% of rows); 20k only as held-out subset check later (needs relabel); time labels are load-noisy so 100ms stays a verification gate only.
 - rfp56 (DIS_RFP_NUM 56) 5k: +64.4+-34.1 (300g, LLR +2.09); 100ms leg pending; merge needs both (BEHAVIOR 35a).
 - Search-depth ladder (user 2026-10-31: "tuning on wrong search is not gonna help"): deployed Botzone search is ~220k-740k nodes/move (depth 12-15 at 4s), 100ms ~ 20k nodes, 5k is a cheap screen only. Screen 5k -> confirm 100ms -> confirm deep leg (~300k nodes) before merge of search changes; final SPSA at >=20k nodes. A clearly negative rung blocks merge.
+
+## Three-phase buckets + opening book (user 2026-10-31)
+- User: "3 main phases that get their own distribution of buckets ... opening might benefit most from disabling D4 on it" and "up to 8 or 10 pieces on board its still opening book that can be memorized".
+- Plan: non-uniform bucket map (opening = >=38 empties i.e. <=11 stones; midgame coarse; endgame fine since bucket 0 = 42% of loss, mse 0.10). Needs engine bucket table keyed by empties (nnue.rs lines 230/258/393 use empties*B/50 today). Boundaries on old edges (empties 7/13/19/25/32/38/44) keep exact split-init parity. Uniform 8->16 split (`ti train split`, built, parity-checked) needs NO engine change: cheap first test, then per-bucket Texel calibration (`ti train export --calibrate`).
+- D4 off for opening rows in training: separate gate.
+- Opening book for <=10 stones (start has 4 stones => ~6 plies): search every position once, deep, store best move; engine `treebook` generator exists. Position count NOT yet counted (do not promise size).
+- Dis-constant screening so far: thr200 (5k +1.2, 100ms +1.2) and thr450 (5k -6.9) flat => dropped. rfp56 leads (5k +64, 100ms +30), fut24 mixed (5k +41, 100ms +6).

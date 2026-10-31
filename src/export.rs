@@ -114,6 +114,64 @@ pub fn refit_dis(net: &mut TrainableNet, train: &mut Tdat, rows: usize, l2: f64)
     Ok(())
 }
 
+
+/// Texel-style output calibration: per phase bucket fit `y' = s*y + c` so that `sigmoid(y')` best matches the training
+/// target (squared error in probability space), then fold it EXACTLY into out_w / out_b / psqt (y is linear in those).
+/// No trunk change, no games. The dis head must be refit afterwards (it predicts |400 y - cp5k|).
+pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize) -> Result<(), String> {
+    let nb = net.buckets;
+    let out_in = net.out_in();
+    let nblk = (train.rows / BLOCK).max(1);
+    let blocks = (rows / BLOCK).max(1).min(nblk);
+    let mut per: Vec<Vec<(f64, f64)>> = vec![Vec::new(); nb];
+    let mut buf = Vec::with_capacity(BLOCK);
+    for i in 0..blocks {
+        buf.clear();
+        train.read_block((i * nblk / blocks) * BLOCK, BLOCK, &mut buf)?;
+        for r in &buf {
+            let f = net.forward_full(&mapper::board_of(r, 0));
+            per[f.bucket].push((f.y as f64, crate::targets::target_of(r).target as f64));
+        }
+    }
+    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+    let mse = |d: &Vec<(f64, f64)>, s: f64, c: f64| d.iter().map(|&(y, t)| (sig(s * y + c) - t).powi(2)).sum::<f64>() / d.len() as f64;
+    for b in 0..nb {
+        let d = &per[b];
+        if d.len() < 500 {
+            println!("  cal bucket {b}: only {} rows, left alone", d.len());
+            continue;
+        }
+        let (mut s, mut c) = (1f64, 0f64);
+        let before = mse(d, 1.0, 0.0);
+        for _ in 0..30 {
+            let (mut a00, mut a01, mut a11, mut g0, mut g1) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for &(y, t) in d {
+                let p = sig(s * y + c);
+                let (r, j) = (p - t, p * (1.0 - p));
+                let (j0, j1) = (j * y, j);
+                a00 += j0 * j0; a01 += j0 * j1; a11 += j1 * j1; g0 += j0 * r; g1 += j1 * r;
+            }
+            let lm = 1e-6 * (a00 + a11) + 1e-12;
+            let (m00, m11) = (a00 + lm, a11 + lm);
+            let det = m00 * m11 - a01 * a01;
+            if det.abs() < 1e-18 { break; }
+            let (ds, dc) = ((m11 * g0 - a01 * g1) / det, (m00 * g1 - a01 * g0) / det);
+            let (ns, nc) = (s - ds, c - dc);
+            if mse(d, ns, nc) > mse(d, s, c) { break; }
+            s = ns; c = nc;
+            if ds.abs() < 1e-7 && dc.abs() < 1e-7 { break; }
+        }
+        let after = mse(d, s, c);
+        println!("  cal bucket {b}: N={} scale {:.4} shift {:+.4} mse {:.5} -> {:.5}", d.len(), s, c, before, after);
+        let (sf, cf) = (s as f32, c as f32);
+        for w in &mut net.out_w[b * out_in..(b + 1) * out_in] { *w *= sf; }
+        net.out_b[b] = sf * net.out_b[b] + cf;
+        let nf = net.psqt.len() / nb;
+        for fi in 0..nf { net.psqt[fi * nb + b] *= sf; }
+    }
+    Ok(())
+}
+
 pub fn run_export(args: &[String]) -> ExitCode {
     match run_export_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -131,6 +189,11 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
     let l2 = crate::flag_f64(args, "--l2").unwrap_or(1.0);
     let mut net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?)?;
     let mut train = Tdat::open(&data)?;
+    if args.iter().any(|a| a == "--calibrate") {
+        let cr = crate::flag_u64(args, "--cal-rows").unwrap_or(400_000) as usize;
+        println!("[export] Texel calibration of {net_path} on ~{cr} rows (per-bucket scale+shift of y, folded into out/psqt)");
+        calibrate(&mut net, &mut train, cr)?;
+    }
     println!("[export] refitting disagreement head of {net_path} on ~{rows} rows, ridge l2 {l2}");
     refit_dis(&mut net, &mut train, rows, l2)?;
 

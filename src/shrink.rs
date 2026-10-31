@@ -481,3 +481,67 @@ pub fn run_upscale(args: &[String]) -> ExitCode {
         }
     }
 }
+
+/// Split every phase bucket in two (B -> 2B) by copying the parent's weights. The engine and trainer compute
+/// `bucket = empties * B / 50`, so bucket b2 of the new net nests exactly inside bucket b2 / 2 of the old one:
+/// step-0 parity is exact and the extra buckets only help once calibrated / fine-tuned.
+pub fn split_buckets(net: &TrainableNet) -> Result<TrainableNet, String> {
+    let nb = net.buckets;
+    let nb2 = nb * 2;
+    let mut n = net.clone();
+    n.buckets = nb2;
+    let dup = |v: &Vec<f32>| -> Vec<f32> {
+        if v.is_empty() {
+            return Vec::new();
+        }
+        let chunk = v.len() / nb;
+        let mut o = Vec::with_capacity(chunk * nb2);
+        for b2 in 0..nb2 {
+            o.extend_from_slice(&v[(b2 / 2) * chunk..(b2 / 2 + 1) * chunk]);
+        }
+        o
+    };
+    let nf = net.psqt.len() / nb;
+    let mut psqt = Vec::with_capacity(nf * nb2);
+    for fi in 0..nf {
+        for b2 in 0..nb2 {
+            psqt.push(net.psqt[fi * nb + b2 / 2]);
+        }
+    }
+    n.psqt = psqt;
+    n.l1_w = dup(&net.l1_w);
+    n.l1_b = dup(&net.l1_b);
+    n.l2_w = dup(&net.l2_w);
+    n.l2_b = dup(&net.l2_b);
+    n.out_w = dup(&net.out_w);
+    n.out_b = dup(&net.out_b);
+    n.s57w = dup(&net.s57w);
+    n.dis_w = dup(&net.dis_w);
+    n.dis_b = dup(&net.dis_b);
+    Ok(n)
+}
+
+/// `ti train split --net a.tnn --data <stem> --out b.tnn [--rows N] [--threads T]`: B -> 2B buckets with val-mse parity check.
+pub fn run_split(args: &[String]) -> ExitCode {
+    let r = (|| -> Result<(), String> {
+        let f = |n: &str| crate::flag_str(args, n);
+        let (net_p, data, out_p) = (f("--net").ok_or("--net required")?, f("--data").ok_or("--data <stem> required")?, f("--out").ok_or("--out required")?);
+        let rows = crate::flag_u64(args, "--rows").unwrap_or(20000) as usize;
+        let threads = crate::flag_u64(args, "--threads").unwrap_or(6) as usize;
+        let net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_p).map_err(|e| format!("{net_p}: {e}"))?)?;
+        let big = split_buckets(&net)?;
+        let cal = load_val(&mut Tdat::open(&data)?, rows)?;
+        let (a, b) = (evaluate(&net, &cal, threads), evaluate(&big, &cal, threads));
+        println!("[split] buckets {} -> {}; val mse on {} rows: original {:.8}  split {:.8}  delta {:+.2e}", net.buckets, big.buckets, cal.len(), a.mse, b.mse, b.mse - a.mse);
+        std::fs::write(&out_p, big.to_tnn_bytes()).map_err(|e| e.to_string())?;
+        println!("[split] wrote {out_p}");
+        Ok(())
+    })();
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("split: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
