@@ -72,3 +72,28 @@ Status key: VERIFIED (tested, number given) / UNSURE (judgement call) / UNTESTED
 21. `ti train check` samples 16 evenly spread 1024-row blocks of train plus one val block, not the whole file (full scan of
     1.4 GB takes seconds and could be added). It does not prove the file equals the npz; `ti data pack` prints the wrapping
     sums for that, and the manifest stores them. A future `check --full` should recompute the sums from the `.tdat`.
+
+## OPUS REVIEW (Opus 5.5, 2026-10-31) — verdicts, with measured numbers
+Measured: mapper (D4 + engine features) 350k rows/s/core on this Haswell; avg 106 active features/perspective;
+val wsum mean 1.215, median 1.0, max 37.7.
+- 1 tdat layout: OK. On the GPU box read the whole 1.4 GB into RAM once instead of seeking per block (cheap, removes disk jitter).
+- 2/3 targets + draws: OK, code is right; the 0.25 blend on non-proven rows is a RECIPE question for the user, not a bug.
+- 4 wsum: not a bug (GPU effective LR x1.215 vs CPU). REAL CONCERN: max weight 37.7 lets one row dominate a 16k batch.
+  Suggest an A/B with wsum clipped at ~8 before the first long run.
+- 5 D4 on bitboards: KEEP, it is more correct than the Python permutation table and costs nothing measurable.
+- 6/7: OK.
+- 8 CPU lazy AdamW: dubious for real training, fine for smoke. CPU backend = smoke/parity only, never production.
+- 10 CPU speed: irrelevant to money (training is on the GPU); only worth it if we decide to train locally for $0.
+- 12/13 graph weight layout: THE biggest risk. Must be proven by a graph-vs-hub forward parity on the GPU before any run.
+- 15 clip +-1.98 on all weights: harmless for the current net (max |dense w| 0.86). OK.
+- 16 EMA: Sonnet was right to flag it. Python evaluated BOTH live and EMA weights every epoch and kept whichever was best
+  on val (train_nnue.py ~749, `_ep%d_ema.pt`). The hub has no EMA, so it may lose that free gain. Cheap fix: keep a
+  host-side average of the last k superbatch snapshots (SWA-style) and validate both, same choose-best rule.
+- 17/18/21: OK.
+- 19 mapper bottleneck: 350k rows/s/core means a 4-core box maps ~1.4M rows/s, about an epoch of v9 in ~21 s. Probably not
+  the bottleneck; the Modal benchmark decides.
+NEW (not in Sonnet's list):
+- N1 the GPU superbatch callback writes a 28 MB .tnn plus a full bullet checkpoint every superbatch: keep last + best only.
+- N2 money: the net is tiny (~90k MACs per sample forward), so GPU time per run should be minutes. The real cost risks
+  are rebuilding the CUDA image on every launch, re-uploading data and idle or parallel containers. Bake `ti` into the
+  image once (cached by rev), keep `.tdat` in a Modal Volume uploaded once, one L4 container, hard timeout.
