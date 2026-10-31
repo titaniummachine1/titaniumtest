@@ -130,7 +130,7 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
         } else {
             0
         };
-        let s = mapper::sample(r, mode, nb);
+        let s = mapper::sample(r, mode, nb, net.groups >> 8);
         for (dst, src) in [(&mut *stm, &s.us), (&mut *ntm, &s.them)] {
             for (i, &f) in src.iter().enumerate() {
                 dst[i] = f as i32;

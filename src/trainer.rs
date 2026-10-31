@@ -457,7 +457,9 @@ pub fn run_buckets(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let nb = net.buckets;
+    // --by-empties: one row per empty-square count (0..=49) instead of per net bucket (to design a bucket map)
+    let by_empties = crate::has_flag(args, "--by-empties");
+    let nb = if by_empties { 50 } else { net.buckets };
     // per bucket: n, sum t, sum t^2, sum err^2, n_proven, err^2 proven
     let mut a = vec![[0f64; 6]; nb];
     for r in &v {
@@ -465,7 +467,7 @@ pub fn run_buckets(args: &[String]) -> ExitCode {
         let fw = net.forward_full(&mapper::board_of(r, 0));
         let p = 1.0 / (1.0 + (-fw.y as f64).exp());
         let e = (p - tg.target as f64).powi(2);
-        let x = &mut a[fw.bucket];
+        let x = &mut a[if by_empties { mapper::board_of(r, 0).empty().count_ones() as usize } else { fw.bucket }];
         x[0] += 1.0;
         x[1] += tg.target as f64;
         x[2] += (tg.target as f64).powi(2);

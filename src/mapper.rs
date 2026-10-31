@@ -51,6 +51,18 @@ pub fn bucket_of(empties: usize, buckets: usize) -> usize {
     (empties * buckets / 50).min(buckets - 1)
 }
 
+/// First empties count of each bucket in map E16 (id 1). MUST equal `titanium::nnue::bucket_map` in the engine
+/// (branch exp/bucketmap): fine buckets in the endgame where the loss is, even spread elsewhere.
+pub const E16_STARTS: [usize; 16] = [0, 2, 3, 4, 5, 6, 7, 11, 15, 19, 22, 25, 29, 33, 37, 41];
+
+/// Bucket of `empties` under map `id` (0 = the even formula; 1 = E16). The id lives in bits 8.. of the net's `groups` word.
+pub fn bucket_of_id(empties: usize, buckets: usize, id: u32) -> usize {
+    match id {
+        1 => E16_STARTS.iter().filter(|&&s| s <= empties).count() - 1,
+        _ => bucket_of(empties, buckets),
+    }
+}
+
 pub struct Sample {
     pub us: Vec<u32>,
     pub them: Vec<u32>,
@@ -61,10 +73,10 @@ pub fn board_of(r: &Rec, mode: usize) -> Board {
     Board::from_occ(transform_bb(r.occ0, mode), transform_bb(r.occ1, mode), 0, r.stm)
 }
 
-pub fn sample(r: &Rec, mode: usize, buckets: usize) -> Sample {
+pub fn sample(r: &Rec, mode: usize, buckets: usize, map_id: u32) -> Sample {
     let b = board_of(r, mode);
     let (us, nu, them, nt) = nnfeat::both(&b, ALL_GROUPS);
-    Sample { us: us[..nu].to_vec(), them: them[..nt].to_vec(), bucket: bucket_of(b.empty().count_ones() as usize, buckets) }
+    Sample { us: us[..nu].to_vec(), them: them[..nt].to_vec(), bucket: bucket_of_id(b.empty().count_ones() as usize, buckets, map_id) }
 }
 
 #[allow(dead_code)]

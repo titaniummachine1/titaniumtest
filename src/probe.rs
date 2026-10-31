@@ -212,7 +212,7 @@ pub fn run_probe(args: &[String]) -> ExitCode {
     let w = net.width;
     let mut freq = vec![0f64; NUM_FEATS];
     for r in &v {
-        let s = mapper::sample(r, 0, net.buckets);
+        let s = mapper::sample(r, 0, net.buckets, net.groups >> 8);
         for &f in s.us.iter().chain(s.them.iter()) {
             freq[f as usize] += 1.0;
         }

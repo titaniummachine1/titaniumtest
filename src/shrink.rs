@@ -25,7 +25,7 @@ pub fn shrink(net: &TrainableNet, w2: usize, cal: &[crate::data::Rec]) -> Result
     let mut n = 0f64;
     let mut a = vec![0f32; w];
     for r in cal {
-        let s = mapper::sample(r, 0, net.buckets);
+        let s = mapper::sample(r, 0, net.buckets, net.groups >> 8);
         for idx in [&s.us, &s.them] {
             a.copy_from_slice(&net.ftb);
             for &f in idx.iter() {
@@ -131,7 +131,7 @@ fn collect(net: &TrainableNet, rows: &[crate::data::Rec]) -> Acts {
     let mut bucket = Vec::with_capacity(rows.len());
     let mut t = vec![0f32; w];
     for r in rows {
-        let s = mapper::sample(r, 0, net.buckets);
+        let s = mapper::sample(r, 0, net.buckets, net.groups >> 8);
         for idx in [&s.us, &s.them] {
             t.copy_from_slice(&net.ftb);
             for &f in idx.iter() {
@@ -541,6 +541,79 @@ pub fn run_split(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("split: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Re-map the phase buckets of a net onto bucket map `id` (same bucket count): new bucket b' copies the weights of the old bucket
+/// that holds the median empties count of b'. Parity is approximate unless the new buckets nest in the old ones, so the
+/// val-mse change is printed; train / calibrate afterwards.
+pub fn remap_buckets(net: &TrainableNet, id: u32) -> Result<TrainableNet, String> {
+    let nb = net.buckets;
+    let old = |e: usize| crate::mapper::bucket_of_id(e, nb, net.groups >> 8);
+    let mut src = vec![0usize; nb];
+    for b2 in 0..nb {
+        let es: Vec<usize> = (1..=45).filter(|&e| crate::mapper::bucket_of_id(e, nb, id) == b2).collect();
+        if es.is_empty() {
+            return Err(format!("new bucket {b2} covers no reachable empties count (1..=45)"));
+        }
+        src[b2] = old(es[es.len() / 2]);
+    }
+    let mut n = net.clone();
+    n.groups = (net.groups & 0xFF) | (id << 8);
+    let pick = |v: &Vec<f32>| -> Vec<f32> {
+        if v.is_empty() {
+            return Vec::new();
+        }
+        let chunk = v.len() / nb;
+        let mut o = Vec::with_capacity(v.len());
+        for b2 in 0..nb {
+            o.extend_from_slice(&v[src[b2] * chunk..(src[b2] + 1) * chunk]);
+        }
+        o
+    };
+    let nf = net.psqt.len() / nb;
+    let mut psqt = Vec::with_capacity(net.psqt.len());
+    for fi in 0..nf {
+        for b2 in 0..nb {
+            psqt.push(net.psqt[fi * nb + src[b2]]);
+        }
+    }
+    n.psqt = psqt;
+    n.l1_w = pick(&net.l1_w);
+    n.l1_b = pick(&net.l1_b);
+    n.l2_w = pick(&net.l2_w);
+    n.l2_b = pick(&net.l2_b);
+    n.out_w = pick(&net.out_w);
+    n.out_b = pick(&net.out_b);
+    n.s57w = pick(&net.s57w);
+    n.dis_w = pick(&net.dis_w);
+    n.dis_b = pick(&net.dis_b);
+    Ok(n)
+}
+
+/// `ti train remap --net a.tnn --data <stem> --out b.tnn --map 1 [--rows N] [--threads T]`
+pub fn run_remap(args: &[String]) -> ExitCode {
+    let r = (|| -> Result<(), String> {
+        let f = |n: &str| crate::flag_str(args, n);
+        let (net_p, data, out_p) = (f("--net").ok_or("--net required")?, f("--data").ok_or("--data <stem> required")?, f("--out").ok_or("--out required")?);
+        let id = crate::flag_u64(args, "--map").ok_or("--map <id> required")? as u32;
+        let rows = crate::flag_u64(args, "--rows").unwrap_or(20000) as usize;
+        let threads = crate::flag_u64(args, "--threads").unwrap_or(6) as usize;
+        let net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_p).map_err(|e| format!("{net_p}: {e}"))?)?;
+        let big = remap_buckets(&net, id)?;
+        let cal = load_val(&mut Tdat::open(&data)?, rows)?;
+        let (a, b) = (evaluate(&net, &cal, threads), evaluate(&big, &cal, threads));
+        println!("[remap] map {} -> {}; val mse on {} rows: original {:.8}  remapped {:.8}  delta {:+.2e}", net.groups >> 8, id, cal.len(), a.mse, b.mse, b.mse - a.mse);
+        std::fs::write(&out_p, big.to_tnn_bytes()).map_err(|e| e.to_string())?;
+        println!("[remap] wrote {out_p}");
+        Ok(())
+    })();
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("remap: {e}");
             ExitCode::FAILURE
         }
     }

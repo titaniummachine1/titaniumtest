@@ -205,10 +205,15 @@ impl TrainableNet {
     }
 
     /// Forward with the hidden activations (h1, h2) and the phase bucket, for the disagreement-head fit.
+    /// Output bucket of a position with `empties` empty squares, under this net's bucket map (groups bits 8..).
+    pub fn bucket(&self, empties: usize) -> usize {
+        crate::mapper::bucket_of_id(empties, self.buckets, self.groups >> 8)
+    }
+
     pub fn forward_full(&self, b: &Board) -> Fwd {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
         let (w, l1, l2, din, out_in) = (self.width, self.l1, self.l2, self.din(), self.out_in());
-        let bucket = ((b.empty().count_ones() as usize) * self.buckets / 50).min(self.buckets - 1);
+        let bucket = self.bucket(b.empty().count_ones() as usize);
         let mut x = vec![0f32; 2 * w];
         let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
@@ -283,7 +288,7 @@ impl TrainableNet {
         let din = self.din();
         let out_in = self.out_in();
         let empties = b.empty().count_ones() as usize;
-        let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
+        let bucket = self.bucket(empties);
 
         // 1. Feature transformer forward
         let mut raw_acc = vec![0f32; 2 * w];
