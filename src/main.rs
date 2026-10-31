@@ -13,6 +13,7 @@
 
 mod book;
 mod data;
+mod targets;
 mod gate;
 mod games;
 mod sprt;

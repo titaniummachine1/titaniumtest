@@ -362,6 +362,7 @@ pub fn run_data(args: &[String]) -> ExitCode {
                 }
             }
         }
+        Some("check-targets") => crate::targets::run_check(args),
         _ => {
             eprintln!("usage: ti data pack --npz <v9.npz> --out <stem>");
             ExitCode::FAILURE
