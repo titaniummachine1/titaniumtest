@@ -13,10 +13,11 @@ use crate::trainer::{load_val, Tdat};
 use titanium::board::Board;
 use titanium::nnfeat::{G2_OFF, G3_OFF, G5_OFF, G6_OFF, NUM_FEATS, SQ_STATES};
 
-const NC: usize = 20;
+const NC: usize = 26;
 const NAMES: [&str; NC] = [
     "mob_us", "mob_them", "stuck_us", "stuck_them", "cap_us", "cap_them", "regions", "largest_region", "odd_regions", "terr_us",
     "terr_them", "contested", "empties", "stone_diff", "perm_us", "perm_them", "safe_us", "safe_them", "exposed_us", "exposed_them",
+    "pst_us", "pst_them", "corner_us", "corner_them", "edge_us", "edge_them",
 ];
 
 const FULL: u64 = (1u64 << 49) - 1;
@@ -46,6 +47,30 @@ const NOT_C6: u64 = {
 /// king-step dilation on the 7x7 grid (symmetric, so independent of row/column bit order)
 fn dil(x: u64) -> u64 {
     (x | ((x << 1) & NOT_C0) | ((x >> 1) & NOT_C6) | (x << 7) | (x >> 7) | ((x << 8) & NOT_C0) | ((x << 6) & NOT_C6) | ((x >> 6) & NOT_C0) | ((x >> 8) & NOT_C6)) & FULL
+}
+
+/// square-value table: Chebyshev distance from the centre (0..3), the 4 corners, the outer ring
+const fn sq_masks() -> ([u64; 4], u64, u64) {
+    let (mut ring, mut corner, mut edge) = ([0u64; 4], 0u64, 0u64);
+    let mut s = 0;
+    while s < 49 {
+        let (r, c) = ((s / 7) as i32, (s % 7) as i32);
+        let (dr, dc) = ((r - 3).abs(), (c - 3).abs());
+        let d = if dr > dc { dr } else { dc };
+        ring[d as usize] |= 1 << s;
+        if dr == 3 && dc == 3 {
+            corner |= 1 << s;
+        }
+        if d == 3 {
+            edge |= 1 << s;
+        }
+        s += 1;
+    }
+    (ring, corner, edge)
+}
+const SQM: ([u64; 4], u64, u64) = sq_masks();
+fn pst(x: u64) -> f64 {
+    (0..4).map(|d| d as f64 * (x & SQM.0[d]).count_ones() as f64).sum()
 }
 
 fn mobility_and_capture(b: &Board) -> (f64, f64) {
@@ -118,6 +143,12 @@ fn cand_features(b: &Board) -> [f64; NC] {
         safe_them.count_ones() as f64,
         exp_us.count_ones() as f64,
         exp_them.count_ones() as f64,
+        pst(us),
+        pst(them),
+        (us & SQM.1).count_ones() as f64,
+        (them & SQM.1).count_ones() as f64,
+        (us & SQM.2).count_ones() as f64,
+        (them & SQM.2).count_ones() as f64,
     ]
 }
 
