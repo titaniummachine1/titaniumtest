@@ -193,3 +193,8 @@ Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Opt
 
 ## 2026-10-31 Constraint (user): AVX2 default, AVX-512 also supported
 Width/speed curve (nps per width + 100 ms gates of refit-shrunk nets) must be measured on BOTH tiers: local PC = AVX2 (Haswell); AVX-512 via Docker sbx CPU sandbox if cpuid shows avx512 (CPU work goes to Docker, not Modal), Modal GPU hosts only as fallback. A width is only a candidate if it does not regress either tier.
+
+## 2026-10-31 NULL TEST + mandatory evals (D240)
+- Null test: champion 7AE0122F with ONLY its disagreement head refit by `ti train export` on v9 (1,367 bytes changed, sha EDC7BEC6) vs the original, 5k nodes, 300 g: **+45.4 +- 41.6, LLR +0.93** (LL 32, LD 3, DD+WL 56, WD 12, WW 47). The dis head drives search pruning (search.rs:1103) and its refit alone is worth ~+45 at 5k nodes (not yet significant, needs extension + 100 ms).
+- Consequence: every candidate gated so far carried this refit. Re-read relative to the re-exported champion: 512 upscale untrained +72 -> width worth only ~+25; v9-trained 256 -102 -> v9 training costs ~-150. Earlier attributions (D237/D239) are corrected by this.
+- Mandatory evals: engine branch exp/uai-info (worktree C:\gitProjects\info-ataxx, f211f71, exe 94751C57, bundled net 7AE0122F) prints `info depth D score cp|mate N nodes N time T nps N` before every bestmove (moves unchanged). `ti sprt` now refuses an engine that prints no info line (probe search at spawn). Games jsonl now carry score/depth/nodes per move. Old main exe FC2AE776 is refused from now on.

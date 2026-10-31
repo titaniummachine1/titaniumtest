@@ -428,6 +428,12 @@ impl UaiEngine {
         };
         eng.send("uai")?;
         eng.wait_for("uaiok")?;
+        // mandatory: every gate move must record what the engine thought (score, depth, nodes); refuse silent engines
+        eng.new_game()?;
+        let (_, t) = eng.search_move(&Board::start(), None, Some(200))?;
+        if (t.score.is_none() && t.mate.is_none()) || t.depth.is_none() || t.nodes.is_none() {
+            return Err(format!("engine '{cmd_line}' prints no 'info depth .. score .. nodes ..' line before bestmove: evals are mandatory for gate analysis (build the engine from exp/uai-info or later)"));
+        }
         Ok(eng)
     }
 
