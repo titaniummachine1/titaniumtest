@@ -213,3 +213,5 @@ Running: logs/gates/levers_dis.sh -> exports dis_{r2m_l1,r200k_l01,r200k_l10}.tn
 
 ## Gate bar (user 2026-10-31)
 Only need to prove a candidate is objectively better than main (law 10): CI lower bound on score > 0.5 or SPRT upper bound. Magnitude is not a criterion (not Stockfish-style Elo counting). Extend straddles; never rank variants by Elo against each other.
+- sandbox tit-sw1 (Docker cloud, AMD EPYC 16 vCPU): cpuid avx2 yes, avx512 NO (2026-10-31) -> AVX-512 tier needs Modal GPU host
+- AVX-512 tier gates (need Modal GPU host; Docker has no avx512): HELD until later, probably past midnight, Modal budget goes to GPU training first (user 2026-10-31). AVX2 gates run on Docker/local meanwhile.
