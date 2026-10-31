@@ -224,3 +224,4 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 ## Promotion legs (user 2026-10-31): search/cost-per-node changes need 5k AND 100 ms passing (+200 ms when aimed at longer search); a clearly negative leg blocks the merge. See BEHAVIOR 35a.
 - Eval-quality-only changes (same width/arch, same nps) may be proven at 5k nodes alone; width/speed changes need timed legs (user 2026-10-31).
 - BEHAVIOR 35b: ahead = presumed pass until proven otherwise; extend unresolved gates first, fresh openings via --book0.
+- Screening gates are NOT SPRTs unless run to a bound: every unresolved gate (LLR inside +-2.94) is continued on fresh openings (--book0) until bound or 2000 games, positives first (user 2026-10-31). logs/gates/resolve.sh is the stopgap.
