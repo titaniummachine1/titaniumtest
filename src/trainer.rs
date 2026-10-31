@@ -197,6 +197,8 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
                 ema: crate::flag_f64(args, "--ema").unwrap_or(0.0) as f32,
                 guard: crate::flag_f64(args, "--guard").unwrap_or(1.15) as f32,
+                patience: g("--patience", 0),
+                min_delta: crate::flag_f64(args, "--min-delta").unwrap_or(2e-6),
             });
         }
         #[cfg(not(feature = "gpu"))]

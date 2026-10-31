@@ -89,6 +89,9 @@ pub struct GpuCfg {
     pub ema: f32,
     /// abort when val mse > guard * initial val mse (0 = off). Mistake 39 / D153: a bad fine-tune showed 0.0204 -> 0.0216 in epoch 1
     pub guard: f32,
+    /// early stopping: stop after this many checkpoints without a val-mse gain > min_delta (0 = off). User order 2026-10-31.
+    pub patience: usize,
+    pub min_delta: f64,
 }
 
 const NB: usize = 8;
@@ -251,6 +254,8 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
     let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
     let (out, threads, ema_d, guard, holdout) = (c.out.clone(), c.threads, c.ema, c.guard, c.holdout);
+    let (patience, min_delta) = (c.patience, c.min_delta);
+    let mut since_best = 0usize;
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
     let mut ema_net: Option<TrainableNet> = None;
@@ -268,7 +273,9 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         let sbn = step.total_batches() / sb;
         let v = trainer::evaluate(&net, &val, threads);
         let mut line = format!("[val superbatch {sbn}] live mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
-        let tr = trainer::evaluate(&net, &probe, threads).mse;
+        let trs = trainer::evaluate(&net, &probe, threads);
+        let tr = trs.mse;
+        line += &format!(" | train-proven {:.6} (n={}; val has NO Zataxx proofs)", trs.mse_proven, trs.n_proven);
         // the GPU idles while this callback runs: keep the extra probes small and print their cost
         let t_probe = std::time::Instant::now();
         let modes = trainer::d4_modes(&net, &val, threads, 8192);
@@ -303,8 +310,12 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
             let _ = std::fs::remove_file(p);
         }
         if pick_mse < best {
+            // a gain smaller than min_delta is saved but does not reset the patience counter
+            since_best = if pick_mse < best - min_delta { 0 } else { since_best + 1 };
             best = pick_mse;
             let _ = std::fs::write(format!("{out}/best.tnn"), pick.to_tnn_bytes());
+        } else {
+            since_best += 1;
         }
         let _ = std::fs::create_dir_all(&ckpt);
         if o.write_to_checkpoint(&ckpt).is_ok() {
@@ -315,6 +326,13 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
             eprintln!("{msg}");
             let _ = std::fs::write(format!("{out}/GUARD_TRIPPED.txt"), &msg);
             std::process::exit(3);
+        }
+        // early stopping: val loss (the generalisation signal) has not improved for `patience` checkpoints -> stop, keep best.tnn
+        if patience > 0 && since_best >= patience {
+            let msg = format!("EARLY STOP at superbatch {sbn}: best val mse {best:.6} not improved by {min_delta:e} for {since_best} checkpoints ({} steps). best.tnn holds the best weights.", since_best * sb);
+            println!("{msg}");
+            let _ = std::fs::write(format!("{out}/EARLY_STOP.txt"), &msg);
+            std::process::exit(0);
         }
     })
     .map_err(|_| "bullet training failed (TrainingError<G> has no Debug bound here; see the console log above)".to_string())?;
