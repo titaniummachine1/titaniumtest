@@ -1,12 +1,19 @@
 [package]
-name = "titaniumtest"
+name = "titanium-hub"
 version = "0.1.0"
 edition = "2021"
-description = "Fishtest/Fishnet-style distributed SPRT gating and teacher relabeling coordinator & worker for Titanium Ataxx"
+description = "ti: the one Titanium tool hub (SPRT gates, books, relabel, NNUE training, coordinator/worker). Moved from the engine repo (crates/titanium-hub, exp/ti-hub 1927bf7); builds against the PUBLISHED engine only."
 license = "MIT"
 
+[[bin]]
+name = "ti"
+path = "src/main.rs"
+
 [dependencies]
-titanium = { path = "../main-ataxx/crates/titanium" }
+# Published engine, pinned (origin/main 20c7acc). For local engine work add a gitignored .cargo/config.toml with
+#   [patch."https://github.com/titaniummachine1/titanium-ataxx"]
+#   titanium = { path = "C:/gitProjects/titanium-ataxx/crates/titanium" }
+titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "20c7accb" }
 
 [profile.release]
 opt-level = 3

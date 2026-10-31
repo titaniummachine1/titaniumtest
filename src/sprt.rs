@@ -5,6 +5,18 @@
 //! - Log-Likelihood Ratio (LLR) against [elo0, elo1] with bounds [ln(beta/(1-alpha)), ln((1-beta)/alpha)]
 //!   For alpha = 0.05, beta = 0.05, bounds are [-2.9444, +2.9444].
 //! - LOS (Likelihood Of Superiority).
+//!
+//! Gate rules (user order 2026-10-30): no verdict below `MIN_GAMES` (100 games = 50 complete pairs, both
+//! seats of every line); pair-score variance floored at `VAR_FLOOR` so identical pairs (every line split
+//! 1-1 by seat) cannot manufacture certainty; `seat_split` reports the share of 1-1 split pairs (> 0.5 =
+//! the book is too unbalanced to measure strength).
+
+/// No SPRT verdict below this many games.
+pub const MIN_GAMES: u32 = 100;
+/// Floor on the per-pair score variance (real gates measure ~0.10).
+pub const VAR_FLOOR: f64 = 0.01;
+/// Above this share of 1-1 split pairs the book lines are seat-decided.
+pub const SEAT_SPLIT_WARN: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SprtTally {
@@ -33,6 +45,8 @@ pub struct SprtStats {
     pub llr: f64,
     pub lower_bound: f64,
     pub upper_bound: f64,
+    /// Share of pairs that split 1-1 (`penta[2]` minus drawn pairs is not separable; DD is rare in Ataxx).
+    pub seat_split: f64,
     pub verdict: SprtVerdict,
 }
 
@@ -76,6 +90,7 @@ impl SprtTally {
                 llr: 0.0,
                 lower_bound,
                 upper_bound,
+                seat_split: 0.0,
                 verdict: SprtVerdict::Continue,
             };
         }
@@ -103,7 +118,7 @@ impl SprtTally {
                 .zip(values.iter())
                 .map(|(p, v)| p * (v - mu) * (v - mu))
                 .sum::<f64>()
-                .max(1e-4);
+                .max(VAR_FLOOR);
             let sigma_pair = (var / n_p).sqrt();
 
             let s_hi = (mu + 1.95996 * sigma_pair).clamp(1e-6, 1.0 - 1e-6);
@@ -123,7 +138,7 @@ impl SprtTally {
             (0.0, 0.5, 0.0)
         };
 
-        let verdict = if total_pairs < 8 {
+        let verdict = if total_games < MIN_GAMES {
             SprtVerdict::Continue
         } else if llr >= upper_bound {
             SprtVerdict::Pass
@@ -143,6 +158,7 @@ impl SprtTally {
             llr,
             lower_bound,
             upper_bound,
+            seat_split: if total_pairs > 0 { self.penta[2] as f64 / total_pairs as f64 } else { 0.0 },
             verdict,
         }
     }
@@ -164,33 +180,53 @@ fn erf_approx(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn tally(pairs: &[((u8, u8), u32)]) -> SprtTally {
+        let mut t = SprtTally::default();
+        for &((a, b), n) in pairs {
+            for _ in 0..n {
+                t.record_pair(a, b);
+            }
+        }
+        t
+    }
+
     #[test]
     fn strong_candidate_passes_sprt() {
-        let mut t = SprtTally::default();
-        for _ in 0..40 {
-            t.record_pair(2, 2); // WW
-        }
-        for _ in 0..10 {
-            t.record_pair(2, 0); // WL
-        }
-        let st = t.compute(0.0, 5.0, 0.05, 0.05);
+        let st = tally(&[((2, 2), 40), ((2, 0), 30), ((0, 0), 10)]).compute(0.0, 20.0, 0.05, 0.05);
         assert!(st.elo > 100.0);
-        assert!(st.llr > st.upper_bound);
         assert_eq!(st.verdict, SprtVerdict::Pass);
     }
 
     #[test]
     fn weaker_candidate_fails_sprt() {
-        let mut t = SprtTally::default();
-        for _ in 0..40 {
-            t.record_pair(0, 0); // LL
-        }
-        for _ in 0..10 {
-            t.record_pair(2, 0); // WL
-        }
-        let st = t.compute(0.0, 5.0, 0.05, 0.05);
+        let st = tally(&[((0, 0), 40), ((2, 0), 30), ((2, 2), 10)]).compute(0.0, 20.0, 0.05, 0.05);
         assert!(st.elo < -100.0);
-        assert!(st.llr < st.lower_bound);
         assert_eq!(st.verdict, SprtVerdict::Fail);
+    }
+
+    #[test]
+    fn no_verdict_below_min_games() {
+        // 40 pairs = 80 games, all won: still no verdict (the old code decided after 8 pairs)
+        let st = tally(&[((2, 2), 40)]).compute(0.0, 20.0, 0.05, 0.05);
+        assert_eq!(st.games, 80);
+        assert_eq!(st.verdict, SprtVerdict::Continue);
+    }
+
+    #[test]
+    fn seat_split_book_never_passes_and_is_flagged() {
+        // every line won by the same seat for both engines: no evidence of strength
+        let st = tally(&[((2, 0), 100)]).compute(0.0, 20.0, 0.05, 0.05);
+        assert_ne!(st.verdict, SprtVerdict::Pass);
+        assert!(st.seat_split > SEAT_SPLIT_WARN);
+        assert!(st.llr > -10.0, "variance floor must stop degenerate certainty, llr {}", st.llr);
+    }
+
+    #[test]
+    fn matches_python_gate_summary_on_the_d154_regate() {
+        // logs/gate_regate_d154_std_5k: penta [28, 8, 106, 10, 56] -> python gate_summary.py LLR +3.26 (elo1 20)
+        let st = tally(&[((0, 0), 28), ((0, 1), 8), ((2, 0), 106), ((2, 1), 10), ((2, 2), 56)]).compute(0.0, 20.0, 0.05, 0.05);
+        assert!((st.llr - 3.26).abs() < 0.05, "llr {}", st.llr);
+        assert!((st.elo - 48.8).abs() < 1.0, "elo {}", st.elo);
+        assert_eq!(st.verdict, SprtVerdict::Pass);
     }
 }

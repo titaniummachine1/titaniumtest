@@ -40,6 +40,10 @@ pub struct TrainableNet {
     pub out_w: Vec<f32>,
     pub out_b: Vec<f32>,
     pub s57w: Vec<f32>,
+    /// TNN3: zero-cost Disagreement Head over h1 || h2 (dis_w[buckets][l1 + l2], dis_b[buckets]); not trained here.
+    pub has_dis: bool,
+    pub dis_w: Vec<f32>,
+    pub dis_b: Vec<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -54,19 +58,20 @@ pub struct LabeledSample {
 impl TrainableNet {
     pub fn from_tnn_bytes(d: &[u8]) -> Result<Self, String> {
         let v2 = d.len() >= 4 && &d[..4] == b"TNN2";
-        if d.len() < 28 || (&d[..4] != b"TNN1" && !v2) {
-            return Err("not a TNN1/TNN2 file".to_string());
+        let has_dis = d.len() >= 4 && &d[..4] == b"TNN3";
+        if d.len() < 28 || (&d[..4] != b"TNN1" && !v2 && !has_dis) {
+            return Err("not a TNN1/TNN2/TNN3 file".to_string());
         }
         let u = |i: usize| u32::from_le_bytes(d[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
         let (num_feats, width, l1, l2, buckets, groups) =
             (u(0), u(1), u(2), u(3), u(4), u(5) as u32);
-        let pairwise = v2 && u(6) != 0;
+        let pairwise = (v2 || has_dis) && u(6) != 0;
         if num_feats != NUM_FEATS {
             return Err(format!("num_feats {num_feats} != {NUM_FEATS}"));
         }
         let din = if pairwise { width } else { 2 * width };
         let out_in = if v2 { l1 + l2 } else { l2 };
-        let mut p = if v2 { 32 } else { 28 };
+        let mut p = if v2 || has_dis { 32 } else { 28 };
         let mut take = |n: usize| -> Vec<f32> {
             let v = d[p..p + 4 * n]
                 .chunks_exact(4)
@@ -86,6 +91,9 @@ impl TrainableNet {
             out_w: take(buckets * out_in),
             out_b: take(buckets),
             s57w: if v2 { take(buckets) } else { Vec::new() },
+            dis_w: if has_dis { take(buckets * (l1 + l2)) } else { Vec::new() },
+            dis_b: if has_dis { take(buckets) } else { Vec::new() },
+            has_dis,
             num_feats,
             width,
             l1,
@@ -103,7 +111,13 @@ impl TrainableNet {
 
     pub fn to_tnn_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.ft.len() * 4 + 65536);
-        out.extend_from_slice(if self.v2 { b"TNN2" } else { b"TNN1" });
+        out.extend_from_slice(if self.has_dis {
+            b"TNN3"
+        } else if self.v2 {
+            b"TNN2"
+        } else {
+            b"TNN1"
+        });
         for &val in &[
             self.num_feats as u32,
             self.width as u32,
@@ -114,7 +128,7 @@ impl TrainableNet {
         ] {
             out.extend_from_slice(&val.to_le_bytes());
         }
-        if self.v2 {
+        if self.v2 || self.has_dis {
             out.extend_from_slice(&(if self.pairwise { 1u32 } else { 0u32 }).to_le_bytes());
         }
         let mut push_slice = |s: &[f32]| {
@@ -133,6 +147,10 @@ impl TrainableNet {
         push_slice(&self.out_b);
         if self.v2 {
             push_slice(&self.s57w);
+        }
+        if self.has_dis {
+            push_slice(&self.dis_w);
+            push_slice(&self.dis_b);
         }
         out
     }
@@ -756,6 +774,7 @@ mod tests {
         let mut tnet = TrainableNet::from_tnn_bytes(BUNDLED_NNUE).expect("parse bundled");
         let exported = tnet.to_tnn_bytes();
         assert_eq!(exported.len(), BUNDLED_NNUE.len());
+        assert!(exported == BUNDLED_NNUE, "TNN round trip must be byte-identical");
 
         let b = Board::start();
         let ref_nnue = Nnue::bundled();

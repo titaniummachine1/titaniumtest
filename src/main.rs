@@ -11,10 +11,14 @@
 //!
 //!   titaniumtest worker --server http://127.0.0.1:8080 [--threads 4] [--worker-id NAME]
 
+mod book;
+mod gate;
+mod games;
 mod sprt;
 mod train;
 
 use sprt::{SprtTally, SprtVerdict};
+mod hash;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -35,8 +39,13 @@ fn main() -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("help");
     match sub {
         "sprt" => run_sprt_cli(&args[1..]),
+        "gate" => gate::run_gate(&args[1..]),
+        "log" => gate::run_log(&args[1..]),
+        "merge-check" => gate::run_merge_check(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
+        "analyze" => games::run_analyze(&args[1..]),
+        "harvest" => games::run_harvest(&args[1..]),
         "coordinator" => run_coordinator(&args[1..]),
         "worker" => run_worker(&args[1..]),
         _ => {
@@ -421,7 +430,7 @@ impl UaiEngine {
         b: &Board,
         time_ms: Option<u64>,
         nodes: Option<u64>,
-    ) -> Result<Option<Move>, String> {
+    ) -> Result<(Option<Move>, Thought), String> {
         self.send(&format!("position fen {}", b.to_ataxx_fen()))?;
         let go_cmd = match (time_ms, nodes) {
             (Some(ms), _) => format!("go movetime {ms}"),
@@ -429,9 +438,25 @@ impl UaiEngine {
             (None, None) => "go movetime 100".to_string(),
         };
         self.send(&go_cmd)?;
-        let line = self.wait_for("bestmove ")?;
+        let t0 = Instant::now();
+        let mut thought = Thought::default();
+        let mut buf = String::new();
+        let line = loop {
+            buf.clear();
+            let n = self.stdout.read_line(&mut buf).map_err(|e| format!("read_line waiting for bestmove: {e}"))?;
+            if n == 0 {
+                return Err("EOF waiting for 'bestmove'".into());
+            }
+            let l = buf.trim();
+            if l.starts_with("info") && l.contains(" score ") {
+                parse_info(l, &mut thought);
+            } else if l.starts_with("bestmove ") {
+                break l.to_string();
+            }
+        };
+        thought.ms = t0.elapsed().as_millis() as u64;
         let tok = line.split_whitespace().nth(1).unwrap_or("pass");
-        Ok(parse_uai_move(b, tok))
+        Ok((parse_uai_move(b, tok), thought))
     }
 }
 
@@ -442,6 +467,25 @@ impl Drop for UaiEngine {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Hash label of an engine spec: `self` = bundled net, `*.tnn` = that net, else the exe (first token) plus every
+/// `.tnn` argument, so a log always says which binary and which net played.
+fn engine_label(spec: &str) -> String {
+    if spec == "self" {
+        return format!("bundled {}", hash::short_hex(titanium::nnue::BUNDLED_NNUE));
+    }
+    let path = spec.strip_prefix("tnn:").unwrap_or(spec);
+    if path.ends_with(".tnn") && !path.contains(char::is_whitespace) {
+        return format!("net {}", hash::file_label(path));
+    }
+    let mut toks = spec.split_whitespace();
+    let exe = toks.next().unwrap_or("");
+    let mut out = format!("exe {}", hash::file_label(exe));
+    for t in toks.filter(|t| t.ends_with(".tnn")) {
+        out.push_str(&format!(" net {}", hash::file_label(t)));
+    }
+    out
 }
 
 fn parse_uai_move(b: &Board, text: &str) -> Option<Move> {
@@ -469,6 +513,106 @@ fn parse_uai_move(b: &Board, text: &str) -> Option<Move> {
     None
 }
 
+/// What the engine reported for one move: score from the MOVER's view (cp, or `mate` in moves when proven:
+/// + = mover mates, - = mover is mated; `score` is then None), depth,
+/// nodes, wall time measured by the hub, principal variation. External engines: the last `info ... score`
+/// line before `bestmove`; missing fields stay None.
+#[derive(Clone, Debug, Default)]
+pub struct Thought {
+    pub score: Option<i32>,
+    pub mate: Option<i32>,
+    pub depth: Option<u32>,
+    pub nodes: Option<u64>,
+    pub ms: u64,
+    pub pv: String,
+}
+
+/// One played move with the mover's thought.
+#[derive(Clone, Debug)]
+pub struct MoveRec {
+    pub ply: u16,
+    pub side: u8,
+    pub mover: &'static str,
+    pub mv: String,
+    pub thought: Thought,
+}
+
+fn parse_info(line: &str, t: &mut Thought) {
+    let tok: Vec<&str> = line.split_whitespace().collect();
+    let mut i = 0;
+    while i < tok.len() {
+        match tok[i] {
+            "depth" => t.depth = tok.get(i + 1).and_then(|v| v.parse().ok()),
+            "nodes" => t.nodes = tok.get(i + 1).and_then(|v| v.parse().ok()),
+            "score" => match tok.get(i + 1).copied() {
+                Some("cp") => {
+                    t.score = tok.get(i + 2).and_then(|v| v.parse().ok());
+                    t.mate = None;
+                }
+                Some("mate") => {
+                    // a mate is exact: keep the distance, never a made-up cp value
+                    t.mate = tok.get(i + 2).and_then(|v| v.parse().ok());
+                    t.score = None;
+                }
+                _ => {}
+            },
+            "pv" => {
+                t.pv = tok[i + 1..].join(" ");
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push(' '),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
+    v.as_ref().map(|x| x.to_string()).unwrap_or_else(|| "null".into())
+}
+
+/// One JSON line per game: everything needed to replay it and to see what each engine thought on every move.
+fn game_json(pair: usize, book_idx: usize, start: &Board, cand_seat: &str, pts_x2: u8, bl: u32, wh: u32, moves: &[MoveRec]) -> String {
+    let mv: Vec<String> = moves
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"ply\":{},\"side\":\"{}\",\"mover\":\"{}\",\"move\":{},\"score\":{},\"mate\":{},\"depth\":{},\"nodes\":{},\"ms\":{},\"pv\":{}}}",
+                m.ply,
+                if m.side == 0 { "x" } else { "o" },
+                m.mover,
+                json_str(&m.mv),
+                opt(&m.thought.score),
+                opt(&m.thought.mate),
+                opt(&m.thought.depth),
+                opt(&m.thought.nodes),
+                m.thought.ms,
+                json_str(&m.thought.pv)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"pair\":{pair},\"book\":{book_idx},\"start\":{},\"candidate_seat\":\"{cand_seat}\",\"candidate_points\":{},\"final_x\":{bl},\"final_o\":{wh},\"moves\":[{}]}}",
+        json_str(&start.to_ataxx_fen()),
+        pts_x2 as f64 / 2.0,
+        mv.join(",")
+    )
+}
+
 enum PlayerSlot {
     InProcess(Searcher<'static>),
     External(UaiEngine),
@@ -478,7 +622,8 @@ impl PlayerSlot {
     fn create(spec: &str) -> Result<Self, String> {
         if spec == "self" {
             Ok(PlayerSlot::InProcess(Searcher::with_main_network()))
-        } else if spec.ends_with(".tnn") || spec.starts_with("tnn:") {
+        } else if spec.starts_with("tnn:") || (spec.ends_with(".tnn") && !spec.contains(char::is_whitespace)) {
+            // a bare net path = in-process searcher; an engine COMMAND that merely ends in .tnn is external
             let path = spec.strip_prefix("tnn:").unwrap_or(spec);
             let loaded = Nnue::load(path).map_err(|e| format!("load tnn '{path}': {e}"))?;
             let leaked: &'static Nnue = Box::leak(Box::new(loaded));
@@ -505,7 +650,7 @@ impl PlayerSlot {
         b: &Board,
         time_ms: Option<u64>,
         nodes: Option<u64>,
-    ) -> Result<Option<Move>, String> {
+    ) -> Result<(Option<Move>, Thought), String> {
         match self {
             PlayerSlot::InProcess(s) => {
                 let limits = SearchLimits {
@@ -513,7 +658,17 @@ impl PlayerSlot {
                     max_nodes: nodes,
                     max_depth: u8::MAX,
                 };
-                Ok(s.search(b, &limits).best)
+                let r = s.search(b, &limits);
+                let mate = mate_in_moves(r.score);
+                let t = Thought {
+                    score: if mate.is_some() { None } else { Some(r.score) },
+                    mate,
+                    depth: Some(r.depth),
+                    nodes: Some(r.nodes),
+                    ms: r.elapsed.as_millis() as u64,
+                    pv: String::new(),
+                };
+                Ok((r.best, t))
             }
             PlayerSlot::External(e) => e.search_move(b, time_ms, nodes),
         }
@@ -531,20 +686,26 @@ fn play_single_game(
     nodes: Option<u64>,
     cand_reset_every_move: bool,
     base_reset_every_move: bool,
+    libataxx_end: bool,
+    moves: &mut Vec<MoveRec>,
 ) -> Result<(u8, u32, u32, u16), String> {
     cand.reset()?;
     base.reset()?;
     let mut b = *start_board;
     let mut forfeit_winner: Option<u8> = None;
+    moves.clear();
 
-    while !b.game_over() && b.ply < 300 {
+    // libataxx (Moonbird/Zataxx) ends the game when NEITHER side can move; classic plays the pass first.
+    let over = |b: &Board| b.game_over() || (libataxx_end && !b.has_moves(0) && !b.has_moves(1));
+    while !over(&b) && b.ply < 300 {
         let side = b.turn;
         if !b.has_moves(side) {
+            moves.push(MoveRec { ply: b.ply as u16, side, mover: "-", mv: "0000".into(), thought: Thought::default() });
             b = b.make_pass();
             continue;
         }
         let cand_turn = (side == 0) == candidate_is_black;
-        let mv = if cand_turn {
+        let (mv, thought) = if cand_turn {
             if cand_reset_every_move {
                 cand.reset()?;
             }
@@ -557,9 +718,18 @@ fn play_single_game(
         };
         match mv {
             Some(m) => {
+                let mv = if m.is_clone() {
+                    Board::sq_name(m.to)
+                } else {
+                    format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+                };
+                let mover = if cand_turn { "candidate" } else { "baseline" };
+                moves.push(MoveRec { ply: b.ply as u16, side, mover, mv, thought });
                 b = b.make(m);
             }
             None => {
+                let mover = if cand_turn { "candidate" } else { "baseline" };
+                moves.push(MoveRec { ply: b.ply as u16, side, mover, mv: "FORFEIT".into(), thought });
                 forfeit_winner = Some(1 - side);
                 break;
             }
@@ -567,7 +737,7 @@ fn play_single_game(
     }
 
     let winner = forfeit_winner.unwrap_or_else(|| {
-        if b.ply >= 300 && !b.game_over() {
+        if b.ply >= 300 && !over(&b) {
             2
         } else {
             b.winner()
@@ -607,25 +777,57 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let cand_reset_every_move = has_flag(args, "--cand-reset-every-move");
     let base_reset_every_move = has_flag(args, "--base-reset-every-move");
     let elo0 = flag_f64(args, "--elo0").unwrap_or(0.0);
-    let elo1 = flag_f64(args, "--elo1").unwrap_or(10.0);
+    let elo1 = flag_f64(args, "--elo1").unwrap_or(20.0);
     let max_games = flag_u64(args, "--max-games").unwrap_or(200) as usize;
     let threads = resolve_threads(args);
     let out_path = flag_str(args, "--out");
 
-    let book_boards: Vec<Board> = match &book_path {
-        Some(p) => {
-            let text = fs::read_to_string(p).unwrap_or_else(|e| panic!("sprt: cannot read book {p}: {e}"));
-            let bs: Vec<Board> = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(|l| Board::from_str(l).unwrap_or_else(|| panic!("sprt: bad book line: {l}")))
-                .collect();
-            assert!(!bs.is_empty(), "sprt: book is empty");
-            bs
-        }
-        None => vec![Board::start()],
+    // A gate never runs without a checked book (no silent single start position).
+    let Some(book_path) = book_path else {
+        eprintln!("sprt: --book <FILE> is required (paired openings, both seats)");
+        return ExitCode::FAILURE;
     };
+    let book_boards: Vec<Board> = match book::load(&book_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sprt: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let book0 = flag_u64(args, "--book0").unwrap_or(0) as usize;
+    let libataxx_end = match flag_str(args, "--rules").as_deref() {
+        None | Some("classic") => false,
+        Some("libataxx") => true,
+        Some(r) => {
+            eprintln!("sprt: --rules classic|libataxx, got {r}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let header = format!(
+        "# ti sprt | candidate {} [{}] | baseline {} [{}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}",
+        cand_spec,
+        engine_label(&cand_spec),
+        base_spec,
+        engine_label(&base_spec),
+        book_path,
+        hash::file_label(&book_path),
+        book0,
+        if libataxx_end { "libataxx" } else { "classic" },
+        nodes,
+        cand_time_ms,
+        base_time_ms,
+        elo0,
+        elo1,
+        env!("CARGO_PKG_VERSION"),
+    );
+    println!("{header}");
+    if let Some(p) = &out_path {
+        if fs::metadata(p).is_ok() {
+            eprintln!("sprt: --out {p} exists -> refusing to append to an old run");
+            return ExitCode::FAILURE;
+        }
+        let _ = fs::write(p, format!("{header}\n"));
+    }
 
     let max_pairs = (max_games + 1) / 2;
     println!(
@@ -666,7 +868,9 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                     if pair_idx >= max_pairs {
                         break;
                     }
-                    let board = &book_boards[pair_idx % book_boards.len()];
+                    let book_idx = (book0 + pair_idx) % book_boards.len();
+                    let board = &book_boards[book_idx];
+                    let (mut mv1, mut mv2) = (Vec::new(), Vec::new());
                     let (g1, b1, w1, p1) = play_single_game(
                         board,
                         true,
@@ -677,6 +881,8 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         nodes,
                         cand_reset_every_move,
                         base_reset_every_move,
+                        libataxx_end,
+                        &mut mv1,
                     )
                     .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 1 failed: {e}"));
                     if stop_flag.load(Ordering::Relaxed) {
@@ -692,6 +898,8 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         nodes,
                         cand_reset_every_move,
                         base_reset_every_move,
+                        libataxx_end,
+                        &mut mv2,
                     )
                     .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 2 failed: {e}"));
 
@@ -718,6 +926,26 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                     println!("{line}");
                     if let Some(p) = out_path {
                         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
+                            // per-game lines in the `titanium-cli match` format (training/gate_summary.py reads them)
+                            for (g, (pts, bl, wh, plies, mv, seat)) in
+                                [(g1, b1, w1, p1, &mv1, "x"), (g2, b2, w2, p2, &mv2, "o")].into_iter().enumerate()
+                            {
+                                let res = match pts {
+                                    2 => "titanium wins",
+                                    0 => "opponent wins",
+                                    _ => "draw",
+                                };
+                                let opp = if seat == "x" { "o" } else { "x" };
+                                let _ = writeln!(
+                                    f,
+                                    "-- game {}: book {book_idx} titanium={seat} opp={opp}: {res} {bl}-{wh} ({plies} plies)\n{}",
+                                    2 * pair_idx + g + 1,
+                                    mv.iter().map(|m| m.mv.as_str()).collect::<Vec<_>>().join(" ")
+                                );
+                                if let Ok(mut j) = fs::OpenOptions::new().create(true).append(true).open(format!("{p}.games.jsonl")) {
+                                    let _ = writeln!(j, "{}", game_json(pair_idx, book_idx, board, seat, pts, bl, wh, mv));
+                                }
+                            }
                             let _ = writeln!(f, "{line}");
                         }
                     }
@@ -738,7 +966,8 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
          Games : {} (+{} -{} ={}, {:.1}%)\n\
          Penta : LL={} LD={} DD+WL={} WD={} WW={}\n\
          Elo   : {:+.1} +- {:.1} (95% CI), LOS {:.1}%\n\
-         LLR   : {:+.2} [{:.2}, {:.2}] -> {:?}",
+         LLR   : {:+.2} [{:.2}, {:.2}] -> {:?}\n\
+         Split : {:.0}% of pairs split 1-1 by seat{}",
         t0.elapsed().as_secs_f64(),
         st.games,
         final_tally.wins,
@@ -756,7 +985,13 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
         st.llr,
         st.lower_bound,
         st.upper_bound,
-        st.verdict
+        st.verdict,
+        100.0 * st.seat_split,
+        if st.seat_split > sprt::SEAT_SPLIT_WARN {
+            "  WARNING: book lines are seat-decided, rebalance the book"
+        } else {
+            ""
+        }
     );
     ExitCode::SUCCESS
 }
@@ -1278,9 +1513,10 @@ fn execute_sprt_pair_payload(
             let t0 = Instant::now();
             let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
             let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
-            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, time_ms, nodes, false, false)
+            let mut scratch = Vec::new();
+            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, false, &mut scratch)
                 .expect("worker: sprt game 1");
-            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, time_ms, nodes, false, false)
+            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, false, &mut scratch)
                 .expect("worker: sprt game 2");
             let submit = format!("PAIR {pid} {g1} {g2}\n");
             match http_post(host_port, "/api/submit_sprt", submit.as_bytes()) {
@@ -1414,4 +1650,45 @@ fn run_worker(args: &[String]) -> ExitCode {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod thought_tests {
+    use super::*;
+
+    #[test]
+    fn engine_command_ending_in_tnn_is_not_a_net_path() {
+        assert!(engine_label("C:/x/titanium-cli.exe serve --network C:/n/a.tnn").starts_with("exe "));
+        assert!(engine_label("C:/n/a.tnn").starts_with("net "));
+    }
+
+    #[test]
+    fn parses_cp_and_mate_info_lines() {
+        let mut t = Thought::default();
+        parse_info("info depth 9 seldepth 12 score cp -37 nodes 5000 time 41 pv b6 a2 f2", &mut t);
+        assert_eq!((t.depth, t.score, t.mate, t.nodes), (Some(9), Some(-37), None, Some(5000)));
+        assert_eq!(t.pv, "b6 a2 f2");
+        parse_info("info depth 20 score mate -3 nodes 900 pv c3", &mut t);
+        assert_eq!((t.score, t.mate), (None, Some(-3)));
+    }
+
+    #[test]
+    fn game_json_is_one_valid_line() {
+        let m = MoveRec { ply: 0, side: 0, mover: "candidate", mv: "b6".into(), thought: Thought { score: Some(12), mate: None, depth: Some(5), nodes: Some(2000), ms: 3, pv: "b6 \"x\"".into() } };
+        let j = game_json(0, 7, &Board::start(), "x", 2, 30, 19, &[m]);
+        assert!(!j.contains('\n'));
+        assert!(j.contains("\"book\":7") && j.contains("\"score\":12") && j.contains("\"mate\":null") && j.contains("\\\"x\\\""));
+    }
+}
+
+/// UAI mate distance in MOVES for a mate score (`MATE - plies` = side to move wins in `plies`), None otherwise.
+/// Positive = side to move mates, negative = gets mated (UAI `score mate N`). Constants match crates/titanium/src/search.rs.
+pub fn mate_in_moves(score: i32) -> Option<i32> {
+    const MATE: i32 = titanium::search::MATE;
+    if score.abs() < MATE - 2000 {
+        return None;
+    }
+    let plies = MATE - score.abs();
+    let moves = (plies + 1) / 2;
+    Some(if score > 0 { moves.max(1) } else { -moves.max(1) })
 }
