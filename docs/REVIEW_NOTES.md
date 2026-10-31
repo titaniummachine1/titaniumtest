@@ -226,3 +226,5 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 - BEHAVIOR 35b: ahead = presumed pass until proven otherwise; extend unresolved gates first, fresh openings via --book0.
 - Screening gates are NOT SPRTs unless run to a bound: every unresolved gate (LLR inside +-2.94) is continued on fresh openings (--book0) until bound or 2000 games, positives first (user 2026-10-31). logs/gates/resolve.sh is the stopgap.
 - USER REJECTION 2026-10-31: fut80 (DIS_FUT_NUM 80; 5k -18.5, 100ms -53.7 LOS 0.3%) and rfp16 (DIS_RFP_NUM 16; 5k -16.2) rejected; removed from queues. fut24 5k +40.7 (pass), 100ms +5.8 (unresolved) still live.
+- Label depth for Texel/calibration (user 2026-10-31 asked 5k or 20k): use existing 5k cp5k labels (99.7% of rows); 20k only as held-out subset check later (needs relabel); time labels are load-noisy so 100ms stays a verification gate only.
+- rfp56 (DIS_RFP_NUM 56) 5k: +64.4+-34.1 (300g, LLR +2.09); 100ms leg pending; merge needs both (BEHAVIOR 35a).
