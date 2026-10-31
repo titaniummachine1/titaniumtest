@@ -97,3 +97,6 @@ NEW (not in Sonnet's list):
 - N2 money: the net is tiny (~90k MACs per sample forward), so GPU time per run should be minutes. The real cost risks
   are rebuilding the CUDA image on every launch, re-uploading data and idle or parallel containers. Bake `ti` into the
   image once (cached by rev), keep `.tdat` in a Modal Volume uploaded once, one L4 container, hard timeout.
+- N3 (FOUND ON THE GPU, FIXED): note 12 was wrong. TNN3 output reads h2 only (out_in = l2 = 32), not h1||h2 (48); h1||h2 is
+  TNN2. The graph asserted `v2` and panicked on the main net before any training; it now follows the net's own flag like the
+  CPU forward. Lesson: the graph shape must come from the net header, never from the doc.

@@ -87,7 +87,9 @@ const NB: usize = 8;
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
 fn build(net: &TrainableNet, d4: bool) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
-    assert!(net.has_dis && !net.pairwise && net.v2 && net.buckets == NB && net.num_feats == NUM_FEATS, "graph covers TNN3, non-pairwise, 8 buckets");
+    assert!(!net.pairwise && net.s57w.is_empty() && net.buckets == NB && net.num_feats == NUM_FEATS,
+        "graph covers non-pairwise nets without the S57 skip, 8 buckets, 26196 features (TNN1/TNN3)");
+    let skip = net.v2; // TNN2: the output reads h1 || h2; TNN1/TNN3: h2 only (out_in = l2)
     let inputs = ModelInputs::default()
         .add_sparse("stm", (NUM_FEATS, 1), MAX_ACTIVE)
         .add_sparse("ntm", (NUM_FEATS, 1), MAX_ACTIVE)
@@ -126,7 +128,7 @@ fn build(net: &TrainableNet, d4: bool) -> (ModelInputsMapper<Rec>, ModelDefiniti
         let x = ft.forward(stm).crelu().concat(ft.forward(ntm).crelu());
         let h1 = a1.forward(x).select(bucket).crelu();
         let h2 = a2.forward(h1).select(bucket).crelu();
-        let o = ao.forward(h1.concat(h2)).select(bucket);
+        let o = if skip { ao.forward(h1.concat(h2)) } else { ao.forward(h2) }.select(bucket);
         let p = (ps.forward(stm) - ps.forward(ntm)).select(bucket);
         let y = o + 0.5f32 * p;
         let loss = (y.sigmoid().power_error(target, 2.5) * wt).reduce_sum_batch();
