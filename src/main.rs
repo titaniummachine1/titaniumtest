@@ -13,7 +13,10 @@
 
 mod book;
 mod data;
+mod layout;
 mod mapper;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod trainer;
 mod targets;
 mod gate;
@@ -187,6 +190,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => return trainer::run_train(&args[1..]),
         Some("parity") => return trainer::run_parity(&args[1..]),
+        Some("check") => return trainer::run_check(&args[1..]),
         _ => {}
     }
     let init_spec = flag_str(args, "--init").unwrap_or_else(|| "bundled".to_string());

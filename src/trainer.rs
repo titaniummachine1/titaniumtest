@@ -130,6 +130,31 @@ pub fn run_train(args: &[String]) -> ExitCode {
 
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
+    if f("--backend").as_deref() == Some("cuda") {
+        #[cfg(feature = "gpu")]
+        {
+            let g = |n: &str, d: u64| crate::flag_u64(args, n).unwrap_or(d) as usize;
+            return crate::gpu::run(crate::gpu::GpuCfg {
+                data: f("--data").ok_or("--data required")?,
+                val: f("--val").ok_or("--val required")?,
+                out: f("--out").ok_or("--out required")?,
+                init: f("--init").unwrap_or_else(|| "bundled".into()),
+                bs: g("--bs", 16384),
+                steps: g("--steps", 1000),
+                lr: crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32,
+                lr_min: crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32,
+                warmup: g("--warmup", 200),
+                eval_every: g("--eval-every", 500),
+                val_rows: g("--val-rows", 65536),
+                threads: g("--threads", 8),
+                seed: g("--seed", 7) as u64,
+                d4: !crate::has_flag(args, "--no-d4"),
+                resume: crate::has_flag(args, "--resume"),
+            });
+        }
+        #[cfg(not(feature = "gpu"))]
+        return Err("this ti was built without --features cuda".into());
+    }
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
     let out = f("--out").ok_or("--out <dir> required")?;
@@ -283,4 +308,61 @@ pub fn run_parity(args: &[String]) -> ExitCode {
     }
     println!("rows {}  max|hub y - engine f32 y| = {:.2e}   quantized-vs-f32 cp: max {:.2} mean {:.3}", rows.len(), worst_f, worst_q, sum_q / rows.len() as f64);
     if worst_f < 1e-3 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// `ti train check --data stem --val stem [--init net]`: preflight. Refuses (exit 1) on any red; prints every check.
+pub fn run_check(args: &[String]) -> ExitCode {
+    let f = |n: &str| crate::flag_str(args, n);
+    let (Some(data), Some(val)) = (f("--data"), f("--val")) else {
+        eprintln!("usage: ti train check --data <stem> --val <stem> [--init net.tnn|bundled]");
+        return ExitCode::FAILURE;
+    };
+    let init = f("--init").unwrap_or_else(|| "bundled".into());
+    let mut red = 0;
+    let mut chk = |ok: bool, what: String| {
+        println!("[{}] {what}", if ok { "ok " } else { "RED" });
+        if !ok {
+            red += 1;
+        }
+    };
+    let (mut td, mut vd) = match (Tdat::open(&data), Tdat::open(&val)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            eprintln!("open failed: {:?} {:?}", a.err(), b.err());
+            return ExitCode::FAILURE;
+        }
+    };
+    for (name, stem, rows) in [("train", &data, td.rows), ("val", &val, vd.rows)] {
+        match std::fs::read_to_string(format!("{stem}.manifest.json")) {
+            Ok(m) => chk(m.contains(&format!("\"rows\":{rows},")), format!("{name}: manifest rows == tdat rows ({rows})")),
+            Err(_) => chk(false, format!("{name}: manifest missing")),
+        }
+    }
+    let bytes = if init == "bundled" { Some(BUNDLED_NNUE.to_vec()) } else { std::fs::read(&init).ok() };
+    let net = bytes.as_deref().and_then(|b| TrainableNet::from_tnn_bytes(b).ok());
+    chk(net.is_some(), format!("init net parses ({init})"));
+    if let Some(net) = &net {
+        chk(net.has_dis && net.buckets == 8 && net.width > 0, format!("TNN3 W={} buckets={} dis head {}", net.width, net.buckets, net.has_dis));
+        let (mut rows, mut other) = (Vec::new(), Vec::new());
+        let nblk = td.rows / BLOCK;
+        for i in 0..16 {
+            td.read_block((i * nblk / 16) * BLOCK, BLOCK, &mut rows).unwrap();
+        }
+        vd.read_block(0, BLOCK, &mut other).unwrap();
+        let bad = rows.iter().chain(&other).filter(|r| !(r.cp.is_finite() && r.wsum.is_finite() && r.wsum >= 0.0 && (0.0..=1.0).contains(&r.outcome) && r.stm < 2 && r.occ0 & r.occ1 == 0 && (r.occ0 | r.occ1) >> 49 == 0)).count();
+        chk(bad == 0, format!("{} sampled rows sane (finite cp/wsum, outcome in [0,1], disjoint 49-bit boards): {bad} bad", rows.len() + other.len()));
+        let proven = rows.iter().filter(|r| target_of(r).proven >= 0).count();
+        chk(proven > 0, format!("proven rows seen in train sample: {proven}/{}", rows.len()));
+        let mut worst = 0f32;
+        let eng = if init == "bundled" { Nnue::bundled() } else { Nnue::load(&init).unwrap() };
+        for r in rows.iter().take(2000) {
+            let b = mapper::board_of(r, 0);
+            worst = worst.max((net.forward_y(&b) - eng.forward_f32(&b, 0.0)).abs());
+        }
+        chk(worst < 1e-3, format!("hub forward == engine f32 forward on 2000 rows (max diff {worst:.1e})"));
+        let ma = |v: &Vec<f32>| v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        chk(ma(&net.ft) <= 1.98 && ma(&net.ftb) <= 1.98, "ft/ftb inside the +-1.98 clip (int16 at QA 1024)".into());
+    }
+    println!("{}", if red == 0 { "PREFLIGHT GREEN" } else { "PREFLIGHT RED" });
+    if red == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }

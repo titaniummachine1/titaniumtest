@@ -16,6 +16,14 @@ path = "src/main.rs"
 titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "20c7accb" }
 
 flate2 = "1.1"
+# GPU backend (bullet, pinned). `--features gpu` type-checks anywhere; `--features cuda` needs the CUDA toolkit (Modal image).
+bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }
+bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }
+bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }
+
+[features]
+gpu = ["dep:bullet-trainer", "dep:bullet-compiler", "dep:bullet-gpu"]
+cuda = ["gpu", "bullet-trainer/cuda"]
 
 [profile.release]
 opt-level = 3
