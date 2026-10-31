@@ -199,6 +199,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 guard: crate::flag_f64(args, "--guard").unwrap_or(1.15) as f32,
                 patience: g("--patience", 0),
                 min_delta: crate::flag_f64(args, "--min-delta").unwrap_or(2e-6),
+                plateau: g("--plateau", 0),
+                lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
+                max_drops: g("--max-drops", 3),
             });
         }
         #[cfg(not(feature = "gpu"))]

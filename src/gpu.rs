@@ -92,6 +92,10 @@ pub struct GpuCfg {
     /// early stopping: stop after this many checkpoints without a val-mse gain > min_delta (0 = off). User order 2026-10-31.
     pub patience: usize,
     pub min_delta: f64,
+    /// reduce-on-plateau (0 = off): checkpoints without a val gain before lr *= lr_factor; stop after max_drops useless drops
+    pub plateau: usize,
+    pub lr_factor: f32,
+    pub max_drops: usize,
 }
 
 const NB: usize = 8;
@@ -245,17 +249,22 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let total_sb = (c.steps + sb - 1) / sb;
     let steps = TrainingSteps { batch_size: c.bs, batches_per_superbatch: sb, start_superbatch: start_sb, end_superbatch: total_sb };
     let (lr, lr_min, warmup, total) = (c.lr, c.lr_min, c.warmup, total_sb * sb);
+    let lr_scale = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
+    let sc = lr_scale.clone();
     let schedule = TrainingSchedule {
         steps,
         log_rate: 100,
-        lr_schedule: Box::new(move |s| lr_at(s.total_batches(), total, lr, lr_min, warmup)),
+        // plateau scaling: the validation callback lowers this multiplier when val stalls (reduce-on-plateau)
+        lr_schedule: Box::new(move |s| lr_at(s.total_batches(), total, lr, lr_min, warmup) * f32::from_bits(sc.load(std::sync::atomic::Ordering::Relaxed))),
         track_grad_norms: false,
     };
     let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
     let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
     let (out, threads, ema_d, guard, holdout) = (c.out.clone(), c.threads, c.ema, c.guard, c.holdout);
     let (patience, min_delta) = (c.patience, c.min_delta);
+    let (plateau, lr_factor, max_drops) = (c.plateau, c.lr_factor, c.max_drops);
     let mut since_best = 0usize;
+    let mut drops = 0usize;
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
     let mut ema_net: Option<TrainableNet> = None;
@@ -327,8 +336,23 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
             let _ = std::fs::write(format!("{out}/GUARD_TRIPPED.txt"), &msg);
             std::process::exit(3);
         }
+        // reduce-on-plateau: `plateau` checkpoints without a val gain -> lr x factor; after `max_drops` drops that still do not
+        // help, stop (best.tnn keeps the best weights)
+        if plateau > 0 && since_best >= plateau {
+            if drops >= max_drops {
+                let msg = format!("EARLY STOP at superbatch {sbn}: best val mse {best:.6}; {drops} lr drops (x{lr_factor} each, lr scale now {:.4}) did not help.", f32::from_bits(lr_scale.load(std::sync::atomic::Ordering::Relaxed)));
+                println!("{msg}");
+                let _ = std::fs::write(format!("{out}/EARLY_STOP.txt"), &msg);
+                std::process::exit(0);
+            }
+            drops += 1;
+            since_best = 0;
+            let s = f32::from_bits(lr_scale.load(std::sync::atomic::Ordering::Relaxed)) * lr_factor;
+            lr_scale.store(s.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            println!("[lr] PLATEAU at superbatch {sbn}: val mse {:.6} best {best:.6}. LR DROP {drops}/{max_drops}: lr scale -> {s:.4}", pick_mse);
+        }
         // early stopping: val loss (the generalisation signal) has not improved for `patience` checkpoints -> stop, keep best.tnn
-        if patience > 0 && since_best >= patience {
+        if plateau == 0 && patience > 0 && since_best >= patience {
             let msg = format!("EARLY STOP at superbatch {sbn}: best val mse {best:.6} not improved by {min_delta:e} for {since_best} checkpoints ({} steps). best.tnn holds the best weights.", since_best * sb);
             println!("{msg}");
             let _ = std::fs::write(format!("{out}/EARLY_STOP.txt"), &msg);
