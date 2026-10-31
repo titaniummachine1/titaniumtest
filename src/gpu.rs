@@ -102,18 +102,17 @@ pub struct GpuCfg {
     pub keep_all: bool,
 }
 
-const NB: usize = 8;
-
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
 fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
-    assert!(!net.pairwise && net.s57w.is_empty() && net.buckets == NB && net.num_feats == NUM_FEATS,
-        "graph covers non-pairwise nets without the S57 skip, 8 buckets, 26196 features (TNN1/TNN3)");
+    let nb = net.buckets;
+    assert!(!net.pairwise && net.s57w.is_empty() && nb >= 1 && net.num_feats == NUM_FEATS,
+        "graph covers non-pairwise nets without the S57 skip, any bucket count, 26196 features (TNN1/TNN3)");
     let skip = net.v2; // TNN2: the output reads h1 || h2; TNN1/TNN3: h2 only (out_in = l2)
     let inputs = ModelInputs::default()
         .add_sparse("stm", (NUM_FEATS, 1), MAX_ACTIVE)
         .add_sparse("ntm", (NUM_FEATS, 1), MAX_ACTIVE)
-        .add_sparse("bucket", (NB, 1), 1)
+        .add_sparse("bucket", (nb, 1), 1)
         .add_dense("target", (1, 1))
         .add_dense("wt", (1, 1));
 
@@ -131,7 +130,7 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
         } else {
             0
         };
-        let s = mapper::sample(r, mode, NB);
+        let s = mapper::sample(r, mode, nb);
         for (dst, src) in [(&mut *stm, &s.us), (&mut *ntm, &s.them)] {
             for (i, &f) in src.iter().enumerate() {
                 dst[i] = f as i32;
@@ -147,10 +146,10 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
 
     let defn = ModelDefinition::build(&inputs, move |b, ((((stm, ntm), bucket), target), wt)| {
         let ft = b.new_affine("ft", NUM_FEATS, w);
-        let ps = b.new_affine("psq", NUM_FEATS, NB);
-        let a1 = b.new_affine("l1", 2 * w, NB * l1);
-        let a2 = b.new_affine("l2", l1, NB * l2);
-        let ao = b.new_affine("out", oi, NB);
+        let ps = b.new_affine("psq", NUM_FEATS, nb);
+        let a1 = b.new_affine("l1", 2 * w, nb * l1);
+        let a2 = b.new_affine("l2", l1, nb * l2);
+        let ao = b.new_affine("out", oi, nb);
 
         let x = ft.forward(stm).crelu().concat(ft.forward(ntm).crelu());
         let h1 = a1.forward(x).select(bucket).crelu();
@@ -180,7 +179,7 @@ fn load_into(w: &mut ModelWeights, net: &TrainableNet) {
     set(w, "ftw", g.ftw);
     set(w, "ftb", g.ftb);
     set(w, "psqw", g.psqw);
-    set(w, "psqb", vec![0.0; NB]);
+    set(w, "psqb", vec![0.0; net.buckets]);
     set(w, "l1w", g.l1w);
     set(w, "l1b", g.l1b);
     set(w, "l2w", g.l2w);

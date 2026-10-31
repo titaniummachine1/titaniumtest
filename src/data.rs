@@ -410,6 +410,7 @@ pub fn run_stats(args: &[String]) -> ExitCode {
     let mut by: BTreeMap<(u8, u8, u8), [u64; 5]> = BTreeMap::new(); // rows, proven, has_cp5k, zx!=0, ti_clash
     let (mut buf, mut s) = (Vec::new(), 0usize);
     let (mut sum_gap, mut n_gap) = (0f64, 0u64);
+    let mut emp = [[0u64; 3]; 50]; // per empties: rows, proof-labelled, 5k search found a forced result
     while s < t.rows {
         buf.clear();
         if t.read_block(s, 1 << 16, &mut buf).is_err() {
@@ -417,6 +418,14 @@ pub fn run_stats(args: &[String]) -> ExitCode {
         }
         s += buf.len();
         for r in &buf {
+            let ne = (crate::mapper::board_of(r, 0).empty().count_ones() as usize).min(49);
+            emp[ne][0] += 1;
+            if r.cp.abs() >= 98_000.0 {
+                emp[ne][1] += 1;
+            }
+            if r.cp5k.abs() >= 98_000.0 {
+                emp[ne][2] += 1;
+            }
             let e = by.entry((r.teacher_kind, r.proof_kind, r.relabel_src)).or_default();
             e[0] += 1;
             if r.cp.abs() >= 98_000.0 {
@@ -447,5 +456,9 @@ pub fn run_stats(args: &[String]) -> ExitCode {
         }
     }
     println!("total {} rows: proven {} ({:.1}%), cp5k present {} ({:.1}%), zx {}, clash {}; mean |cp - cp5k| (capped 1500) on non-proven rows with both: {:.1} cp", tot[0], tot[1], 100.0 * tot[1] as f64 / tot[0] as f64, tot[2], 100.0 * tot[2] as f64 / tot[0] as f64, tot[3], tot[4], sum_gap / n_gap.max(1) as f64);
+    println!("empties |       rows  proof-labelled (%)   5k-search-found-forced (%)");
+    for (ne, e) in emp.iter().enumerate().filter(|(_, e)| e[0] > 0) {
+        println!("{ne:>7} | {:>10} {:>10} ({:>5.1})  {:>10} ({:>5.1})", e[0], e[1], 100.0 * e[1] as f64 / e[0] as f64, e[2], 100.0 * e[2] as f64 / e[0] as f64);
+    }
     ExitCode::SUCCESS
 }
