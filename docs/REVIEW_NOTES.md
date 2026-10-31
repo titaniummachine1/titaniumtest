@@ -100,3 +100,6 @@ NEW (not in Sonnet's list):
 - N3 (FOUND ON THE GPU, FIXED): note 12 was wrong. TNN3 output reads h2 only (out_in = l2 = 32), not h1||h2 (48); h1||h2 is
   TNN2. The graph asserted `v2` and panicked on the main net before any training; it now follows the net's own flag like the
   CPU forward. Lesson: the graph shape must come from the net header, never from the doc.
+- N4 GPU RESULT (2026-10-31): note 13 (column-major layout) CONFIRMED: graph vs hub max diff 7.2e-7 on 512 rows. A10: 1.85M pos/s,
+  same at 4 and 8 loader threads on 4 vCPU, so the loader may be the cap. Next measurement: cpu=8 to see if it scales.
+  v9 epoch ~16 s, ~$0.006/epoch.
