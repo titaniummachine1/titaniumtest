@@ -73,7 +73,8 @@ def sh(cmd):
     return r.returncode
 
 
-@app.function(gpu="L4", cpu=4.0, memory=16384, timeout=40 * 60)
+# GPU fallback list: L4 queues sometimes (2026-10-31: 6+ min); T4 is cheapest, the net is tiny. Modal tries them in order.
+@app.function(gpu=["L4", "T4", "A10G"], cpu=4.0, memory=16384, timeout=40 * 60)
 def bench():
     sh("nvidia-smi --query-gpu=name,memory.total --format=csv; nproc; grep -m1 'model name' /proc/cpuinfo")
     net = "/src/engine/data/nnue/nnue_main.tnn"
