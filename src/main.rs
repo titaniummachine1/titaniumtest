@@ -201,6 +201,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("probe") => return probe::run_probe(&args[1..]),
         Some("shrink") => return shrink::run_shrink(&args[1..]),
         Some("rank") => return shrink::run_rank(&args[1..]),
+        Some("upscale") => return shrink::run_upscale(&args[1..]),
         Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {

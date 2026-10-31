@@ -411,3 +411,73 @@ pub fn shrink_refit(net: &TrainableNet, w2: usize, rows: &[crate::data::Rec], th
     let r = evaluate(&refit, &test_rows, threads).mse;
     Ok((refit, plain, o, p, r))
 }
+
+// ------------------------------------------------------------------------------------------------------------------
+// `ti train upscale`: Net2Net-wider (function preserving). New channel c' copies source channel c' % w; every copy of a source
+// channel gets l1 weight / copies, so the l1 pre-activations are unchanged. Tiny noise on the copied ft columns breaks the
+// symmetry (identical copies would receive identical gradients forever). Step-0 parity is measured, not assumed (D130).
+// ------------------------------------------------------------------------------------------------------------------
+
+pub fn upscale(net: &TrainableNet, w2: usize, noise: f32) -> Result<TrainableNet, String> {
+    let w = net.width;
+    if net.pairwise {
+        return Err("upscale: pairwise nets are not supported".into());
+    }
+    if w2 <= w {
+        return Err(format!("upscale: --width must exceed {w}"));
+    }
+    let src = |c: usize| c % w;
+    let copies = |c: usize| (w2 - c + w - 1) / w; // number of new channels mapping to source c
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let mut out = net.clone();
+    out.width = w2;
+    out.ft = Vec::with_capacity(net.num_feats * w2);
+    for f in 0..net.num_feats {
+        for c in 0..w2 {
+            let v = net.ft[f * w + src(c)];
+            out.ft.push(if c >= w { v + noise * rnd() } else { v });
+        }
+    }
+    out.ftb = (0..w2).map(|c| net.ftb[src(c)]).collect();
+    let (din, din2) = (2 * w, 2 * w2);
+    out.l1_w = Vec::with_capacity(net.buckets * net.l1 * din2);
+    for r in 0..net.buckets * net.l1 {
+        let row = &net.l1_w[r * din..(r + 1) * din];
+        for half in 0..2 {
+            out.l1_w.extend((0..w2).map(|c| row[half * w + src(c)] / copies(src(c)) as f32));
+        }
+    }
+    Ok(out)
+}
+
+pub fn run_upscale(args: &[String]) -> ExitCode {
+    let r = (|| -> Result<(), String> {
+        let f = |n: &str| crate::flag_str(args, n);
+        let (net_p, data, out_p) = (f("--net").ok_or("--net required")?, f("--data").ok_or("--data <stem> required")?, f("--out").ok_or("--out required")?);
+        let w2 = crate::flag_u64(args, "--width").ok_or("--width required")? as usize;
+        let rows = crate::flag_u64(args, "--rows").unwrap_or(20000) as usize;
+        let threads = crate::flag_u64(args, "--threads").unwrap_or(6) as usize;
+        let noise = crate::flag_f64(args, "--noise").unwrap_or(1e-4) as f32;
+        let net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_p).map_err(|e| format!("{net_p}: {e}"))?)?;
+        let big = upscale(&net, w2, noise)?;
+        let cal = load_val(&mut Tdat::open(&data)?, rows)?;
+        let (a, b) = (evaluate(&net, &cal, threads), evaluate(&big, &cal, threads));
+        println!("[upscale] W {} -> {} (noise {noise}); val mse on {} rows: original {:.8}  upscaled {:.8}  delta {:+.2e}", net.width, w2, cal.len(), a.mse, b.mse, b.mse - a.mse);
+        std::fs::write(&out_p, big.to_tnn_bytes()).map_err(|e| e.to_string())?;
+        println!("[upscale] wrote {out_p}");
+        Ok(())
+    })();
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("upscale: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

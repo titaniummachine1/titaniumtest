@@ -98,6 +98,8 @@ pub struct GpuCfg {
     pub max_drops: usize,
     /// proven rows train on blend*proof + (1-blend)*sigmoid(cp5k); 1.0 = exact proofs (default, D162)
     pub proof_blend: f32,
+    /// keep every checkpoint (ckpt_<step>.tnn) so a strength-vs-step curve can be gated afterwards
+    pub keep_all: bool,
 }
 
 const NB: usize = 8;
@@ -265,6 +267,7 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let (out, threads, ema_d, guard, holdout) = (c.out.clone(), c.threads, c.ema, c.guard, c.holdout);
     let (patience, min_delta) = (c.patience, c.min_delta);
     let (plateau, lr_factor, max_drops) = (c.plateau, c.lr_factor, c.max_drops);
+    let keep_all = c.keep_all;
     let mut since_best = 0usize;
     let mut drops = 0usize;
     let mut best = f64::MAX;
@@ -318,7 +321,9 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         let cur = format!("{out}/ckpt_{}.tnn", step.total_batches());
         let _ = std::fs::write(&cur, pick.to_tnn_bytes());
         if let Some(p) = last.replace(cur) {
-            let _ = std::fs::remove_file(p);
+            if !keep_all {
+                let _ = std::fs::remove_file(p);
+            }
         }
         if pick_mse < best {
             // a gain smaller than min_delta is saved but does not reset the patience counter

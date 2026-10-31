@@ -163,3 +163,8 @@ No cliff down to W64 before any retraining. Effective rank: 512 needs ~384 chann
 Plan (not run): stepwise chain (256->192->128->96->64), each step refit start + short distillation run (teacher = saturated net outputs via the p3 column,
 `--distill L` blend, proofs untouched), LTH-style rewind rather than one-shot. Pick the knee by (val mse, engine nps), then game-gate 2-3 widths.
 Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Optuna-style search = bounded loop of capped `ti train modal launch` runs, only worth it for students.
+
+## 2026-10-31 Ceiling gate result + champion upscale run (D237)
+- Gate: saturated 256 (grow256a best, v9 data, dis-head refit sha 6061F2EB) vs champion 7AE0122F, same exe FC2AE776, std5k book, 5k nodes: Elo -102.0 +- 39.9, LLR -3.00 (FAIL). Penta LL=71 LD=6 DD+WL=65 WD=5 WW=23. Lower val MSE (0.0178 vs 0.0182) did NOT give strength: v9 data/labels (Zataxx proofs etc.) move the net away from what wins games. Val MSE is not a strength metric.
+- New: `ti train upscale` (Net2Net wider, step-0 parity measured: 256->512 delta val mse -3.1e-8) and `ti train ... --keep-all` (keeps every ckpt_<step>.tnn) to gate a strength-vs-step curve.
+- Run: upscaled champion (data/nnue/sat/champ_up512.tnn) trained on v9, every eval checkpoint kept; then gate checkpoints vs champion to find where Elo peaks (distillation target). The peak may be step 0.
