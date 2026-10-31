@@ -250,3 +250,6 @@ User: "every step of downscale must be from biggest best strongest net usually s
 ## CORRECTION: opening tree is NOT small (2026-10-31, measured)
 `treecount` (scratch cmd in logs/varsrc/info-ataxx, 8-symmetry dedup, from standard start): new positions by ply 1..7 = 5, 64, 877, 12,356, 148,210, 1,866,676, 21,004,826 (~x12-14 per ply; stopped at ply 7). Jumps add no stone, so "<=10 stones" is NOT ~6 plies. My earlier claim ("small tree, search every position once") was WRONG. A full book is infeasible; a SELECTIVE book (best few moves per node within a margin, like `treebook`, thousands of lines) with deep search on main lines is the feasible lever. Not built; needs user go.
 Also: dataset per-empties table (ti data stats): proof labels cover only <=4 empties (65-100%), 5k search finds forced results only at <=4 empties (89% at 1, 30% at 2, 11% at 3); <5% of rows have >=38 empties; rows at 43-47 empties show 12-54%% 'proven' = unexplained, possible artifact.
+
+## Botzone deploy 2026-10-31 (user ordered; login only in conversation)
+Uploaded data/titanium_v2.so sha EC4B4BAD (28,492,848 B), main ba09f2b, embedded net 00C01A49 (dis-head refit + per-bucket calibration). Driver unchanged 9550316F. Verified by download hash match. Rollback: logs/botzone_v12_backup (3F9E10BA, net 7AE0122F). Not included: fut24 (200ms leg -13 early), buckets, book, width.
