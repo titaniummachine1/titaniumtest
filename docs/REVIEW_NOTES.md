@@ -223,3 +223,4 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 
 ## Promotion legs (user 2026-10-31): search/cost-per-node changes need 5k AND 100 ms passing (+200 ms when aimed at longer search); a clearly negative leg blocks the merge. See BEHAVIOR 35a.
 - Eval-quality-only changes (same width/arch, same nps) may be proven at 5k nodes alone; width/speed changes need timed legs (user 2026-10-31).
+- BEHAVIOR 35b: ahead = presumed pass until proven otherwise; extend unresolved gates first, fresh openings via --book0.
