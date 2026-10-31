@@ -236,3 +236,10 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 - D4 off for opening rows in training: separate gate.
 - Opening book for <=10 stones (start has 4 stones => ~6 plies): search every position once, deep, store best move; engine `treebook` generator exists. Position count NOT yet counted (do not promise size).
 - Dis-constant screening so far: thr200 (5k +1.2, 100ms +1.2) and thr450 (5k -6.9) flat => dropped. rfp56 leads (5k +64, 100ms +30), fut24 mixed (5k +41, 100ms +6).
+
+## Distillation rule: no chains (user 2026-10-31)
+User: "every step of downscale must be from biggest best strongest net usually so we dont do deaf phone game where information is lost throughout the distillation".
+- Every student (distilled or refit-shrunk) comes DIRECTLY from the single strongest teacher net (by gate, not by width). Never student -> student.
+- Teacher now = merged 0BFFB378 (W=256); saturated 512 nets are not teachers until they beat it per node AND at 100 ms.
+- Labels = 5k-node search values (+ teacher outputs as soft target). When the teacher improves, redistil all students from it.
+- Speed/strength curve may be non-monotone (user: dip at ~400 knps could rise again at ~1.5 Mnps). Report "best found", not "optimal". Sample coarse extremes first (64..512), refit-shrunk sweep understates small widths, search constants retuned per width.
