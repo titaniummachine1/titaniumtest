@@ -462,11 +462,24 @@ pub fn run_buckets(args: &[String]) -> ExitCode {
     let nb = if by_empties { 50 } else { net.buckets };
     // per bucket: n, sum t, sum t^2, sum err^2, n_proven, err^2 proven
     let mut a = vec![[0f64; 6]; nb];
+    // per-empties sufficient statistics of the OLS fit target ~ a + b * p: n, sum p, sum t, sum p^2, sum p*t, sum t^2
+    let mut st = vec![[0f64; 6]; 50];
     for r in &v {
         let tg = target_of(r);
         let fw = net.forward_full(&mapper::board_of(r, 0));
         let p = 1.0 / (1.0 + (-fw.y as f64).exp());
         let e = (p - tg.target as f64).powi(2);
+        if by_empties {
+            let e = (mapper::board_of(r, 0).empty().count_ones() as usize).min(49);
+            let (pp, tt) = (p, tg.target as f64);
+            let q = &mut st[e];
+            q[0] += 1.0;
+            q[1] += pp;
+            q[2] += tt;
+            q[3] += pp * pp;
+            q[4] += pp * tt;
+            q[5] += tt * tt;
+        }
         let x = &mut a[if by_empties { mapper::board_of(r, 0).empty().count_ones() as usize } else { fw.bucket }];
         x[0] += 1.0;
         x[1] += tg.target as f64;
@@ -489,5 +502,103 @@ pub fn run_buckets(args: &[String]) -> ExitCode {
         let mse = x[3] / x[0];
         println!("{b:>6} {:>6} {:.5}  {:.5}     {:>6.1}%      {:>6}      {:.5}     {:>5.1}%", x[0] as usize, mse, var, 100.0 * mse / var.max(1e-12), x[4] as usize, if x[4] > 0.0 { x[5] / x[4] } else { 0.0 }, 100.0 * x[3] / tot.max(1e-12));
     }
+    if by_empties {
+        bucket_plan(&st, crate::flag_u64(args, "--plan").map(|x| x as usize));
+    }
     ExitCode::SUCCESS
+}
+
+/// Where should the bucket boundaries go? For a fixed trunk, one bucket = one (a, b) recalibration of the output
+/// (target ~ a + b * p). Cost of a run of empties counts = squared error left after the OLS fit of that run; the DP picks the
+/// K contiguous runs over empties 1..=45 with the least total error. Compared with the even and E16 maps and with the net as it is.
+fn bucket_plan(st: &[[f64; 6]], only_k: Option<usize>) {
+    let lo = 1usize;
+    let hi = 45usize;
+    let total: f64 = (lo..=hi).map(|e| st[e][0]).sum();
+    let cost_run = |i: usize, j: usize| -> f64 {
+        let mut q = [0f64; 6];
+        for e in i..=j {
+            for k in 0..6 {
+                q[k] += st[e][k];
+            }
+        }
+        let n = q[0];
+        if n < 2.0 {
+            return 0.0;
+        }
+        let (stt, spp, spt) = (q[5] - q[2] * q[2] / n, q[3] - q[1] * q[1] / n, q[4] - q[1] * q[2] / n);
+        if spp < 1e-9 {
+            return stt;
+        }
+        stt - spt * spt / spp
+    };
+    let raw: f64 = (lo..=hi).map(|e| {
+        let q = &st[e];
+        // squared error of p itself: sum (p - t)^2 = pp - 2pt + tt
+        q[3] - 2.0 * q[4] + q[5]
+    }).sum();
+    println!("
+--- bucket plan over empties {lo}..={hi} ({total:.0} rows): mse of the net as is {:.5}", raw / total);
+    let n = hi - lo + 1;
+    let maxk = 40usize.min(n);
+    let mut c = vec![vec![0f64; n]; n]; // c[i][j]: run lo+i ..= lo+j
+    for i in 0..n {
+        for j in i..n {
+            c[i][j] = cost_run(lo + i, lo + j);
+        }
+    }
+    let mut f = vec![vec![f64::INFINITY; n]; maxk + 1];
+    let mut cut = vec![vec![0usize; n]; maxk + 1];
+    for j in 0..n {
+        f[1][j] = c[0][j];
+    }
+    for k in 2..=maxk {
+        for j in (k - 1)..n {
+            for i in (k - 1)..=j {
+                let v = f[k - 1][i - 1] + c[i][j];
+                if v < f[k][j] {
+                    f[k][j] = v;
+                    cut[k][j] = i;
+                }
+            }
+        }
+    }
+    let eval_map = |starts: &[usize]| -> f64 {
+        let mut s = 0.0;
+        for (b, &st0) in starts.iter().enumerate() {
+            let en = if b + 1 < starts.len() { starts[b + 1] - 1 } else { hi };
+            let (i, j) = (st0.max(lo), en.min(hi));
+            if i <= j {
+                s += cost_run(i, j);
+            }
+        }
+        s
+    };
+    let even = |k: usize| -> Vec<usize> {
+        let mut v = vec![0usize];
+        for b in 1..k {
+            v.push((0..=49).find(|&e| mapper::bucket_of(e, k) == b).unwrap_or(50));
+        }
+        v
+    };
+    println!("  K   best-mse   even-mse   gain-vs-even   starts of the best map");
+    for k in [4usize, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40] {
+        if k > maxk || only_k.map_or(false, |o| o != k) {
+            continue;
+        }
+        let mut starts = Vec::new();
+        let mut j = n - 1;
+        for kk in (1..=k).rev() {
+            let i = if kk == 1 { 0 } else { cut[kk][j] };
+            starts.push(lo + i);
+            if kk > 1 {
+                j = i - 1;
+            }
+        }
+        starts.reverse();
+        let best = f[k][n - 1] / total;
+        let ev = eval_map(&even(k)) / total;
+        println!("{k:>3}   {best:.5}    {ev:.5}    {:>+7.1}%      {:?}", 100.0 * (best - ev) / ev, starts);
+    }
+    println!("  E16 map (current plan) mse {:.5}", eval_map(&mapper::E16_STARTS) / total);
 }

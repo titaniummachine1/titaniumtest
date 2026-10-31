@@ -106,6 +106,7 @@ pub struct GpuCfg {
 fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     let nb = net.buckets;
+    let map_id = net.groups >> 8; // bucket map id (copied: the sampler closure must be 'static)
     assert!(!net.pairwise && net.s57w.is_empty() && nb >= 1 && net.num_feats == NUM_FEATS,
         "graph covers non-pairwise nets without the S57 skip, any bucket count, 26196 features (TNN1/TNN3)");
     let skip = net.v2; // TNN2: the output reads h1 || h2; TNN1/TNN3: h2 only (out_in = l2)
@@ -130,7 +131,7 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
         } else {
             0
         };
-        let s = mapper::sample(r, mode, nb, net.groups >> 8);
+        let s = mapper::sample(r, mode, nb, map_id);
         for (dst, src) in [(&mut *stm, &s.us), (&mut *ntm, &s.them)] {
             for (i, &f) in src.iter().enumerate() {
                 dst[i] = f as i32;
