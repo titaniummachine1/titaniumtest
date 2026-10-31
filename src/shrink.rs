@@ -92,6 +92,15 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let threads = crate::flag_u64(args, "--threads").unwrap_or(6) as usize;
     let net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_p).map_err(|e| format!("{net_p}: {e}"))?)?;
     let cal = load_val(&mut Tdat::open(&data)?, rows)?;
+    if crate::has_flag(args, "--refit") {
+        let t = std::time::Instant::now();
+        let (refit, _plain, o, p, r) = shrink_refit(&net, w2, &cal, threads)?;
+        println!("[shrink --refit] W {} -> {} on {} held-out rows: original {o:.6}  same channels pruned {p:.6}  pruned + L1 refit {r:.6}  ({:.0} s)", net.width, w2, cal.len() / 2, t.elapsed().as_secs_f64());
+        println!("[shrink --refit] refit wins back {:.1}% of the pruning loss", 100.0 * (p - r) / (p - o).max(1e-12));
+        std::fs::write(&out_p, refit.to_tnn_bytes()).map_err(|e| e.to_string())?;
+        println!("[shrink --refit] wrote {out_p}");
+        return Ok(());
+    }
     let (small, keep) = shrink(&net, w2, &cal)?;
     let before = evaluate(&net, &cal, threads);
     let after = evaluate(&small, &cal, threads);
@@ -100,4 +109,305 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     std::fs::write(&out_p, small.to_tnn_bytes()).map_err(|e| e.to_string())?;
     println!("[shrink] wrote {out_p}");
     Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// `ti train rank` / `ti train shrink --refit`: "image-style" downscale. Channels are chosen by pivoted Cholesky on the
+// downstream-weighted activation covariance (greedy: next channel = the one whose activation is least explained by the ones
+// already kept), and the L1 layer is then REFITTED by ridge least squares on real positions so the kept channels absorb what
+// the dropped ones contributed (nothing is simply thrown away).
+// ------------------------------------------------------------------------------------------------------------------
+
+struct Acts {
+    w: usize,
+    /// per row: [us (w) | them (w)] activations after the clamp
+    a: Vec<f32>,
+    bucket: Vec<usize>,
+}
+
+fn collect(net: &TrainableNet, rows: &[crate::data::Rec]) -> Acts {
+    let w = net.width;
+    let mut a = Vec::with_capacity(rows.len() * 2 * w);
+    let mut bucket = Vec::with_capacity(rows.len());
+    let mut t = vec![0f32; w];
+    for r in rows {
+        let s = mapper::sample(r, 0, net.buckets);
+        for idx in [&s.us, &s.them] {
+            t.copy_from_slice(&net.ftb);
+            for &f in idx.iter() {
+                for (v, x) in t.iter_mut().zip(&net.ft[f as usize * w..(f as usize + 1) * w]) {
+                    *v += *x;
+                }
+            }
+            a.extend(t.iter().map(|v| v.clamp(0.0, 1.0)));
+        }
+        bucket.push(s.bucket);
+    }
+    Acts { w, a, bucket }
+}
+
+/// downstream-scaled covariance of the channel activations (both perspectives pooled) and the per-channel scale
+fn scaled_cov(net: &TrainableNet, ac: &Acts) -> Vec<Vec<f64>> {
+    let w = ac.w;
+    let din = 2 * w;
+    let rows = net.buckets * net.l1;
+    let n = ac.bucket.len() * 2;
+    let mut mean = vec![0f64; w];
+    for r in 0..ac.bucket.len() {
+        for h in 0..2 {
+            for c in 0..w {
+                mean[c] += ac.a[(r * 2 + h) * w + c] as f64;
+            }
+        }
+    }
+    for m in mean.iter_mut() {
+        *m /= n as f64;
+    }
+    let mut cov = vec![vec![0f64; w]; w];
+    let mut d = vec![0f64; w];
+    for r in 0..ac.bucket.len() {
+        for h in 0..2 {
+            let row = &ac.a[(r * 2 + h) * w..(r * 2 + h + 1) * w];
+            for c in 0..w {
+                d[c] = row[c] as f64 - mean[c];
+            }
+            for p in 0..w {
+                if d[p] != 0.0 {
+                    for q in p..w {
+                        cov[p][q] += d[p] * d[q];
+                    }
+                }
+            }
+        }
+    }
+    let mut sc = vec![0f64; w];
+    for c in 0..w {
+        let mut wsq = 0f64;
+        for r in 0..rows {
+            let rw = &net.l1_w[r * din..(r + 1) * din];
+            wsq += (rw[c] as f64).powi(2) + (rw[w + c] as f64).powi(2);
+        }
+        sc[c] = wsq.sqrt();
+    }
+    for p in 0..w {
+        for q in p..w {
+            let v = cov[p][q] / n as f64 * sc[p] * sc[q];
+            cov[p][q] = v;
+            cov[q][p] = v;
+        }
+    }
+    cov
+}
+
+/// pivoted Cholesky: returns (pivot order, residual trace after each pivot) ; trace[0] = total
+fn pivots(cov: &[Vec<f64>], k: usize) -> (Vec<usize>, Vec<f64>) {
+    let w = cov.len();
+    let mut diag: Vec<f64> = (0..w).map(|i| cov[i][i]).collect();
+    let mut l: Vec<Vec<f64>> = Vec::new(); // l[j][i] = column j of the Cholesky factor
+    let mut order = Vec::new();
+    let mut used = vec![false; w];
+    let mut trace = vec![diag.iter().sum::<f64>()];
+    for _ in 0..k.min(w) {
+        let (mut p, mut best) = (usize::MAX, -1.0);
+        for i in 0..w {
+            if !used[i] && diag[i] > best {
+                best = diag[i];
+                p = i;
+            }
+        }
+        if p == usize::MAX || best <= 1e-18 {
+            break;
+        }
+        used[p] = true;
+        order.push(p);
+        let mut col = vec![0f64; w];
+        for i in 0..w {
+            let mut s = cov[i][p];
+            for lj in &l {
+                s -= lj[i] * lj[p];
+            }
+            col[i] = s / best.sqrt();
+        }
+        for i in 0..w {
+            diag[i] = (diag[i] - col[i] * col[i]).max(0.0);
+        }
+        l.push(col);
+        trace.push(diag.iter().enumerate().filter(|(i, _)| !used[*i]).map(|(_, v)| *v).sum());
+    }
+    (order, trace)
+}
+
+pub fn run_rank(args: &[String]) -> ExitCode {
+    let f = |n: &str| crate::flag_str(args, n);
+    let (Some(net_p), Some(data)) = (f("--net"), f("--data")) else {
+        eprintln!("usage: ti train rank --net n.tnn --data <stem> [--rows 40000]");
+        return ExitCode::FAILURE;
+    };
+    let rows = crate::flag_u64(args, "--rows").unwrap_or(40000) as usize;
+    let net = match std::fs::read(&net_p).map_err(|e| e.to_string()).and_then(|b| TrainableNet::from_tnn_bytes(&b)) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("rank: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cal = match Tdat::open(&data).and_then(|mut t| load_val(&mut t, rows)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rank: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ac = collect(&net, &cal);
+    let cov = scaled_cov(&net, &ac);
+    let (order, trace) = pivots(&cov, net.width);
+    let total = trace[0];
+    println!("net {net_p}: W={}  ({} rows, {} activation vectors)", net.width, cal.len(), cal.len() * 2);
+    println!("  downstream-weighted variance NOT explained by the first k channels (pivoted Cholesky):");
+    let mut ks: Vec<usize> = vec![16, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384, 448];
+    ks.retain(|&k| k < order.len());
+    ks.push(order.len());
+    for k in ks {
+        println!("    k={k:>4}  unexplained {:>8.4}%", 100.0 * trace[k] / total.max(1e-18));
+    }
+    let dead = (0..net.width).filter(|&c| cov[c][c] < 1e-6 * total / net.width as f64).count();
+    println!("  nearly dead channels (variance x downstream weight < 1e-6 of the average): {dead} of {}", net.width);
+    ExitCode::SUCCESS
+}
+
+/// Gaussian elimination with partial pivoting for (A + ridge) X = B, A is n x n, B is n x m.
+fn solve_multi(mut a: Vec<Vec<f64>>, mut b: Vec<Vec<f64>>, ridge: f64) -> Vec<Vec<f64>> {
+    let n = a.len();
+    for i in 0..n {
+        a[i][i] += ridge;
+    }
+    for c in 0..n {
+        let p = (c..n).max_by(|&x, &y| a[x][c].abs().partial_cmp(&a[y][c].abs()).unwrap()).unwrap();
+        a.swap(c, p);
+        b.swap(c, p);
+        let d = a[c][c];
+        for k in c..n {
+            a[c][k] /= d;
+        }
+        for k in 0..b[c].len() {
+            b[c][k] /= d;
+        }
+        for r in 0..n {
+            if r != c {
+                let f = a[r][c];
+                if f != 0.0 {
+                    for k in c..n {
+                        let t = a[c][k];
+                        a[r][k] -= f * t;
+                    }
+                    for k in 0..b[c].len() {
+                        let t = b[c][k];
+                        b[r][k] -= f * t;
+                    }
+                }
+            }
+        }
+    }
+    b
+}
+
+/// `ti train shrink --refit`: pivoted-Cholesky channel choice + ridge refit of every bucket's L1 on real positions.
+/// Rows are split even/odd: fit on even, report on odd (held out). Returns (refitted net, plain-pruned net with the SAME channels).
+pub fn shrink_refit(net: &TrainableNet, w2: usize, rows: &[crate::data::Rec], threads: usize) -> Result<(TrainableNet, TrainableNet, f64, f64, f64), String> {
+    let w = net.width;
+    let fit_rows: Vec<crate::data::Rec> = rows.iter().cloned().step_by(2).collect();
+    let test_rows: Vec<crate::data::Rec> = rows.iter().skip(1).cloned().step_by(2).collect();
+    let ac = collect(net, &fit_rows);
+    let cov = scaled_cov(net, &ac);
+    let (order, _) = pivots(&cov, w2);
+    if order.len() < w2 {
+        return Err(format!("only {} usable channels", order.len()));
+    }
+    let mut keep: Vec<usize> = order[..w2].to_vec();
+    keep.sort_unstable();
+    // plain pruned net with the same channels (same construction as `shrink`, but with this channel set)
+    let build = |l1_w: Vec<f32>, l1_b: Vec<f32>| {
+        let mut o = net.clone();
+        o.width = w2;
+        o.ft = Vec::with_capacity(net.num_feats * w2);
+        for f in 0..net.num_feats {
+            for &c in &keep {
+                o.ft.push(net.ft[f * w + c]);
+            }
+        }
+        o.ftb = keep.iter().map(|&c| net.ftb[c]).collect();
+        o.l1_w = l1_w;
+        o.l1_b = l1_b;
+        o
+    };
+    let din = 2 * w;
+    let rows_l1 = net.buckets * net.l1;
+    let mut plain_w = Vec::with_capacity(rows_l1 * 2 * w2);
+    for r in 0..rows_l1 {
+        let row = &net.l1_w[r * din..(r + 1) * din];
+        plain_w.extend(keep.iter().map(|&c| row[c]));
+        plain_w.extend(keep.iter().map(|&c| row[w + c]));
+    }
+    let plain = build(plain_w, net.l1_b.clone());
+
+    // ridge refit per bucket
+    let n = 2 * w2 + 1;
+    let m = net.l1;
+    let mut g = vec![vec![vec![0f64; n]; n]; net.buckets];
+    let mut h = vec![vec![vec![0f64; m]; n]; net.buckets];
+    let mut x = vec![0f64; n];
+    for (ri, &b) in ac.bucket.iter().enumerate() {
+        let us = &ac.a[(ri * 2) * w..(ri * 2 + 1) * w];
+        let them = &ac.a[(ri * 2 + 1) * w..(ri * 2 + 2) * w];
+        for (j, &c) in keep.iter().enumerate() {
+            x[j] = us[c] as f64;
+            x[w2 + j] = them[c] as f64;
+        }
+        x[2 * w2] = 1.0;
+        // original pre-activations of this bucket's l1 units are the regression targets
+        let mut z = vec![0f64; m];
+        for (j, zj) in z.iter_mut().enumerate() {
+            let r = b * net.l1 + j;
+            let rw = &net.l1_w[r * din..(r + 1) * din];
+            let mut s = net.l1_b[r] as f64;
+            for c in 0..w {
+                s += rw[c] as f64 * us[c] as f64 + rw[w + c] as f64 * them[c] as f64;
+            }
+            *zj = s;
+        }
+        for p in 0..n {
+            let xp = x[p];
+            if xp != 0.0 {
+                for q in p..n {
+                    g[b][p][q] += xp * x[q];
+                }
+                for j in 0..m {
+                    h[b][p][j] += xp * z[j];
+                }
+            }
+        }
+    }
+    let mut l1_w = vec![0f32; rows_l1 * 2 * w2];
+    let mut l1_b = net.l1_b.clone();
+    for b in 0..net.buckets {
+        for p in 0..n {
+            for q in 0..p {
+                g[b][p][q] = g[b][q][p];
+            }
+        }
+        let tr: f64 = (0..n).map(|i| g[b][i][i]).sum::<f64>() / n as f64;
+        let sol = solve_multi(std::mem::take(&mut g[b]), std::mem::take(&mut h[b]), 1e-4 * tr.max(1e-9));
+        for j in 0..m {
+            let r = b * net.l1 + j;
+            for p in 0..2 * w2 {
+                l1_w[r * 2 * w2 + p] = sol[p][j] as f32;
+            }
+            l1_b[r] = sol[2 * w2][j] as f32;
+        }
+    }
+    let refit = build(l1_w, l1_b);
+    let o = evaluate(net, &test_rows, threads).mse;
+    let p = evaluate(&plain, &test_rows, threads).mse;
+    let r = evaluate(&refit, &test_rows, threads).mse;
+    Ok((refit, plain, o, p, r))
 }

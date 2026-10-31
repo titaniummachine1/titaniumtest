@@ -146,3 +146,20 @@ afterwards speed work towards 400k-1M nps. Opus view:
 - Memorisation test (100k slice, lr 1e-3, no D4): loss 0.0231 -> 0.00013. Trainer is correct. Orientation probe works (17000% spread without D4, 1.5% with).
 - `ti train buckets`: bucket 0 (<=6 empties) is 14% of rows, 42% of loss, 48% of target variance unexplained. NOTE bucket index = min(empties*8/50,7): 0 is the ENDGAME, 7 the opening.
 - UNSURE: whether the endgame loss matters for play (search solves those positions). Idea, UNTESTED: down-weight bucket 0 rows or train with them excluded and see if mid-game buckets improve (capacity freed) - decided by games only.
+
+## 2026-10-31 Shrinking without losing fitness: research + measured refit (D236)
+
+Research (sources): Lottery Ticket Hypothesis (arxiv 1803.03635; rewinding variant 1903.01611) = iterative prune + rewind/retrain beats one-shot;
+Neuron Merging (arxiv 2010.13160) = fold pruned neurons into kept ones via the next layer; Net2Net (arxiv 1511.05641) = function-preserving resize;
+ThiNet / Channel Pruning (arxiv 1707.06342, 1707.06168) = choose channels, then least-squares reconstruct the next layer's input;
+DeepChess (arxiv 1711.09667) = distilled small nets match, from-scratch ones are much worse; Lc0 distillation thread talkchess p=787865.
+
+What we already have = the ThiNet/"image-style" step: `ti train shrink --refit` (pivoted-Cholesky channel selection + L1 ridge least-squares refit, no training).
+Held-out val MSE (original -> same channels pruned -> pruned+refit):
+- from 512 (0.017934): W384 0.019230 -> 0.018303 (71.5% recovered); W256 0.021650 -> 0.019085 (69.0%); W192 0.022655 -> 0.019841 (59.6%)
+- from 256 champion 7AE0122F (0.018213): W192 0.019737 -> 0.018654; W128 0.022763 -> 0.019795; W96 0.023270 -> 0.020577; W64 0.025539 -> 0.021357
+No cliff down to W64 before any retraining. Effective rank: 512 needs ~384 channels for 95% variance, 256 needs ~192, no dead neurons.
+
+Plan (not run): stepwise chain (256->192->128->96->64), each step refit start + short distillation run (teacher = saturated net outputs via the p3 column,
+`--distill L` blend, proofs untouched), LTH-style rewind rather than one-shot. Pick the knee by (val mse, engine nps), then game-gate 2-3 widths.
+Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Optuna-style search = bounded loop of capped `ti train modal launch` runs, only worth it for students.
