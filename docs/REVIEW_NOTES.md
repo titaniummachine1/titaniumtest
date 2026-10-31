@@ -253,3 +253,6 @@ Also: dataset per-empties table (ti data stats): proof labels cover only <=4 emp
 
 ## Botzone deploy 2026-10-31 (user ordered; login only in conversation)
 Uploaded data/titanium_v2.so sha EC4B4BAD (28,492,848 B), main ba09f2b, embedded net 00C01A49 (dis-head refit + per-bucket calibration). Driver unchanged 9550316F. Verified by download hash match. Rollback: logs/botzone_v12_backup (3F9E10BA, net 7AE0122F). Not included: fut24 (200ms leg -13 early), buckets, book, width.
+
+## USER ORDER 2026-10-31 (late): NO Botzone upload of the 16-bucket net until it is actually RETRAINED and gated
+User: "dont upload it to botzone until you finish retrain of it actually and gate it while still merged to main as better". cal16 (CE7C88D4) = split + calibration only, NOT retrained. Main keeps it (merged by user order); Botzone stays on EC4B4BAD (cal 8-bucket, uploaded earlier) / V13 until a real retrained 16-bucket net passes time gates. Upload job for 3CBD889C was killed mid-transfer; storage hash being re-verified.
