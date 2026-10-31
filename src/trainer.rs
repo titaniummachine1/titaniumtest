@@ -202,6 +202,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 plateau: g("--plateau", 0),
                 lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
                 max_drops: g("--max-drops", 3),
+                proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
             });
         }
         #[cfg(not(feature = "gpu"))]

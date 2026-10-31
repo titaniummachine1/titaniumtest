@@ -18,7 +18,7 @@ use titanium::nnue::BUNDLED_NNUE;
 use crate::data::Rec;
 use crate::layout::{self, GraphTensors};
 use crate::mapper;
-use crate::targets::target_of;
+use crate::targets::target_train;
 use crate::train::TrainableNet;
 use crate::trainer::{self, Tdat};
 
@@ -96,12 +96,14 @@ pub struct GpuCfg {
     pub plateau: usize,
     pub lr_factor: f32,
     pub max_drops: usize,
+    /// proven rows train on blend*proof + (1-blend)*sigmoid(cp5k); 1.0 = exact proofs (default, D162)
+    pub proof_blend: f32,
 }
 
 const NB: usize = 8;
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     assert!(!net.pairwise && net.s57w.is_empty() && net.buckets == NB && net.num_feats == NUM_FEATS,
         "graph covers non-pairwise nets without the S57 skip, 8 buckets, 26196 features (TNN1/TNN3)");
@@ -137,7 +139,7 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32) -
             }
         }
         bk[0] = s.bucket as i32;
-        target[0] = target_of(r).target;
+        target[0] = target_train(r, proof_blend).target;
         wt[0] = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
     });
 
@@ -228,7 +230,7 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         }
         println!("[holdout] DIAGNOSTIC RUN: D4 orientation {k} is never trained, it is validated separately");
     }
-    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip);
+    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -374,7 +376,7 @@ fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -
     use bullet_trainer::model::ModelEvaluator;
     use bullet_trainer::run::{HostPool, Step};
     let net = load_init(init)?;
-    let (mapper, defn) = build(&net, false, None, 0.0);
+    let (mapper, defn) = build(&net, false, None, 0.0, 1.0);
     let mut w = ModelWeights::new(&defn, 1);
     load_into(&mut w, &net);
     let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;

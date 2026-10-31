@@ -36,6 +36,49 @@ pub fn target_of(r: &Rec) -> Target {
     make_target(r.cp, r.outcome, None)
 }
 
+/// Training target with soft proofs: a proven row becomes `blend * proof + (1 - blend) * sigmoid(cp5k)` (blend 1.0 = exact,
+/// the D162 rule). Evaluation (`target_of`) always uses the exact target so val numbers stay comparable across runs.
+pub fn target_train(r: &Rec, proof_blend: f32) -> Target {
+    let t = target_of(r);
+    if t.proven >= 0 && proof_blend < 1.0 {
+        return Target { target: proof_blend * t.proven as f32 + (1.0 - proof_blend) * sigmoid_cp(r.cp5k), proven: t.proven };
+    }
+    t
+}
+
+#[cfg(test)]
+mod proof_blend_tests {
+    use super::*;
+
+    fn rec(cp: f32, cp5k: f32) -> Rec {
+        Rec::from_bytes(&[0u8; 48]).tap(|r| {
+            r.cp = cp;
+            r.cp5k = cp5k;
+            r.outcome = 1.0;
+        })
+    }
+    trait Tap: Sized {
+        fn tap(self, f: impl FnOnce(&mut Self)) -> Self;
+    }
+    impl Tap for Rec {
+        fn tap(mut self, f: impl FnOnce(&mut Self)) -> Self {
+            f(&mut self);
+            self
+        }
+    }
+
+    #[test]
+    fn blend_one_is_exact_and_soft_pulls_toward_5k() {
+        let proven_win = rec(99_000.0, 0.0);
+        assert_eq!(target_train(&proven_win, 1.0).target, 1.0);
+        assert!((target_train(&proven_win, 0.9).target - 0.95).abs() < 1e-6); // 0.9*1 + 0.1*0.5
+        let proven_loss = rec(-99_000.0, 0.0);
+        assert!((target_train(&proven_loss, 0.9).target - 0.05).abs() < 1e-6);
+        let normal = rec(120.0, 120.0);
+        assert_eq!(target_train(&normal, 0.9), target_of(&normal)); // non-proven rows untouched
+    }
+}
+
 /// `ti data check-targets --tdat X.tdat --ref ref.f32`: compare against the Python oracle's float32 targets.
 pub fn run_check(args: &[String]) -> std::process::ExitCode {
     use std::io::Read;
