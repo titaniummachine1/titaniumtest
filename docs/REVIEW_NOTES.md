@@ -190,3 +190,6 @@ Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Opt
 
 ## 2026-10-31 Corner / edge / centre-distance PST probe (user idea)
 `ti train probe` gained 6 candidates (pst_us/them = sum of Chebyshev distance-from-centre per stone, corner_us/them, edge_us/them). Residual of champion 7AE0122F on val_v9_clean (60k rows): single-feature correlations with the residual all |r| <= 0.053 (pst_them -0.038 all rows / -0.053 endgame, corner_them -0.042, edge_them -0.039, own-side ones <= 0.015); ALL 26 candidates together held-out R2 per bucket 0.97 / 0.11 / -0.63 / 0.40 / -0.01 / 3.37 / 3.27 / 1.43 %. G1 is a full per-square table, so a PST is already representable. Verdict: nothing there (<=0.3% of residual variance from any one).
+
+## 2026-10-31 Constraint (user): AVX2 default, AVX-512 also supported
+Width/speed curve (nps per width + 100 ms gates of refit-shrunk nets) must be measured on BOTH tiers: local PC = AVX2 (Haswell); AVX-512 via Docker sbx CPU sandbox if cpuid shows avx512 (CPU work goes to Docker, not Modal), Modal GPU hosts only as fallback. A width is only a candidate if it does not regress either tier.
