@@ -222,3 +222,4 @@ vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g)
 ## Standing law (user 2026-10-31): stack every law-10 gain into main one at a time (BEHAVIOR 35 in engine repo). First: nnue_main.tnn 0BFFB378, main 1d26a49 local.
 
 ## Promotion legs (user 2026-10-31): search/cost-per-node changes need 5k AND 100 ms passing (+200 ms when aimed at longer search); a clearly negative leg blocks the merge. See BEHAVIOR 35a.
+- Eval-quality-only changes (same width/arch, same nps) may be proven at 5k nodes alone; width/speed changes need timed legs (user 2026-10-31).
