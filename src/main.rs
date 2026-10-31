@@ -14,6 +14,7 @@
 mod book;
 mod data;
 mod mapper;
+mod trainer;
 mod targets;
 mod gate;
 mod games;
@@ -183,6 +184,11 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
 }
 
 fn run_train_subcmd(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("run") => return trainer::run_train(&args[1..]),
+        Some("parity") => return trainer::run_parity(&args[1..]),
+        _ => {}
+    }
     let init_spec = flag_str(args, "--init").unwrap_or_else(|| "bundled".to_string());
     let Some(bin_path) = flag_str(args, "--bin") else {
         eprintln!("train: --bin <dis_positions.bin> is required");

@@ -173,12 +173,76 @@ impl TrainableNet {
         }
     }
 
+    /// Forward only: the network output `y` in sigmoid units (cp = 400 y), f32 weights.
+    pub fn forward_y(&self, b: &Board) -> f32 {
+        let (us, nu, them, nt) = nnfeat::both(b, self.groups);
+        let (w, l1, l2, din, out_in) = (self.width, self.l1, self.l2, self.din(), self.out_in());
+        let bucket = ((b.empty().count_ones() as usize) * self.buckets / 50).min(self.buckets - 1);
+        let mut x = vec![0f32; 2 * w];
+        let mut ps = [0f32; 2];
+        for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
+            let a = &mut x[half * w..(half + 1) * w];
+            a.copy_from_slice(&self.ftb);
+            for &f in &idx[..n] {
+                let fi = f as usize;
+                for (v, r) in a.iter_mut().zip(&self.ft[fi * w..(fi + 1) * w]) {
+                    *v += *r;
+                }
+                ps[half] += self.psqt[fi * self.buckets + bucket];
+            }
+            for v in a.iter_mut() {
+                *v = v.clamp(0.0, 1.0);
+            }
+        }
+        let mut xin = vec![0f32; din];
+        if self.pairwise {
+            let h = w / 2;
+            for half in 0..2 {
+                for j in 0..h {
+                    xin[half * h + j] = x[half * w + j] * x[half * w + h + j];
+                }
+            }
+        } else {
+            xin.copy_from_slice(&x);
+        }
+        let mut h1 = vec![0f32; l1];
+        for j in 0..l1 {
+            let r = bucket * l1 + j;
+            let s: f32 = self.l1_w[r * din..(r + 1) * din].iter().zip(&xin).map(|(a, b)| a * b).sum();
+            h1[j] = (s + self.l1_b[r]).clamp(0.0, 1.0);
+        }
+        let mut h2 = vec![0f32; l2];
+        for j in 0..l2 {
+            let r = bucket * l2 + j;
+            let s: f32 = self.l2_w[r * l1..(r + 1) * l1].iter().zip(&h1).map(|(a, b)| a * b).sum();
+            h2[j] = (s + self.l2_b[r]).clamp(0.0, 1.0);
+        }
+        let row = &self.out_w[bucket * out_in..(bucket + 1) * out_in];
+        let o = if self.v2 {
+            row[..l1].iter().zip(&h1).map(|(a, b)| a * b).sum::<f32>() + row[l1..].iter().zip(&h2).map(|(a, b)| a * b).sum::<f32>()
+        } else {
+            row.iter().zip(&h2).map(|(a, b)| a * b).sum::<f32>()
+        } + self.out_b[bucket];
+        o + 0.5 * (ps[0] - ps[1])
+    }
+
     /// Forward + backward on a single position, accumulating gradients into `grad`.
     /// Returns the sample loss `|sigmoid(y) - target_prob|^2.5`.
     pub fn forward_backward_sample(
         &self,
         b: &Board,
         target_prob: f32,
+        grad: &mut BatchGradients,
+    ) -> f32 {
+        self.forward_backward_weighted(b, target_prob, 1.0, grad)
+    }
+
+    /// Same as above with a per-sample loss weight (the dataset's `wsum`).
+    pub fn forward_backward_weighted(
+        &self,
+        b: &Board,
+        target_prob: f32,
+        weight: f32,
         grad: &mut BatchGradients,
     ) -> f32 {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
@@ -265,11 +329,11 @@ impl TrainableNet {
         let pred = 1.0 / (1.0 + (-y).exp());
         let diff = pred - target_prob;
         let abs_diff = diff.abs();
-        let loss = abs_diff.powf(2.5);
+        let loss = abs_diff.powf(2.5) * weight;
         if abs_diff < 1e-7 {
             return loss;
         }
-        let d_loss_d_pred = 2.5 * diff.signum() * abs_diff.powf(1.5);
+        let d_loss_d_pred = weight * 2.5 * diff.signum() * abs_diff.powf(1.5);
         let dy = d_loss_d_pred * pred * (1.0 - pred);
 
         // 7. Backward: Output layer
