@@ -14,7 +14,7 @@ use titanium::nnue::Nnue;
 const BLOCK: usize = 1024;
 
 /// Solve (A + l2 I) x = v by Gaussian elimination with partial pivoting (f64, n <= 64).
-fn solve(a: &[Vec<f64>], v: &[f64], l2: f64) -> Vec<f64> {
+pub(crate) fn solve(a: &[Vec<f64>], v: &[f64], l2: f64) -> Vec<f64> {
     let n = v.len();
     let mut m: Vec<Vec<f64>> = (0..n)
         .map(|i| {
