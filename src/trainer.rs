@@ -423,3 +423,67 @@ pub fn run_check(args: &[String]) -> ExitCode {
     println!("{}", if red == 0 { "PREFLIGHT GREEN" } else { "PREFLIGHT RED" });
     if red == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
+
+/// `ti train buckets --net n.tnn --data <stem> [--rows 65536]`: where does the remaining loss live? MSE per phase bucket
+/// (stones/empties), split proven (exact 1/0 targets) vs other, next to the variance of the target in that bucket
+/// (mse / variance = share of the target the net does NOT explain; ~1 = no better than predicting the bucket mean).
+pub fn run_buckets(args: &[String]) -> ExitCode {
+    let f = |n: &str| crate::flag_str(args, n);
+    let (Some(net_p), Some(data)) = (f("--net"), f("--data")) else {
+        eprintln!("usage: ti train buckets --net <n.tnn> --data <stem> [--rows 65536]");
+        return ExitCode::FAILURE;
+    };
+    let rows = crate::flag_u64(args, "--rows").unwrap_or(65536) as usize;
+    let net = match std::fs::read(&net_p).map_err(|e| e.to_string()).and_then(|b| TrainableNet::from_tnn_bytes(&b)) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("buckets: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut t = match Tdat::open(&data) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("buckets: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let v = match load_val(&mut t, rows) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("buckets: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let nb = net.buckets;
+    // per bucket: n, sum t, sum t^2, sum err^2, n_proven, err^2 proven
+    let mut a = vec![[0f64; 6]; nb];
+    for r in &v {
+        let tg = target_of(r);
+        let fw = net.forward_full(&mapper::board_of(r, 0));
+        let p = 1.0 / (1.0 + (-fw.y as f64).exp());
+        let e = (p - tg.target as f64).powi(2);
+        let x = &mut a[fw.bucket];
+        x[0] += 1.0;
+        x[1] += tg.target as f64;
+        x[2] += (tg.target as f64).powi(2);
+        x[3] += e;
+        if tg.proven >= 0 {
+            x[4] += 1.0;
+            x[5] += e;
+        }
+    }
+    println!("{} rows of {data}, net {net_p}", v.len());
+    println!("bucket   rows   mse     target-var  unexplained  proven-rows  proven-mse  share-of-total-loss");
+    let tot: f64 = a.iter().map(|x| x[3]).sum();
+    for (b, x) in a.iter().enumerate() {
+        if x[0] == 0.0 {
+            continue;
+        }
+        let mean = x[1] / x[0];
+        let var = x[2] / x[0] - mean * mean;
+        let mse = x[3] / x[0];
+        println!("{b:>6} {:>6} {:.5}  {:.5}     {:>6.1}%      {:>6}      {:.5}     {:>5.1}%", x[0] as usize, mse, var, 100.0 * mse / var.max(1e-12), x[4] as usize, if x[4] > 0.0 { x[5] / x[4] } else { 0.0 }, 100.0 * x[3] / tot.max(1e-12));
+    }
+    ExitCode::SUCCESS
+}

@@ -140,3 +140,9 @@ afterwards speed work towards 400k-1M nps. Opus view:
   (0.0244 vs 0.0176): different data mix, so the val-train "gap" is negative; watch its trend, not its sign.
 - lr 1e-5 moved val by +-0.00002 in 1500 steps: safe but nearly inert. The real run needs a larger LR (guard 1.15 protects).
 - Launch footgun: Git Bash rewrites `/data/..` arguments to `C:/Program Files/Git/data/..`; use `ti train modal put` or MSYS_NO_PATHCONV=1.
+
+## grow512a/b + memorisation + buckets (2026-10-31 night) - see engine docs/DECISIONS.md D232
+- grow512b: val never beat the init (0.017632 vs 0.017639); LR halving x3 did not recover val; saturated on generalisation.
+- Memorisation test (100k slice, lr 1e-3, no D4): loss 0.0231 -> 0.00013. Trainer is correct. Orientation probe works (17000% spread without D4, 1.5% with).
+- `ti train buckets`: bucket 0 (<=6 empties) is 14% of rows, 42% of loss, 48% of target variance unexplained. NOTE bucket index = min(empties*8/50,7): 0 is the ENDGAME, 7 the opening.
+- UNSURE: whether the endgame loss matters for play (search solves those positions). Idea, UNTESTED: down-weight bucket 0 rows or train with them excluded and see if mid-game buckets improve (capacity freed) - decided by games only.

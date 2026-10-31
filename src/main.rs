@@ -195,6 +195,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("parity") => return trainer::run_parity(&args[1..]),
         Some("check") => return trainer::run_check(&args[1..]),
         Some("export") => return export::run_export(&args[1..]),
+        Some("buckets") => return trainer::run_buckets(&args[1..]),
         Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {
