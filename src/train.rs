@@ -46,6 +46,14 @@ pub struct TrainableNet {
     pub dis_b: Vec<f32>,
 }
 
+/// Result of [`TrainableNet::forward_full`].
+pub struct Fwd {
+    pub y: f32,
+    pub h1: Vec<f32>,
+    pub h2: Vec<f32>,
+    pub bucket: usize,
+}
+
 #[derive(Clone, Copy)]
 pub struct LabeledSample {
     pub occ0: u64,
@@ -175,6 +183,11 @@ impl TrainableNet {
 
     /// Forward only: the network output `y` in sigmoid units (cp = 400 y), f32 weights.
     pub fn forward_y(&self, b: &Board) -> f32 {
+        self.forward_full(b).y
+    }
+
+    /// Forward with the hidden activations (h1, h2) and the phase bucket, for the disagreement-head fit.
+    pub fn forward_full(&self, b: &Board) -> Fwd {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
         let (w, l1, l2, din, out_in) = (self.width, self.l1, self.l2, self.din(), self.out_in());
         let bucket = ((b.empty().count_ones() as usize) * self.buckets / 50).min(self.buckets - 1);
@@ -223,7 +236,7 @@ impl TrainableNet {
         } else {
             row.iter().zip(&h2).map(|(a, b)| a * b).sum::<f32>()
         } + self.out_b[bucket];
-        o + 0.5 * (ps[0] - ps[1])
+        Fwd { y: o + 0.5 * (ps[0] - ps[1]), h1, h2, bucket }
     }
 
     /// Forward + backward on a single position, accumulating gradients into `grad`.

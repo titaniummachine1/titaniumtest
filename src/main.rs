@@ -13,6 +13,7 @@
 
 mod book;
 mod data;
+mod export;
 mod layout;
 mod mapper;
 #[cfg(feature = "gpu")]
@@ -191,6 +192,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("run") => return trainer::run_train(&args[1..]),
         Some("parity") => return trainer::run_parity(&args[1..]),
         Some("check") => return trainer::run_check(&args[1..]),
+        Some("export") => return export::run_export(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {
             let a = &args[1..];
