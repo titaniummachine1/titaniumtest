@@ -13,10 +13,10 @@ use crate::trainer::{load_val, Tdat};
 use titanium::board::Board;
 use titanium::nnfeat::{G2_OFF, G3_OFF, G5_OFF, G6_OFF, NUM_FEATS, SQ_STATES};
 
-const NC: usize = 14;
+const NC: usize = 20;
 const NAMES: [&str; NC] = [
     "mob_us", "mob_them", "stuck_us", "stuck_them", "cap_us", "cap_them", "regions", "largest_region", "odd_regions", "terr_us",
-    "terr_them", "contested", "empties", "stone_diff",
+    "terr_them", "contested", "empties", "stone_diff", "perm_us", "perm_them", "safe_us", "safe_them", "exposed_us", "exposed_them",
 ];
 
 const FULL: u64 = (1u64 << 49) - 1;
@@ -91,6 +91,12 @@ fn cand_features(b: &Board) -> [f64; NC] {
     // territory: empties within distance 2 of only one side's stones
     let reach = |s: u64| dil(dil(s)) & empty;
     let (ru, rt) = (reach(us), reach(them));
+    // stone safety: permanent = no empty neighbour (can never be flipped); exposed = a neighbouring empty is a landing square of
+    // the enemy (can be flipped next move); safe = neither permanent nor exposed-now but still flippable later is NOT counted here
+    let near_empty = dil(empty);
+    let (perm_us, perm_them) = (us & !near_empty, them & !near_empty);
+    let (exp_us, exp_them) = (us & dil(rt), them & dil(ru));
+    let (safe_us, safe_them) = (us & !exp_us, them & !exp_them);
     [
         mu,
         mt,
@@ -106,6 +112,12 @@ fn cand_features(b: &Board) -> [f64; NC] {
         (ru & rt).count_ones() as f64,
         empty.count_ones() as f64,
         us.count_ones() as f64 - them.count_ones() as f64,
+        perm_us.count_ones() as f64,
+        perm_them.count_ones() as f64,
+        safe_us.count_ones() as f64,
+        safe_them.count_ones() as f64,
+        exp_us.count_ones() as f64,
+        exp_them.count_ones() as f64,
     ]
 }
 
@@ -211,10 +223,11 @@ pub fn run_probe(args: &[String]) -> ExitCode {
         bk.push(fw.bucket);
         x.push(cand_features(&b));
     }
-    let sets: [(&str, Vec<usize>); 5] = [
+    let sets: [(&str, Vec<usize>); 6] = [
         ("mobility + stuck", vec![0, 1, 2, 3]),
         ("best capture (tactics)", vec![4, 5]),
         ("regions + territory", vec![6, 7, 8, 9, 10, 11]),
+        ("stone safety (permanent/safe/exposed)", vec![14, 15, 16, 17, 18, 19]),
         ("ALL candidates", (0..NC).collect()),
         ("reference: empties+stone diff (net has G6)", vec![12, 13]),
     ];
