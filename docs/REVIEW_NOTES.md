@@ -243,3 +243,4 @@ User: "every step of downscale must be from biggest best strongest net usually s
 - Teacher now = merged 0BFFB378 (W=256); saturated 512 nets are not teachers until they beat it per node AND at 100 ms.
 - Labels = 5k-node search values (+ teacher outputs as soft target). When the teacher improves, redistil all students from it.
 - Speed/strength curve may be non-monotone (user: dip at ~400 knps could rise again at ~1.5 Mnps). Report "best found", not "optimal". Sample coarse extremes first (64..512), refit-shrunk sweep understates small widths, search constants retuned per width.
+- BEHAVIOR 35e: 100/200 ms legs decide search-affecting merges; 5k is diagnosis only (user 2026-10-31). rfp56 dropped: 5k fresh-opening rerun -23.3+-27.2 (582g) vs screening +64.4 (300g) = noise. cal_r2m 5k +51.3+-29.8 (512g) pending 100ms. fut24 100ms +20.3+-14.5 (2000g, lower +5.8); 200ms queued.
