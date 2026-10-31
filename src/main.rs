@@ -19,6 +19,7 @@ mod leak;
 mod mapper;
 mod modal;
 mod probe;
+mod shrink;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod trainer;
@@ -198,6 +199,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("export") => return export::run_export(&args[1..]),
         Some("buckets") => return trainer::run_buckets(&args[1..]),
         Some("probe") => return probe::run_probe(&args[1..]),
+        Some("shrink") => return shrink::run_shrink(&args[1..]),
         Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {
