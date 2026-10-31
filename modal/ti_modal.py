@@ -19,10 +19,8 @@ image = (
     .add_local_dir(ENGINE + r"\crates\titanium", "/src/engine/crates/titanium", copy=True, ignore=["target"])
     .add_local_file(ENGINE + r"\data\nnue\nnue_main.tnn", "/src/engine/data/nnue/nnue_main.tnn", copy=True)
     .add_local_file(ENGINE + r"\data\nnue\fut_small.tsn", "/src/engine/data/nnue/fut_small.tsn", copy=True)
-    .add_local_dir(HUB, "/src/hub", copy=True, ignore=["target", ".cargo", "modal"])
+    .add_local_dir(HUB, "/src/hub", copy=True, ignore=["target", "modal"])
     .run_commands(
-        "mkdir -p /src/hub/.cargo && printf '[patch.\"https://github.com/titaniummachine1/titanium-ataxx\"]\n"
-        "titanium = { path = \"/src/engine/crates/titanium\" }\n' > /src/hub/.cargo/config.toml",
         "cd /src/hub && CUDA_PATH=/usr/local/cuda RUSTFLAGS='-C target-cpu=x86-64-v3 -L /usr/local/cuda/lib64/stubs' "
         "$HOME/.cargo/bin/cargo build --release --features cuda && cp target/release/ti /usr/local/bin/ti",
     )
