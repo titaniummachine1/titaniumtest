@@ -220,3 +220,5 @@ Only need to prove a candidate is objectively better than main (law 10): CI lowe
 vs main 7AE0122F, paired book, CI lower bound >0: r200k_l1 5k +45.4+-41.6 (300g); r2m_l1 5k +58.5+-38.2 (300g); r200k_l01 5k +64.4+-38.5 (300g); r2m_l1 100ms AVX2 (Docker) +39.6+-35.3 (370g, ongoing). I wrongly waited for SPRT upper bound (+10 Elo1); law 10 replaced it. Variants not ranked (differences inside noise). AVX-512 tier gate still owed (Modal, after midnight). Merge needs user approval naming branch+net.
 
 ## Standing law (user 2026-10-31): stack every law-10 gain into main one at a time (BEHAVIOR 35 in engine repo). First: nnue_main.tnn 0BFFB378, main 1d26a49 local.
+
+## Promotion legs (user 2026-10-31): search/cost-per-node changes need 5k AND 100 ms passing (+200 ms when aimed at longer search); a clearly negative leg blocks the merge. See BEHAVIOR 35a.
