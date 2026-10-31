@@ -364,6 +364,7 @@ pub fn run_data(args: &[String]) -> ExitCode {
         }
         Some("check-targets") => crate::targets::run_check(args),
         Some("check-leak") => crate::leak::run_check(args),
+        Some("stats") => run_stats(args),
         _ => {
             eprintln!("usage: ti data pack --npz <v9.npz> --out <stem>");
             ExitCode::FAILURE
@@ -390,4 +391,61 @@ mod tests {
         assert_eq!(rows, 601_957);
         assert_eq!(std::fs::metadata(format!("{}.tdat", out.display())).unwrap().len(), (rows * REC) as u64);
     }
+}
+
+/// `ti data stats --data <stem>`: what is in a packed dataset (source of the labels, how many carry a 5k-search eval, proofs).
+pub fn run_stats(args: &[String]) -> ExitCode {
+    use std::collections::BTreeMap;
+    let Some(stem) = crate::flag_str(args, "--data") else {
+        eprintln!("usage: ti data stats --data <stem>");
+        return ExitCode::FAILURE;
+    };
+    let mut t = match crate::trainer::Tdat::open(&stem) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("data stats: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut by: BTreeMap<(u8, u8, u8), [u64; 5]> = BTreeMap::new(); // rows, proven, has_cp5k, zx!=0, ti_clash
+    let (mut buf, mut s) = (Vec::new(), 0usize);
+    let (mut sum_gap, mut n_gap) = (0f64, 0u64);
+    while s < t.rows {
+        buf.clear();
+        if t.read_block(s, 1 << 16, &mut buf).is_err() {
+            break;
+        }
+        s += buf.len();
+        for r in &buf {
+            let e = by.entry((r.teacher_kind, r.proof_kind, r.relabel_src)).or_default();
+            e[0] += 1;
+            if r.cp.abs() >= 98_000.0 {
+                e[1] += 1;
+            }
+            if r.cp5k != 0.0 {
+                e[2] += 1;
+                if r.cp.abs() < 98_000.0 {
+                    sum_gap += (r.cp - r.cp5k).abs().min(1500.0) as f64;
+                    n_gap += 1;
+                }
+            }
+            if r.zx != 0 {
+                e[3] += 1;
+            }
+            if r.ti_clash != 0 {
+                e[4] += 1;
+            }
+        }
+    }
+    println!("{stem}: {} rows", t.rows);
+    println!("teacher_kind proof_kind relabel_src |       rows   proven(|cp|>=98000)   cp5k!=0     zx!=0  ti_clash");
+    let mut tot = [0u64; 5];
+    for ((a, b, c), e) in &by {
+        println!("{a:>12} {b:>10} {c:>11} | {:>10} {:>10} {:>14} {:>9} {:>9}", e[0], e[1], e[2], e[3], e[4]);
+        for i in 0..5 {
+            tot[i] += e[i];
+        }
+    }
+    println!("total {} rows: proven {} ({:.1}%), cp5k present {} ({:.1}%), zx {}, clash {}; mean |cp - cp5k| (capped 1500) on non-proven rows with both: {:.1} cp", tot[0], tot[1], 100.0 * tot[1] as f64 / tot[0] as f64, tot[2], 100.0 * tot[2] as f64 / tot[0] as f64, tot[3], tot[4], sum_gap / n_gap.max(1) as f64);
+    ExitCode::SUCCESS
 }
