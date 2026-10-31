@@ -240,3 +240,39 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     .map_err(|_| "bullet training failed (TrainingError<G> has no Debug bound here; see the console log above)".to_string())?;
     Ok(())
 }
+
+/// `ti train gpu-parity --init net --tdat stem [--n 512]`: graph forward (bullet, on the GPU) vs hub CPU forward on the
+/// same positions and the same weights. Proves the layout + graph before any training. Exit 1 if max diff > 1e-3.
+pub fn parity(init: &str, stem: &str, n: usize) -> Result<(), String> {
+    let device: Arc<Device<_>> = DefaultDevice::new(0).map_err(|e| format!("{e:?}"))?;
+    parity_on(device, init, stem, n)
+}
+
+fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -> Result<(), String> {
+    use bullet_trainer::model::ModelEvaluator;
+    use bullet_trainer::run::{HostPool, Step};
+    let net = load_init(init)?;
+    let (mapper, defn) = build(&net, false);
+    let mut w = ModelWeights::new(&defn, 1);
+    load_into(&mut w, &net);
+    let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;
+    ev.load_weights(&w).map_err(|e| format!("{e:?}"))?;
+    let pool = HostPool::new(device.clone());
+    let mut t = Tdat::open(stem)?;
+    let rows = trainer::load_val(&mut t, n)?;
+    let (mut worst, mut sum) = (0f32, 0f64);
+    for r in rows.iter().take(n) {
+        let host = mapper.map(&pool, std::slice::from_ref(r), Step::default(), 1).map_err(|e| format!("{e:?}"))?;
+        let inputs = host.to_device(&device).map_err(|e| format!("{e:?}"))?;
+        let out = ev.evaluate(&inputs).map_err(|e| format!("{e:?}"))?;
+        let y = match out.get("output").ok_or("no output")?.to_host().map_err(|e| format!("{e:?}"))? {
+            TValue::F32(v) => v[0],
+            _ => return Err("output not f32".into()),
+        };
+        let d = (y - net.forward_y(&mapper::board_of(r, 0))).abs();
+        worst = worst.max(d);
+        sum += d as f64;
+    }
+    println!("gpu-parity rows {} max|graph - hub| {:.3e} mean {:.3e}", n.min(rows.len()), worst, sum / n.min(rows.len()).max(1) as f64);
+    if worst < 1e-3 { Ok(()) } else { Err("GPU PARITY FAILED: graph != hub forward (check layout.rs / graph)".into()) }
+}

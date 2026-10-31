@@ -191,6 +191,18 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("run") => return trainer::run_train(&args[1..]),
         Some("parity") => return trainer::run_parity(&args[1..]),
         Some("check") => return trainer::run_check(&args[1..]),
+        #[cfg(feature = "gpu")]
+        Some("gpu-parity") => {
+            let a = &args[1..];
+            let r = gpu::parity(&flag_str(a, "--init").unwrap_or_else(|| "bundled".into()), &flag_str(a, "--tdat").unwrap_or_default(), flag_u64(a, "--n").unwrap_or(512) as usize);
+            return match r {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {}
     }
     let init_spec = flag_str(args, "--init").unwrap_or_else(|| "bundled".to_string());

@@ -132,3 +132,31 @@ mod tests {
         assert_eq!(bucket_of(25, 8), 4);
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    /// `cargo test --release mapper_speed -- --ignored --nocapture` (needs the packed val file)
+    #[test]
+    #[ignore]
+    fn mapper_speed() {
+        let p = "C:/gitProjects/titanium-ataxx/data/nnue/packed/val_v9.tdat";
+        let b = std::fs::read(p).unwrap();
+        let rows: Vec<Rec> = b.chunks_exact(crate::data::REC).take(200_000).map(Rec::from_bytes).collect();
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for (i, r) in rows.iter().enumerate() {
+            n += sample(r, i & 7, 8).us.len();
+        }
+        let s = t.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        let mut m = 0usize;
+        for r in &rows {
+            let (_, nu, _, nt) = nnfeat::both(&board_of(r, 0), ALL_GROUPS);
+            m += nu + nt;
+        }
+        let s2 = t2.elapsed().as_secs_f64();
+        println!("mapper (D4 + feats + Vec): {:.0} rows/s/core, avg active {:.1}; feats only {:.0} rows/s/core", rows.len() as f64 / s, n as f64 / rows.len() as f64, rows.len() as f64 / s2, );
+        let _ = m;
+    }
+}
