@@ -15,6 +15,8 @@ path = "src/main.rs"
 #   titanium = { path = "C:/gitProjects/titanium-ataxx/crates/titanium" }
 titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "20c7accb" }
 
+flate2 = "1.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

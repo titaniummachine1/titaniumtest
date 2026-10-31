@@ -12,6 +12,7 @@
 //!   titaniumtest worker --server http://127.0.0.1:8080 [--threads 4] [--worker-id NAME]
 
 mod book;
+mod data;
 mod gate;
 mod games;
 mod sprt;
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
         "gate" => gate::run_gate(&args[1..]),
         "log" => gate::run_log(&args[1..]),
         "merge-check" => gate::run_merge_check(&args[1..]),
+        "data" => data::run_data(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
