@@ -27,6 +27,7 @@ mod targets;
 mod gate;
 mod games;
 mod sprt;
+mod spsa;
 mod train;
 
 use sprt::{SprtTally, SprtVerdict};
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("help");
     match sub {
         "sprt" => run_sprt_cli(&args[1..]),
+        "spsa" => spsa::run_spsa(&args[1..]),
         "gate" => gate::run_gate(&args[1..]),
         "log" => gate::run_log(&args[1..]),
         "merge-check" => gate::run_merge_check(&args[1..]),
