@@ -187,7 +187,36 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
     let (net_path, data, out) = (f("--net").ok_or("--net <trained.tnn> required")?, f("--data").ok_or("--data <stem> required")?, f("--out").ok_or("--out <final.tnn> required")?);
     let rows = crate::flag_u64(args, "--rows").unwrap_or(200_000) as usize;
     let l2 = crate::flag_f64(args, "--l2").unwrap_or(1.0);
-    let mut net = TrainableNet::from_tnn_bytes(&std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?)?;
+    let src_bytes = std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?;
+    let src_sha = crate::hash::short_hex(&src_bytes);
+    let mut net = TrainableNet::from_tnn_bytes(&src_bytes)?;
+    // provenance (D242): the source must be the file the trainer recorded, proven by re-measuring its val on the same slice
+    let rec = crate::prov::lookup(&net_path);
+    let val_dir = f("--val-dir").unwrap_or_else(|| "data/nnue/packed".into());
+    let (val_stem, val_rows) = match &rec {
+        Some(e) => (format!("{val_dir}/{}", e.on), e.rows),
+        None if crate::has_flag(args, "--no-record") => (f("--val").ok_or("--no-record needs --val <stem>")?, crate::flag_u64(args, "--val-rows").unwrap_or(131072) as usize),
+        None => {
+            return Err(format!(
+                "no {} line matches {net_path} (sha {src_sha}). Fetch the whole run dir (`ti train modal fetch --tag T`) and export from it, \
+                 or pass --no-record --val <stem> for a net written before RECORD.txt existed",
+                crate::prov::RECORD
+            ))
+        }
+    };
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let val = {
+        let mut vf = Tdat::open(&val_stem)?;
+        crate::trainer::load_val(&mut vf, val_rows)?
+    };
+    let v_src = crate::trainer::evaluate(&net, &val, threads).mse;
+    match &rec {
+        Some(e) if (v_src - e.val).abs() > 2e-6 => {
+            return Err(format!("{net_path}: val on {val_stem} ({val_rows} rows) is {v_src:.6} but the run recorded {:.6} ({}): NOT the trained file", e.val, e.line))
+        }
+        Some(e) => println!("[export] provenance OK: {} | re-measured val {v_src:.6}", e.line),
+        None => println!("[export] NO RECORD (--no-record): source sha {src_sha}, val {v_src:.6} on {val_stem} ({val_rows} rows)"),
+    }
     let mut train = Tdat::open(&data)?;
     if args.iter().any(|a| a == "--calibrate") {
         let cr = crate::flag_u64(args, "--cal-rows").unwrap_or(400_000) as usize;
@@ -232,5 +261,22 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
     if wf > 1e-3 {
         return Err("hub forward != engine f32 forward on the exported file".into());
     }
+    let v_out = crate::trainer::evaluate(&net, &val, threads).mse;
+    println!("[export] val {v_src:.6} -> {v_out:.6} (dis refit leaves y unchanged; only --calibrate moves it)");
+    crate::prov::write_prov(
+        &out,
+        &[
+            ("out_sha", crate::hash::file_label(&out)),
+            ("source", net_path.clone()),
+            ("source_sha", src_sha),
+            ("record", rec.as_ref().map(|e| e.line.clone()).unwrap_or_else(|| "NONE (--no-record)".into())),
+            ("val", format!("{val_stem} rows {val_rows}")),
+            ("val_source", format!("{v_src:.6}")),
+            ("val_out", format!("{v_out:.6}")),
+            ("calibrate", args.iter().any(|a| a == "--calibrate").to_string()),
+            ("hub", env!("CARGO_PKG_VERSION").into()),
+        ],
+    )?;
+    println!("[export] wrote {out}.prov");
     Ok(())
 }

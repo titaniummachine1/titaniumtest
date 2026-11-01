@@ -121,9 +121,9 @@ mod tests {
         let mut s = 0x1234_5678_9abc_def1u64;
         for _ in 0..200 {
             let r = rec(&mut s);
-            let base = sample(&r, 0, 8);
+            let base = sample(&r, 0, 8, 0);
             for m in 1..MODES {
-                let t = sample(&r, m, 8);
+                let t = sample(&r, m, 8, 0);
                 let g1 = |v: &Vec<u32>| -> Vec<(usize, usize)> {
                     let mut o: Vec<_> = v.iter().map(|&f| f as usize).filter(|&f| f >= G1_OFF && f < G2_OFF).map(|f| (f / SQ_STATES, f % SQ_STATES)).collect();
                     o.sort();
@@ -158,7 +158,7 @@ mod bench {
         let t = std::time::Instant::now();
         let mut n = 0usize;
         for (i, r) in rows.iter().enumerate() {
-            n += sample(r, i & 7, 8).us.len();
+            n += sample(r, i & 7, 8, 0).us.len();
         }
         let s = t.elapsed().as_secs_f64();
         let t2 = std::time::Instant::now();

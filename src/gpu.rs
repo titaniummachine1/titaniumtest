@@ -268,6 +268,7 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let (patience, min_delta) = (c.patience, c.min_delta);
     let (plateau, lr_factor, max_drops) = (c.plateau, c.lr_factor, c.max_drops);
     let keep_all = c.keep_all;
+    let (val_stem, val_rows) = (c.val.clone(), c.val_rows);
     let mut since_best = 0usize;
     let mut drops = 0usize;
     let mut best = f64::MAX;
@@ -319,7 +320,9 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         println!("{line}");
         // keep only the newest checkpoint + best.tnn (~28 MB each)
         let cur = format!("{out}/ckpt_{}.tnn", step.total_batches());
-        let _ = std::fs::write(&cur, pick.to_tnn_bytes());
+        let pick_bytes = pick.to_tnn_bytes();
+        let _ = std::fs::write(&cur, &pick_bytes);
+        crate::prov::record(&out, &format!("ckpt_{}.tnn", step.total_batches()), &pick_bytes, pick_mse, &val_stem, val_rows, sbn);
         if let Some(p) = last.replace(cur) {
             if !keep_all {
                 let _ = std::fs::remove_file(p);
@@ -329,7 +332,8 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
             // a gain smaller than min_delta is saved but does not reset the patience counter
             since_best = if pick_mse < best - min_delta { 0 } else { since_best + 1 };
             best = pick_mse;
-            let _ = std::fs::write(format!("{out}/best.tnn"), pick.to_tnn_bytes());
+            let _ = std::fs::write(format!("{out}/best.tnn"), &pick_bytes);
+            crate::prov::record(&out, "best.tnn", &pick_bytes, pick_mse, &val_stem, val_rows, sbn);
         } else {
             since_best += 1;
         }

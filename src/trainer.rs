@@ -327,7 +327,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             }
             if v.mse < best {
                 best = v.mse;
-                std::fs::write(format!("{out}/best.tnn"), net.to_tnn_bytes()).map_err(|e| e.to_string())?;
+                let b = net.to_tnn_bytes();
+                std::fs::write(format!("{out}/best.tnn"), &b).map_err(|e| e.to_string())?;
+                crate::prov::record(&out, "best.tnn", &b, v.mse, &val_stem, val_rows, done);
             }
         }
         if done % save_every == 0 || done == steps {
@@ -432,7 +434,7 @@ pub fn run_check(args: &[String]) -> ExitCode {
 pub fn run_buckets(args: &[String]) -> ExitCode {
     let f = |n: &str| crate::flag_str(args, n);
     let (Some(net_p), Some(data)) = (f("--net"), f("--data")) else {
-        eprintln!("usage: ti train buckets --net <n.tnn> --data <stem> [--rows 65536]");
+        eprintln!("usage: ti train buckets --net <n.tnn> --data <stem> [--rows 65536] [--by-empties] [--dump rows.txt]");
         return ExitCode::FAILURE;
     };
     let rows = crate::flag_u64(args, "--rows").unwrap_or(65536) as usize;
@@ -464,11 +466,18 @@ pub fn run_buckets(args: &[String]) -> ExitCode {
     let mut a = vec![[0f64; 6]; nb];
     // per-empties sufficient statistics of the OLS fit target ~ a + b * p: n, sum p, sum t, sum p^2, sum p*t, sum t^2
     let mut st = vec![[0f64; 6]; 50];
-    for r in &v {
+    // --dump FILE: one line per row "row empties bucket p target proven", for paired comparisons of nets on the same rows
+    let mut dump = crate::flag_str(args, "--dump").map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("buckets: --dump")));
+    for (i, r) in v.iter().enumerate() {
         let tg = target_of(r);
         let fw = net.forward_full(&mapper::board_of(r, 0));
         let p = 1.0 / (1.0 + (-fw.y as f64).exp());
         let e = (p - tg.target as f64).powi(2);
+        if let Some(w) = dump.as_mut() {
+            use std::io::Write;
+            let em = mapper::board_of(r, 0).empty().count_ones();
+            writeln!(w, "{i} {em} {} {p:.6} {:.6} {}", fw.bucket, tg.target, tg.proven).expect("buckets: --dump write");
+        }
         if by_empties {
             let e = (mapper::board_of(r, 0).empty().count_ones() as usize).min(49);
             let (pp, tt) = (p, tg.target as f64);

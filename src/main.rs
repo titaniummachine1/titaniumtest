@@ -31,6 +31,7 @@ mod train;
 
 use sprt::{SprtTally, SprtVerdict};
 mod hash;
+mod prov;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -732,7 +733,7 @@ fn play_single_game(
     nodes: Option<u64>,
     cand_reset_every_move: bool,
     base_reset_every_move: bool,
-    libataxx_end: bool,
+    rules: u8,
     moves: &mut Vec<MoveRec>,
 ) -> Result<(u8, u32, u32, u16), String> {
     cand.reset()?;
@@ -741,8 +742,11 @@ fn play_single_game(
     let mut forfeit_winner: Option<u8> = None;
     moves.clear();
 
-    // libataxx (Moonbird/Zataxx) ends the game when NEITHER side can move; classic plays the pass first.
-    let over = |b: &Board| b.game_over() || (libataxx_end && !b.has_moves(0) && !b.has_moves(1));
+    // rules: 0 classic (plays the pass first), 1 libataxx (Moonbird/Zataxx: ends when NEITHER side can move),
+    // 2 botzone (no passes: the game ends the moment EITHER side cannot move, empties go to the mobile side).
+    let libataxx_end = rules == 1;
+    let bz_end = rules == 2;
+    let over = |b: &Board| b.game_over() || (libataxx_end && !b.has_moves(0) && !b.has_moves(1)) || (bz_end && (!b.has_moves(0) || !b.has_moves(1)));
     while !over(&b) && b.ply < 300 {
         let side = b.turn;
         if !b.has_moves(side) {
@@ -782,14 +786,25 @@ fn play_single_game(
         }
     }
 
-    let winner = forfeit_winner.unwrap_or_else(|| {
+    let (mut bl, mut wh) = b.counts();
+    let mut bz_winner: Option<u8> = None;
+    if bz_end && forfeit_winner.is_none() && over(&b) {
+        let empties = 49u32.saturating_sub(bl as u32 + wh as u32);
+        let (m0, m1) = (b.has_moves(0), b.has_moves(1));
+        if m0 && !m1 {
+            bl = (bl as u32 + empties) as _;
+        } else if m1 && !m0 {
+            wh = (wh as u32 + empties) as _;
+        }
+        bz_winner = Some(if bl > wh { 0 } else if wh > bl { 1 } else { 2 });
+    }
+    let winner = forfeit_winner.or(bz_winner).unwrap_or_else(|| {
         if b.ply >= 300 && !over(&b) {
             2
         } else {
             b.winner()
         }
     });
-    let (bl, wh) = b.counts();
     let pts_x2 = if winner == 2 {
         1
     } else if (winner == 0 && candidate_is_black) || (winner == 1 && !candidate_is_black) {
@@ -841,16 +856,34 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
         }
     };
     let book0 = flag_u64(args, "--book0").unwrap_or(0) as usize;
-    let libataxx_end = match flag_str(args, "--rules").as_deref() {
-        None | Some("classic") => false,
-        Some("libataxx") => true,
+    let rules: u8 = match flag_str(args, "--rules").as_deref() {
+        None | Some("classic") => 0,
+        Some("libataxx") => 1,
+        Some("botzone") => 2,
         Some(r) => {
-            eprintln!("sprt: --rules classic|libataxx, got {r}");
+            eprintln!("sprt: --rules classic|libataxx|botzone, got {r}");
             return ExitCode::FAILURE;
         }
     };
+    // provenance (D242): a candidate net under test must carry a `.prov` from `ti train export`; a net the baseline also
+    // runs (speed / search gates) is not under test and needs none
+    let base_nets: Vec<String> = prov::nets_of(&base_spec).iter().map(|n| hash::file_label(n)).collect();
+    let mut prov_note = String::new();
+    for n in prov::nets_of(&cand_spec) {
+        if base_nets.contains(&hash::file_label(&n)) {
+            continue;
+        }
+        match prov::check_net(&n) {
+            Ok(s) => prov_note.push_str(&format!(" | prov {s}")),
+            Err(e) if has_flag(args, "--allow-unproven-net") => prov_note.push_str(&format!(" | UNPROVEN NET (override): {e}")),
+            Err(e) => {
+                eprintln!("sprt: candidate net has no verified provenance: {e}\n      (export it with `ti train export`, or pass --allow-unproven-net to gate it anyway, logged as UNPROVEN)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let header = format!(
-        "# ti sprt | candidate {} [{}] | baseline {} [{}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}",
+        "# ti sprt | candidate {} [{}] | baseline {} [{}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}{prov_note}",
         cand_spec,
         engine_label(&cand_spec),
         base_spec,
@@ -858,7 +891,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
         book_path,
         hash::file_label(&book_path),
         book0,
-        if libataxx_end { "libataxx" } else { "classic" },
+        ["classic", "libataxx", "botzone"][rules as usize],
         nodes,
         cand_time_ms,
         base_time_ms,
@@ -927,7 +960,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         nodes,
                         cand_reset_every_move,
                         base_reset_every_move,
-                        libataxx_end,
+                        rules,
                         &mut mv1,
                     )
                     .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 1 failed: {e}"));
@@ -944,7 +977,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         nodes,
                         cand_reset_every_move,
                         base_reset_every_move,
-                        libataxx_end,
+                        rules,
                         &mut mv2,
                     )
                     .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 2 failed: {e}"));
@@ -1560,9 +1593,9 @@ fn execute_sprt_pair_payload(
             let mut cand = PlayerSlot::create(cand_spec).expect("worker: cand init");
             let mut base = PlayerSlot::create(base_spec).expect("worker: base init");
             let mut scratch = Vec::new();
-            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, false, &mut scratch)
+            let (g1, _, _, _) = play_single_game(&board, true, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, 0, &mut scratch)
                 .expect("worker: sprt game 1");
-            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, false, &mut scratch)
+            let (g2, _, _, _) = play_single_game(&board, false, &mut cand, &mut base, time_ms, time_ms, nodes, false, false, 0, &mut scratch)
                 .expect("worker: sprt game 2");
             let submit = format!("PAIR {pid} {g1} {g2}\n");
             match http_post(host_port, "/api/submit_sprt", submit.as_bytes()) {
