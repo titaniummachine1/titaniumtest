@@ -18,7 +18,7 @@ use titanium::nnue::BUNDLED_NNUE;
 use crate::data::Rec;
 use crate::layout::{self, GraphTensors};
 use crate::mapper;
-use crate::targets::target_train;
+use crate::targets::{rw_val_row, target_train_rw};
 use crate::train::TrainableNet;
 use crate::trainer::{self, Tdat};
 
@@ -98,12 +98,14 @@ pub struct GpuCfg {
     pub max_drops: usize,
     /// proven rows train on blend*proof + (1-blend)*sigmoid(cp5k); 1.0 = exact proofs (default, D162)
     pub proof_blend: f32,
+    /// game-result weight by phase [<=6 empties, 7..12, >=13] instead of the fixed 0.25 (engine D310); val rows follow it
+    pub result_weight: Option<[f32; 3]>,
     /// keep every checkpoint (ckpt_<step>.tnn) so a strength-vs-step curve can be gated afterwards
     pub keep_all: bool,
 }
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32, rw: Option<[f32; 3]>) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     let nb = net.buckets;
     let map_id = net.groups >> 8; // bucket map id (copied: the sampler closure must be 'static)
@@ -141,7 +143,7 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
             }
         }
         bk[0] = s.bucket as i32;
-        target[0] = target_train(r, proof_blend).target;
+        target[0] = target_train_rw(r, proof_blend, rw).target;
         wt[0] = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
     });
 
@@ -232,7 +234,7 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         }
         println!("[holdout] DIAGNOSTIC RUN: D4 orientation {k} is never trained, it is validated separately");
     }
-    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend);
+    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend, c.result_weight);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -248,7 +250,11 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         }
     }
     let mut valf = Tdat::open(&c.val)?;
-    let val = trainer::load_val(&mut valf, c.val_rows)?;
+    let mut val = trainer::load_val(&mut valf, c.val_rows)?;
+    if let Some(rw) = c.result_weight {
+        val = val.into_iter().map(|r| rw_val_row(r, rw)).collect();
+        println!("[result-weight] {rw:?} by empties (<=6, 7..12, >=13): val MSE is measured on this run's own target");
+    }
     let sb = c.eval_every.max(1);
     let total_sb = (c.steps + sb - 1) / sb;
     let steps = TrainingSteps { batch_size: c.bs, batches_per_superbatch: sb, start_superbatch: start_sb, end_superbatch: total_sb };
@@ -385,7 +391,7 @@ fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -
     use bullet_trainer::model::ModelEvaluator;
     use bullet_trainer::run::{HostPool, Step};
     let net = load_init(init)?;
-    let (mapper, defn) = build(&net, false, None, 0.0, 1.0);
+    let (mapper, defn) = build(&net, false, None, 0.0, 1.0, None);
     let mut w = ModelWeights::new(&defn, 1);
     load_into(&mut w, &net);
     let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;

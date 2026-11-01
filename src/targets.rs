@@ -46,6 +46,30 @@ pub fn target_train(r: &Rec, proof_blend: f32) -> Target {
     t
 }
 
+/// Game-result weight by phase (engine D310, RESEARCH_2026_11_01 sec. 2): `w = [<=6 empties, 7..12, >=13]` replaces the fixed
+/// 0.25 on non-proven rows, target = (1-w)*sigmoid(cp) + w*outcome. Training only; validation keeps `target_of`.
+pub fn target_train_rw(r: &Rec, proof_blend: f32, rw: Option<[f32; 3]>) -> Target {
+    let t = target_train(r, proof_blend);
+    match rw {
+        Some(w) if t.proven < 0 => {
+            let empties = 49 - (r.occ0 | r.occ1).count_ones();
+            let w = if empties <= 6 { w[0] } else if empties <= 12 { w[1] } else { w[2] };
+            Target { target: (1.0 - w) * sigmoid_cp(r.cp) + w * r.outcome, proven: -1 }
+        }
+        _ => t,
+    }
+}
+
+/// Val rows for a `--result-weight-phase` run: rewrites `outcome` so that `target_of` (0.75*sig + 0.25*outcome) equals the
+/// run's training target; guard / plateau / early stop then watch the loss the run actually trains on.
+pub fn rw_val_row(mut r: Rec, rw: [f32; 3]) -> Rec {
+    let t = target_train_rw(&r, 1.0, Some(rw));
+    if t.proven < 0 {
+        r.outcome = (t.target - 0.75 * sigmoid_cp(r.cp)) / 0.25;
+    }
+    r
+}
+
 #[cfg(test)]
 mod proof_blend_tests {
     use super::*;
@@ -76,6 +100,19 @@ mod proof_blend_tests {
         assert!((target_train(&proven_loss, 0.9).target - 0.05).abs() < 1e-6);
         let normal = rec(120.0, 120.0);
         assert_eq!(target_train(&normal, 0.9), target_of(&normal)); // non-proven rows untouched
+    }
+
+    #[test]
+    fn result_weight_by_phase() {
+        let mut open = rec(120.0, 120.0); // empty board: 49 empties -> w[2]
+        assert_eq!(target_train_rw(&open, 1.0, None), target_of(&open));
+        assert!((target_train_rw(&open, 1.0, Some([0.35, 0.04, 0.0])).target - sigmoid_cp(120.0)).abs() < 1e-6);
+        open.occ0 = (1u64 << 44) - 1; // 44 stones -> 5 empties -> w[0]
+        let t = target_train_rw(&open, 1.0, Some([0.35, 0.04, 0.0])).target;
+        assert!((t - (0.65 * sigmoid_cp(120.0) + 0.35)).abs() < 1e-6);
+        assert_eq!(target_train_rw(&rec(99_000.0, 0.0), 1.0, Some([0.35, 0.04, 0.0])).target, 1.0); // proofs untouched
+        let v = rw_val_row(open, [0.35, 0.04, 0.0]);
+        assert!((target_of(&v).target - t).abs() < 1e-6);
     }
 }
 

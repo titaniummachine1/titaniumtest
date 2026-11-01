@@ -203,11 +203,21 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
                 max_drops: g("--max-drops", 3),
                 proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
+                result_weight: match f("--result-weight-phase") {
+                    Some(v) => {
+                        let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
+                        Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values: <=6,7..12,>=13 empties")?)
+                    }
+                    None => None,
+                },
                 keep_all: crate::has_flag(args, "--keep-all"),
             });
         }
         #[cfg(not(feature = "gpu"))]
         return Err("this ti was built without --features cuda".into());
+    }
+    if f("--result-weight-phase").is_some() {
+        return Err("--result-weight-phase is only wired into --backend cuda".into());
     }
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
