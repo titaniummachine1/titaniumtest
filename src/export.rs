@@ -118,7 +118,7 @@ pub fn refit_dis(net: &mut TrainableNet, train: &mut Tdat, rows: usize, l2: f64)
 /// Texel-style output calibration: per phase bucket fit `y' = s*y + c` so that `sigmoid(y')` best matches the training
 /// target (squared error in probability space), then fold it EXACTLY into out_w / out_b / psqt (y is linear in those).
 /// No trunk change, no games. The dis head must be refit afterwards (it predicts |400 y - cp5k|).
-pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize) -> Result<(), String> {
+pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize, rw: Option<[f32; 3]>) -> Result<(), String> {
     let nb = net.buckets;
     let out_in = net.out_in();
     let nblk = (train.rows / BLOCK).max(1);
@@ -130,7 +130,7 @@ pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize) -> Resul
         train.read_block((i * nblk / blocks) * BLOCK, BLOCK, &mut buf)?;
         for r in &buf {
             let f = net.forward_full(&mapper::board_of(r, 0));
-            per[f.bucket].push((f.y as f64, crate::targets::target_of(r).target as f64));
+            per[f.bucket].push((f.y as f64, crate::targets::target_train_rw(r, 1.0, rw).target as f64));
         }
     }
     let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
@@ -205,9 +205,21 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
         }
     };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // a `--result-weight-phase` run recorded val on its own target and calibrates to it (engine D310)
+    let rw: Option<[f32; 3]> = match f("--result-weight-phase") {
+        Some(v) => {
+            let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
+            Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values")?)
+        }
+        None => None,
+    };
     let val = {
         let mut vf = Tdat::open(&val_stem)?;
-        crate::trainer::load_val(&mut vf, val_rows)?
+        let v = crate::trainer::load_val(&mut vf, val_rows)?;
+        match rw {
+            Some(w) => v.into_iter().map(|r| crate::targets::rw_val_row(r, w)).collect(),
+            None => v,
+        }
     };
     let v_src = crate::trainer::evaluate(&net, &val, threads).mse;
     match &rec {
@@ -221,7 +233,7 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--calibrate") {
         let cr = crate::flag_u64(args, "--cal-rows").unwrap_or(400_000) as usize;
         println!("[export] Texel calibration of {net_path} on ~{cr} rows (per-bucket scale+shift of y, folded into out/psqt)");
-        calibrate(&mut net, &mut train, cr)?;
+        calibrate(&mut net, &mut train, cr, rw)?;
     }
     println!("[export] refitting disagreement head of {net_path} on ~{rows} rows, ridge l2 {l2}");
     refit_dis(&mut net, &mut train, rows, l2)?;
