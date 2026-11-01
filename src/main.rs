@@ -59,6 +59,7 @@ fn main() -> ExitCode {
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
+        "insight" => games::run_insight(&args[1..]),
         "harvest" => games::run_harvest(&args[1..]),
         "coordinator" => run_coordinator(&args[1..]),
         "worker" => run_worker(&args[1..]),
@@ -1072,6 +1073,14 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             ""
         }
     );
+    if let Some(p) = &out_path {
+        if let Ok(text) = fs::read_to_string(format!("{p}.games.jsonl")) {
+            let gs: Vec<games::Game> = text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| games::parse_game(l).ok()).collect();
+            if let Some(r) = games::insight(&gs) {
+                println!("{r}");
+            }
+        }
+    }
     ExitCode::SUCCESS
 }
 

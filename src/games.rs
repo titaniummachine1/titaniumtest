@@ -184,6 +184,173 @@ pub(crate) fn read_games(paths: &[String]) -> Result<Vec<Game>, String> {
     Ok(out)
 }
 
+// ---- `ti insight` and the end-of-gate report: what the engines' own per-move evals say about how the games went ----
+
+fn mean_z(xs: &[f64]) -> (f64, f64) {
+    let n = xs.len() as f64;
+    if xs.len() < 2 {
+        return (xs.first().copied().unwrap_or(0.0), 0.0);
+    }
+    let mu = xs.iter().sum::<f64>() / n;
+    let var = xs.iter().map(|x| (x - mu) * (x - mu)).sum::<f64>() / (n - 1.0);
+    (mu, if var > 0.0 { mu / (var / n).sqrt() } else { 0.0 })
+}
+
+/// Information-only report (NEVER part of a verdict, docs/GATE_RULE.md): per side speed and depth, value lost per move
+/// (mover's score + the opponent's next score, mates and |score| > 1500 skipped), the mid-game tilt of each game in the
+/// candidate's view (mean of both engines' scores over plies 10..end-10) and how well it agrees with the results.
+/// Needs >= 50 complete pairs with scored moves, else None.
+pub fn insight(games: &[Game]) -> Option<String> {
+    use std::collections::HashMap;
+    #[derive(Default)]
+    struct Side {
+        nodes: u64,
+        ms: u64,
+        depths: Vec<u32>,
+        moves: u64,
+        blunders: u64,
+        swing: f64,
+    }
+    let mut side: HashMap<&str, Side> = HashMap::new();
+    // per pair: (result points, tilt cp, candidate swing mean, baseline swing mean) per game
+    let mut pairs: HashMap<(u64, u64), Vec<(f64, f64, f64, f64)>> = HashMap::new();
+    for g in games {
+        let ok = |r: &Rec| r.mate.is_none() && r.score.map_or(false, |s| s.abs() <= 1500);
+        let scored: Vec<&Rec> = g.moves.iter().filter(|r| ok(r)).collect();
+        for r in &g.moves {
+            let e = side.entry(if r.mover == "candidate" { "candidate" } else { "baseline" }).or_default();
+            if let (Some(n), Some(ms)) = (r.nodes, r.ms) {
+                e.nodes += n;
+                e.ms += ms;
+            }
+            if let Some(d) = r.depth {
+                e.depths.push(d);
+            }
+        }
+        let mut sw = [(0.0f64, 0u32); 2]; // 0 = candidate, 1 = baseline
+        for w in scored.windows(2) {
+            // consecutive records only (a skipped unscored move breaks the chain)
+            if w[1].ply != w[0].ply + 1 {
+                continue;
+            }
+            let swing = (w[0].score.unwrap() + w[1].score.unwrap()) as f64;
+            let i = if w[0].mover == "candidate" { 0 } else { 1 };
+            sw[i].0 += swing;
+            sw[i].1 += 1;
+            let e = side.get_mut(if i == 0 { "candidate" } else { "baseline" }).unwrap();
+            e.moves += 1;
+            e.swing += swing;
+            if swing > 150.0 {
+                e.blunders += 1;
+            }
+        }
+        if scored.len() < 30 || sw[0].1 == 0 || sw[1].1 == 0 {
+            continue;
+        }
+        let cv: Vec<f64> = scored
+            .iter()
+            .map(|r| {
+                let s = r.score.unwrap() as f64;
+                if r.mover == "candidate" {
+                    s
+                } else {
+                    -s
+                }
+            })
+            .collect();
+        let (lo, hi) = (10usize, (cv.len() - 10).max(11));
+        let tilt = cv[lo..hi].iter().sum::<f64>() / (hi - lo) as f64;
+        pairs
+            .entry((g.pair, g.book))
+            .or_default()
+            .push((g.cand_points, tilt, sw[0].0 / sw[0].1 as f64, sw[1].0 / sw[1].1 as f64));
+    }
+    let full: Vec<&Vec<(f64, f64, f64, f64)>> = pairs.values().filter(|v| v.len() == 2).collect();
+    if full.len() < 50 {
+        return None;
+    }
+    let np = full.len() as f64;
+    let act: Vec<f64> = full.iter().map(|v| (v[0].0 + v[1].0) / 2.0).collect();
+    let tilt: Vec<f64> = full.iter().map(|v| (v[0].1 + v[1].1) / 2.0).collect();
+    let lost: Vec<f64> = full.iter().map(|v| (v[0].3 - v[0].2 + v[1].3 - v[1].2) / 2.0).collect();
+    let exp: f64 = full
+        .iter()
+        .map(|v| v.iter().map(|g| 1.0 / (1.0 + (-g.1 / 400.0).exp())).sum::<f64>() / 2.0)
+        .sum::<f64>()
+        / np;
+    let (mt, zt) = mean_z(&tilt);
+    let (ml, zl) = mean_z(&lost);
+    let mut agree = 0u32;
+    let mut decided = 0u32;
+    for (a, t) in act.iter().zip(&tilt) {
+        if *a != 0.5 && *t != 0.0 {
+            decided += 1;
+            if (a - 0.5) * t > 0.0 {
+                agree += 1;
+            }
+        }
+    }
+    let mut out = String::from("-- eval insight (info only, not in the verdict) --\n");
+    for name in ["candidate", "baseline"] {
+        if let Some(e) = side.get(name) {
+            let mut d = e.depths.clone();
+            d.sort_unstable();
+            out += &format!(
+                "  {name:<9} {:>6.0} knps | median depth {} | value lost per move {:+.1} cp | blunders (>150 cp) {:.1}% of {} moves\n",
+                e.nodes as f64 / e.ms.max(1) as f64,
+                d.get(d.len() / 2).copied().unwrap_or(0),
+                e.swing / e.moves.max(1) as f64,
+                100.0 * e.blunders as f64 / e.moves.max(1) as f64,
+                e.moves
+            );
+        }
+    }
+    out += &format!(
+        "  actual score {:.4} | eval-expected score {:.4} ({} pairs)\n  mid-game tilt toward the candidate {:+.1} cp, paired z {:+.2} ({})\n  value lost per move, baseline minus candidate {:+.2} cp, paired z {:+.2} (+ = the candidate loses less)\n  result and tilt agree in sign on {}/{} decided pairs ({:.0}%)",
+        act.iter().sum::<f64>() / np,
+        exp,
+        full.len(),
+        mt,
+        zt,
+        if zt > 1.96 {
+            "tilted to the CANDIDATE"
+        } else if zt < -1.96 {
+            "tilted to the BASELINE"
+        } else {
+            "no clear tilt"
+        },
+        ml,
+        zl,
+        agree,
+        decided,
+        100.0 * agree as f64 / decided.max(1) as f64
+    );
+    Some(out)
+}
+
+pub fn run_insight(args: &[String]) -> ExitCode {
+    let paths: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
+    if paths.is_empty() {
+        eprintln!("usage: ti insight <run.games.jsonl> [...]");
+        return ExitCode::FAILURE;
+    }
+    let mut games = Vec::new();
+    for p in &paths {
+        match fs::read_to_string(p) {
+            Ok(t) => games.extend(t.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| parse_game(l).ok())),
+            Err(e) => {
+                eprintln!("insight: {p}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match insight(&games) {
+        Some(r) => println!("{r}"),
+        None => println!("insight: fewer than 50 complete pairs with scored moves ({} games read)", games.len()),
+    }
+    ExitCode::SUCCESS
+}
+
 pub fn run_analyze(args: &[String]) -> ExitCode {
     let paths: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
     if paths.is_empty() {
