@@ -20,13 +20,14 @@ Bump the `rev` in `Cargo.toml` when the engine moves; record it in the commit me
 
 ## Layout
 
-    src/main.rs   subcommand dispatch (sprt, gate, log, merge-check, train, relabel, analyze, harvest, coordinator, worker)
+    src/main.rs   subcommand dispatch (sprt, regret, gate, log, merge-check, train, relabel, analyze, harvest, coordinator, worker)
     src/gate.rs   commit-vs-commit and net-vs-net gates, one record per run (docs/GATES.jsonl)
     src/sprt.rs   pentanomial SPRT, matches training/gate_summary.py
     src/games.rs  replay / explain / harvest of game logs
     src/book.rs   book checks (refuses the poisoned one-stone-start book)
     src/train.rs  NNUE trainer (TNN1/2/3 IO, CPU backend; CUDA backend + Modal runner in progress)
     src/hash.rs   dependency-free SHA-256, the project hash convention (first 8 hex digits, upper case)
+    docs/REGRET.md   `ti regret`: deep-reference regret of a shallow search on fixed positions
     docs/HUB_TRAINING_PLAN.md   the mandatory training work list (H0-H10) and acceptance criteria
 
 ## Status of training (read docs/HUB_TRAINING_PLAN.md)

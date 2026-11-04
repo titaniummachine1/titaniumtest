@@ -52,6 +52,8 @@ pub struct Fwd {
     pub h1: Vec<f32>,
     pub h2: Vec<f32>,
     pub bucket: usize,
+    /// Input of the first dense layer (pairwise accumulator product), width = din().
+    pub xin: Vec<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -259,7 +261,7 @@ impl TrainableNet {
         } else {
             row.iter().zip(&h2).map(|(a, b)| a * b).sum::<f32>()
         } + self.out_b[bucket];
-        Fwd { y: o + 0.5 * (ps[0] - ps[1]), h1, h2, bucket }
+        Fwd { y: o + 0.5 * (ps[0] - ps[1]), h1, h2, bucket, xin }
     }
 
     /// Forward + backward on a single position, accumulating gradients into `grad`.

@@ -10,6 +10,7 @@
 //!
 //!   ti spsa --exe titanium-cli.exe --net nnue_main.tnn --book book50k_std5k.txt --knobs knobs.txt --out run.log \
 //!           --nodes 5000,50000 --pairs 50 --iters 200 --threads 7 [--book0 60000] [--seed 1] [--resume]
+//!           [--warm-nodes 1000 --warm-iters 100]   (user 2026-11-02: first iterations at shallow, fast games, then the --nodes cycle)
 //!
 //! knobs.txt: one knob per line, `name lo hi c [a]` (c = perturbation size in knob units, a = step size, default c). `#` comments.
 use std::collections::HashMap;
@@ -132,6 +133,8 @@ fn run(args: &[String]) -> Result<(), String> {
         .split(',')
         .map(|x| x.trim().parse::<u64>().map_err(|_| format!("bad --nodes entry '{x}'")))
         .collect::<Result<_, _>>()?;
+    let warm_nodes: Option<u64> = flag(args, "--warm-nodes").and_then(|x| x.parse().ok());
+    let warm_iters: usize = if warm_nodes.is_some() { flag(args, "--warm-iters").and_then(|x| x.parse().ok()).unwrap_or(100) } else { 0 };
     if nodes.iter().any(|&n| n < 5000) {
         return Err("--nodes entries must be >= 5000 (user 2026-11-01: shallower tuning is wrong)".into());
     }
@@ -167,9 +170,10 @@ fn run(args: &[String]) -> Result<(), String> {
     if k0 == 0 {
         let _ = writeln!(
             log,
-            "# ti spsa | exe {exe} | net {net} | book {book} | knobs {knob_file} ({}) | nodes {:?} | pairs {pairs} | iters {iters} | seed {seed} | defaults {}",
+            "# ti spsa | exe {exe} | net {net} | book {book} | knobs {knob_file} ({}) | nodes {:?} | warm {:?} x {warm_iters} | pairs {pairs} | iters {iters} | seed {seed} | defaults {}",
             knobs.len(),
             nodes,
+            warm_nodes,
             tune_arg(&knobs, &theta)
         );
     }
@@ -183,7 +187,10 @@ fn run(args: &[String]) -> Result<(), String> {
         let clamp = |i: usize, v: f64| v.clamp(knobs[i].lo, knobs[i].hi).round();
         let plus: Vec<f64> = (0..knobs.len()).map(|i| clamp(i, theta[i] + ck[i] * delta[i])).collect();
         let minus: Vec<f64> = (0..knobs.len()).map(|i| clamp(i, theta[i] - ck[i] * delta[i])).collect();
-        let nd = nodes[k % nodes.len()];
+        let nd = match warm_nodes {
+            Some(w) if k < warm_iters => w,
+            _ => nodes[(k - warm_iters.min(k)) % nodes.len()],
+        };
         let cmd = |th: &[f64]| format!("{exe} serve --tune {} --network {net}", tune_arg(&knobs, th));
         let o = Command::new(&me)
             .args(["sprt", "--candidate", &cmd(&plus), "--baseline", &cmd(&minus)])

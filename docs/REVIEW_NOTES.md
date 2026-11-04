@@ -165,7 +165,7 @@ Plan (not run): stepwise chain (256->192->128->96->64), each step refit start + 
 Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Optuna-style search = bounded loop of capped `ti train modal launch` runs, only worth it for students.
 
 ## 2026-10-31 Ceiling gate result + champion upscale run (D237)
-- Gate: saturated 256 (grow256a best, v9 data, dis-head refit sha 6061F2EB) vs champion 7AE0122F, same exe FC2AE776, std5k book, 5k nodes: Elo -102.0 +- 39.9, LLR -3.00 (FAIL). Penta LL=71 LD=6 DD+WL=65 WD=5 WW=23. Lower val MSE (0.0178 vs 0.0182) did NOT give strength: v9 data/labels (Zataxx proofs etc.) move the net away from what wins games. Val MSE is not a strength metric.
+- [VOID per D242: the -102 gate used a corrupted local file (val 0.0206), not the run output (0.0178); val and games agree] Gate: saturated 256 (grow256a best, v9 data, dis-head refit sha 6061F2EB) vs champion 7AE0122F, same exe FC2AE776, std5k book, 5k nodes: Elo -102.0 +- 39.9, LLR -3.00 (FAIL). Penta LL=71 LD=6 DD+WL=65 WD=5 WW=23. Lower val MSE (0.0178 vs 0.0182) did NOT give strength: v9 data/labels (Zataxx proofs etc.) move the net away from what wins games. Val MSE is not a strength metric.
 - New: `ti train upscale` (Net2Net wider, step-0 parity measured: 256->512 delta val mse -3.1e-8) and `ti train ... --keep-all` (keeps every ckpt_<step>.tnn) to gate a strength-vs-step curve.
 - Run: upscaled champion (data/nnue/sat/champ_up512.tnn) trained on v9, every eval checkpoint kept; then gate checkpoints vs champion to find where Elo peaks (distillation target). The peak may be step 0.
 
@@ -176,7 +176,7 @@ Needs `ti train teach` + `--distill` (not built) and a user go for GPU runs. Opt
 - Checkpoint hunt: run up512a (champion Net2Net-upscaled to 512, v9, lr 3e-5) kept ckpt every 250 steps (249..3749); gating 249/999/1999/3749 vs 7AE0122F at 5k nodes (logs/gates/up512a_*.log).
 
 ## 2026-10-31 Plan to maximise Elo before distillation (D239) - status at time of writing
-- Finding: val MSE improved while games lost (256/v9 -102 +-40). Target is not aligned with Elo; games decide, not val.
+- [VOID per D242: the -102 gate used a corrupted local file (val 0.0206), not the run output (0.0178); val and games agree] Finding: val MSE improved while games lost (256/v9 -102 +-40). Target is not aligned with Elo; games decide, not val.
 - Provisional (5k nodes, vs 7AE0122F): champion Net2Net-upscaled to 512 with ZERO training = +101 +-89 (60 g, still running); ckpt 249 of up512a = +101 +-67 (110 g). Width alone ~ +100 at fixed nodes; trained checkpoints must beat the step-0 net, not just the champion. Two gates ran concurrently by mistake (pgrep absent in git bash): fixed-node results unaffected, only slower.
 - Running/launched: up512a ckpts 249/999/1999/3749 gate chain (logs/gates/up512a_*.out), step-0 control (ctrl_up512.out), Modal runs up512pb5 (proof-blend 0.5, done, ckpts on Volume runs/up512pb5) and up512pb0 (proof-blend 0, launched, runs/up512pb0). All: init champ_up512, v9, lr 3e-5, 2500 steps, --keep-all, eval-every 250.
 - Next (in order): gate pb5/pb0 ckpts; score/outcome lambda sweep (0.5/0.5, 0.9/0.1, 1.0/0); final straws = skip rows where 5k score and outcome disagree, low-LR fine-tune on cleanest rows, 512-teacher relabel of weak buckets; zero-init 1-ply-lookahead input columns only if all fail. Optuna-style search over per-datatype weights needs per-type weights in the trainer (not built) and a game-gate objective (~$3, hours); deferred pending go.
@@ -196,7 +196,7 @@ Width/speed curve (nps per width + 100 ms gates of refit-shrunk nets) must be me
 
 ## 2026-10-31 NULL TEST + mandatory evals (D240)
 - Null test: champion 7AE0122F with ONLY its disagreement head refit by `ti train export` on v9 (1,367 bytes changed, sha EDC7BEC6) vs the original, 5k nodes, 300 g: **+45.4 +- 41.6, LLR +0.93** (LL 32, LD 3, DD+WL 56, WD 12, WW 47). The dis head drives search pruning (search.rs:1103) and its refit alone is worth ~+45 at 5k nodes (not yet significant, needs extension + 100 ms).
-- Consequence: every candidate gated so far carried this refit. Re-read relative to the re-exported champion: 512 upscale untrained +72 -> width worth only ~+25; v9-trained 256 -102 -> v9 training costs ~-150. Earlier attributions (D237/D239) are corrected by this.
+- [VOID per D242: the -102 gate used a corrupted local file (val 0.0206), not the run output (0.0178); val and games agree] Consequence: every candidate gated so far carried this refit. Re-read relative to the re-exported champion: 512 upscale untrained +72 -> width worth only ~+25; v9-trained 256 -102 -> v9 training costs ~-150. Earlier attributions (D237/D239) are corrected by this.
 - Mandatory evals: engine branch exp/uai-info (worktree C:\gitProjects\info-ataxx, f211f71, exe 94751C57, bundled net 7AE0122F) prints `info depth D score cp|mate N nodes N time T nps N` before every bestmove (moves unchanged). `ti sprt` now refuses an engine that prints no info line (probe search at spawn). Games jsonl now carry score/depth/nodes per move. Old main exe FC2AE776 is refused from now on.
 
 ## 2026-10-31 Auxiliary-head lever sweep at 5k nodes (user order: "saturate the aux heads, count levers before downscaling")

@@ -325,7 +325,93 @@ pub fn insight(games: &[Game]) -> Option<String> {
         decided,
         100.0 * agree as f64 / decided.max(1) as f64
     );
+    out += &insight_phases(games);
     Some(out)
+}
+
+/// Where in the game the candidate gained (user 2026-11-02: "was the win in the endgame or across the board?"). Plies are
+/// bucketed 0-19 / 20-39 / 40-59 / 60-79 / 80+. Per bucket and per complete pair (both seats averaged): value lost per move of
+/// the baseline minus the candidate (+ = the candidate loses less), the cp that adds up to per game, and the candidate-view eval
+/// level (mean of both engines' scores, + = the candidate stands better), each with its paired z.
+fn insight_phases(games: &[Game]) -> String {
+    use std::collections::HashMap;
+    const EDGES: [usize; 6] = [0, 20, 40, 60, 80, 1000];
+    const NB: usize = 5;
+    let bucket = |ply: usize| (0..NB).find(|&i| ply < EDGES[i + 1]).unwrap_or(NB - 1);
+    // per game: per bucket (cand swing sum, cand n, base swing sum, base n, eval-level sum, eval n)
+    type G = [(f64, u32, f64, u32, f64, u32); NB];
+    let mut pairs: HashMap<(u64, u64), Vec<G>> = HashMap::new();
+    for g in games {
+        let ok = |r: &Rec| r.mate.is_none() && r.score.map_or(false, |s| s.abs() <= 1500);
+        let scored: Vec<&Rec> = g.moves.iter().filter(|r| ok(r)).collect();
+        if scored.len() < 30 {
+            continue;
+        }
+        let mut a: G = [(0.0, 0, 0.0, 0, 0.0, 0); NB];
+        for r in &scored {
+            let s = r.score.unwrap() as f64;
+            let e = &mut a[bucket(r.ply as usize)];
+            e.4 += if r.mover == "candidate" { s } else { -s };
+            e.5 += 1;
+        }
+        for w in scored.windows(2) {
+            if w[1].ply != w[0].ply + 1 {
+                continue;
+            }
+            let swing = (w[0].score.unwrap() + w[1].score.unwrap()) as f64;
+            let e = &mut a[bucket(w[0].ply as usize)];
+            if w[0].mover == "candidate" {
+                e.0 += swing;
+                e.1 += 1;
+            } else {
+                e.2 += swing;
+                e.3 += 1;
+            }
+        }
+        pairs.entry((g.pair, g.book)).or_default().push(a);
+    }
+    let full: Vec<&Vec<G>> = pairs.values().filter(|v| v.len() == 2).collect();
+    if full.len() < 50 {
+        return String::new();
+    }
+    let mut out = String::from("\n  by game phase (ply buckets; per-move diff = baseline minus candidate value lost, + = candidate better):\n");
+    for b in 0..NB {
+        let mut diff = Vec::new();
+        let mut saved = Vec::new();
+        let mut lvl = Vec::new();
+        for v in &full {
+            let (mut d, mut s, mut l, mut nd, mut nl) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for g in v.iter() {
+                let e = g[b];
+                if e.1 > 0 && e.3 > 0 {
+                    d += e.2 / e.3 as f64 - e.0 / e.1 as f64;
+                    // cp per game this bucket adds up to: per-move diff x the moves one side makes here
+                    s += (e.2 / e.3 as f64 - e.0 / e.1 as f64) * (e.1 + e.3) as f64 / 2.0;
+                    nd += 1.0;
+                }
+                if e.5 > 0 {
+                    l += e.4 / e.5 as f64;
+                    nl += 1.0;
+                }
+            }
+            if nd > 0.0 {
+                diff.push(d / nd);
+                saved.push(s / nd);
+            }
+            if nl > 0.0 {
+                lvl.push(l / nl);
+            }
+        }
+        let (md, zd) = mean_z(&diff);
+        let (ms, _) = mean_z(&saved);
+        let (ml, zl) = mean_z(&lvl);
+        let name = if b + 1 == NB { format!("{}+", EDGES[b]) } else { format!("{}-{}", EDGES[b], EDGES[b + 1] - 1) };
+        out += &format!(
+            "    ply {name:<6} value lost diff {md:+6.2} cp/move (z {zd:+5.2}) = {ms:+7.1} cp per game | eval level for the candidate {ml:+7.1} cp (z {zl:+5.2}) | {} pairs\n",
+            diff.len()
+        );
+    }
+    out.trim_end().to_string()
 }
 
 pub fn run_insight(args: &[String]) -> ExitCode {
