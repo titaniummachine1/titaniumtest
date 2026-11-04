@@ -105,22 +105,77 @@ fn busy_processes() -> Vec<String> {
 // ---------------------------------------------------------------- building a side
 
 #[derive(Clone, Debug)]
-struct Side {
-    label: String,
-    commit: String,
-    exe: PathBuf,
-    exe_sha: String,
-    net: String,
-    net_path: Option<PathBuf>,
-    version: String,
+pub struct Side {
+    pub label: String,
+    pub commit: String,
+    pub exe: PathBuf,
+    pub exe_sha: String,
+    pub net: String,
+    pub net_path: Option<PathBuf>,
+    pub version: String,
 }
 
 impl Side {
-    fn spec(&self) -> String {
+    pub fn spec(&self) -> String {
         match &self.net_path {
             Some(n) => format!("{} serve --network {}", fwd(&self.exe), fwd(n)),
             None => format!("{} serve", fwd(&self.exe)),
         }
+    }
+}
+
+/// Locate the titanium-ataxx engine repository root from any working directory.
+pub fn engine_root() -> Result<PathBuf, String> {
+    if let Ok(top) = git(Path::new("."), &["rev-parse", "--show-toplevel"]) {
+        let p = PathBuf::from(&top);
+        if p.join("crates/titanium").exists() {
+            return Ok(p);
+        }
+    }
+    for cand in ["C:/gitProjects/mainpromo-ataxx", "C:/gitProjects/titanium-ataxx"] {
+        let p = PathBuf::from(cand);
+        if p.join("crates/titanium").exists() {
+            return Ok(p);
+        }
+    }
+    Err("could not locate titanium-ataxx engine repository".into())
+}
+
+/// Locate the canonical balanced 4-corner opening book across all worktrees of the engine repo.
+pub fn default_book(root: &Path) -> PathBuf {
+    let mut roots = vec![root.to_path_buf()];
+    for l in git(root, &["worktree", "list", "--porcelain"]).unwrap_or_default().lines() {
+        if let Some(w) = l.strip_prefix("worktree ") {
+            roots.push(PathBuf::from(w));
+        }
+    }
+    for name in ["data/nnue/book50k_std5k.txt", "data/nnue/book50k_std.txt"] {
+        if let Some(p) = roots.iter().map(|r| r.join(name)).find(|p| p.exists()) {
+            return p;
+        }
+    }
+    root.join("data/nnue/book50k_std5k.txt")
+}
+
+/// Resolve the canonical `main` commit (comparing `main` and `origin/main` so a stale local ref is never used).
+pub fn resolve_main_commit(root: &Path) -> Result<String, String> {
+    let local_main = git(root, &["rev-parse", "--verify", "main^{commit}"]).ok();
+    let origin_main = git(root, &["rev-parse", "--verify", "origin/main^{commit}"]).ok();
+    match (local_main, origin_main) {
+        (Some(m), Some(om)) => {
+            if m == om {
+                Ok(m)
+            } else if Command::new("git").args(["merge-base", "--is-ancestor", &m, &om]).current_dir(root).status().map(|s| s.success()).unwrap_or(false) {
+                Ok(om)
+            } else if Command::new("git").args(["merge-base", "--is-ancestor", &om, &m]).current_dir(root).status().map(|s| s.success()).unwrap_or(false) {
+                Ok(m)
+            } else {
+                Err(format!("local `main` ({}) and `origin/main` ({}) have diverged! Reconcile `main` before running a gate.", &m[..8], &om[..8]))
+            }
+        }
+        (None, Some(om)) => Ok(om),
+        (Some(m), None) => Ok(m),
+        (None, None) => Err("neither `main` nor `origin/main` exists in git repo".into()),
     }
 }
 
@@ -132,41 +187,143 @@ fn parse_version(line: &str) -> Option<(String, String, String)> {
     Some((get("commit")?, get("dirty")?, get("net")?))
 }
 
-fn ensure_exe(root: &Path, gate_dir: &Path, refname: &str) -> Result<Side, String> {
-    let full = git(root, &["rev-parse", "--verify", &format!("{refname}^{{commit}}")])?;
+/// Parse `titanium-cli info` output (`adb3af4`+ defaults guard).
+/// Returns `(bundled_net_sha8, bundled_pol_sha8, bundled_small_sha8, active_is_bundled, policy_on, small_on, has_warning)`.
+fn parse_info_bundle(text: &str) -> Option<(String, String, String, bool, bool, bool, bool)> {
+    if !text.starts_with("titanium ") || !text.contains("bundled big net") {
+        return None;
+    }
+    let mut net = None;
+    let mut pol = None;
+    let mut small = None;
+    let mut active_bundled = false;
+    let mut pol_on = false;
+    let mut small_on = false;
+    for l in text.lines() {
+        let l = l.trim();
+        if let Some(r) = l.strip_prefix("bundled big net") {
+            net = r.split_whitespace().next().map(str::to_string);
+        } else if let Some(r) = l.strip_prefix("bundled policy") {
+            pol = r.split_whitespace().next().map(str::to_string);
+        } else if let Some(r) = l.strip_prefix("bundled small net") {
+            small = r.split_whitespace().next().map(str::to_string);
+        } else if let Some(r) = l.strip_prefix("active big net") {
+            active_bundled = r.trim() == "bundled";
+        } else if let Some(r) = l.strip_prefix("policy head") {
+            pol_on = r.trim().starts_with("ON");
+        } else if let Some(r) = l.strip_prefix("futility small net") {
+            small_on = r.trim().starts_with("ON");
+        }
+    }
+    Some((net?, pol?, small?, active_bundled, pol_on, small_on, text.contains("WARNING:")))
+}
+
+/// Find an existing clean worktree checked out at `full_commit`, if any.
+fn find_clean_worktree_at(root: &Path, full_commit: &str) -> Option<PathBuf> {
+    let list = git(root, &["worktree", "list", "--porcelain"]).ok()?;
+    let mut cur_wt: Option<PathBuf> = None;
+    let mut cur_head: Option<String> = None;
+    for line in list.lines().chain(std::iter::once("")) {
+        if let Some(w) = line.strip_prefix("worktree ") {
+            cur_wt = Some(PathBuf::from(w));
+            cur_head = None;
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            cur_head = Some(h.trim().to_string());
+        } else if line.is_empty() {
+            if let (Some(wt), Some(h)) = (cur_wt.take(), cur_head.take()) {
+                if h == full_commit && wt.exists() {
+                    if let Ok(st) = git(&wt, &["status", "--porcelain", "-uno"]) {
+                        if st.trim().is_empty() {
+                            return Some(wt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn ensure_exe(root: &Path, gate_dir: &Path, refname: &str) -> Result<Side, String> {
+    let is_main = refname == "main" || refname == "origin/main";
+    let full = if is_main {
+        resolve_main_commit(root)?
+    } else {
+        git(root, &["rev-parse", "--verify", &format!("{refname}^{{commit}}")])?
+    };
     let short = full[..8].to_string();
     let exes = gate_dir.join("exes");
     fs::create_dir_all(&exes).map_err(|e| e.to_string())?;
     let exe = exes.join(format!("titanium-{short}{}", if cfg!(windows) { ".exe" } else { "" }));
     if !exe.exists() {
-        let wt = gate_dir.join(format!("wt-{short}"));
-        if wt.exists() {
-            let _ = git(root, &["worktree", "remove", "--force", &fwd(&wt)]);
-        }
-        git(root, &["worktree", "add", "--detach", &fwd(&wt), &full])?;
-        let target = gate_dir.join("target");
-        println!("gate: building {refname} ({short}) from a clean checkout ...");
-        let built = sh("cargo", &["build", "--release", "-p", "titanium-cli"], Some(&wt), &[("CARGO_TARGET_DIR", &target)]);
-        let copied = built.and_then(|_| fs::copy(target.join("release").join(EXE), &exe).map(|_| ()).map_err(|e| e.to_string()));
-        let _ = git(root, &["worktree", "remove", "--force", &fwd(&wt)]);
-        copied?;
-    }
-    let ver = Command::new(&exe).arg("version").output().map_err(|e| e.to_string())?;
-    let line = String::from_utf8_lossy(&ver.stdout).trim().to_string();
-    let (version, net) = match parse_version(&line) {
-        Some((c, dirty, net)) => {
-            if c != short || dirty != "0" {
-                return Err(format!("{refname}: binary says commit={c} dirty={dirty}, expected commit={short} dirty=0 -> delete {} and retry", fwd(&exe)));
+        if let Some(clean_wt) = find_clean_worktree_at(root, &full) {
+            println!("gate: building {refname} ({short}) from clean worktree {} ...", fwd(&clean_wt));
+            sh("cargo", &["build", "--release", "-p", "titanium-cli"], Some(&clean_wt), &[])?;
+            fs::copy(clean_wt.join("target").join("release").join(EXE), &exe).map_err(|e| e.to_string())?;
+        } else {
+            let wt = gate_dir.join(format!("wt-{short}"));
+            if wt.exists() {
+                let _ = git(root, &["worktree", "remove", "--force", &fwd(&wt)]);
             }
-            (line.clone(), net)
+            git(root, &["worktree", "add", "--detach", &fwd(&wt), &full])?;
+            let target = gate_dir.join("target");
+            println!("gate: building {refname} ({short}) from a clean checkout ...");
+            let built = sh("cargo", &["build", "--release", "-p", "titanium-cli"], Some(&wt), &[("CARGO_TARGET_DIR", &target)]);
+            let copied = built.and_then(|_| fs::copy(target.join("release").join(EXE), &exe).map(|_| ()).map_err(|e| e.to_string()));
+            let _ = git(root, &["worktree", "remove", "--force", &fwd(&wt)]);
+            copied?;
         }
-        None => {
-            let blob = Command::new("git").args(["show", &format!("{full}:data/nnue/nnue_main.tnn")]).current_dir(root).output().ok();
-            let net = blob.filter(|o| o.status.success()).map(|o| hash::short_hex(&o.stdout)).unwrap_or_else(|| "unknown".to_string());
-            ("unsupported (build predates `version`)".to_string(), net)
+    }
+    let info_out = Command::new(&exe).arg("info").output().map_err(|e| e.to_string())?;
+    let info_text = String::from_utf8_lossy(&info_out.stdout).trim().to_string();
+    let (version, net) = if let Some((net_sha, pol_sha, sn_sha, active_bundled, pol_on, sn_on, has_warn)) = parse_info_bundle(&info_text) {
+        if is_main {
+            if !active_bundled || !pol_on || !sn_on || has_warn {
+                return Err(format!(
+                    "main champion ({short}) failed defaults guard in `titanium-cli info`:\n{info_text}"
+                ));
+            }
+            if let Ok(bundle_txt) = git(root, &["show", &format!("{full}:data/nnue/BUNDLE.txt")]) {
+                if let Some(pin_net) = bundle_txt.lines().find_map(|l| l.strip_prefix("net ")) {
+                    let expected_sha8 = pin_net.trim()[..8].to_uppercase();
+                    if net_sha != expected_sha8 {
+                        return Err(format!(
+                            "main binary net mismatch: binary has {net_sha}, BUNDLE.txt at {short} pins {expected_sha8} -> delete {} and retry",
+                            fwd(&exe)
+                        ));
+                    }
+                }
+            }
+        }
+        (
+            format!("commit={short} dirty=0 net={net_sha} policy={pol_sha} small={sn_sha}"),
+            net_sha,
+        )
+    } else {
+        let ver = Command::new(&exe).arg("version").output().map_err(|e| e.to_string())?;
+        let line = String::from_utf8_lossy(&ver.stdout).trim().to_string();
+        match parse_version(&line) {
+            Some((c, dirty, net)) => {
+                if c != short || dirty != "0" {
+                    return Err(format!("{refname}: binary says commit={c} dirty={dirty}, expected commit={short} dirty=0 -> delete {} and retry", fwd(&exe)));
+                }
+                (line.clone(), net)
+            }
+            None => {
+                let blob = Command::new("git").args(["show", &format!("{full}:data/nnue/nnue_main.tnn")]).current_dir(root).output().ok();
+                let net = blob.filter(|o| o.status.success()).map(|o| hash::short_hex(&o.stdout)).unwrap_or_else(|| "unknown".to_string());
+                ("unsupported (build predates `info`/`version`)".to_string(), net)
+            }
         }
     };
     Ok(Side { label: refname.to_string(), commit: short, exe_sha: hash::file_label(&fwd(&exe)), exe, net, net_path: None, version })
+}
+
+/// Resolve, build (if needed), and verify the canonical `main` champion binary.
+pub fn ensure_main_champion() -> Result<Side, String> {
+    let root = engine_root()?;
+    let gate_dir = root.parent().unwrap_or(&root).join("_gate");
+    ensure_exe(&root, &gate_dir, "main")
 }
 
 /// One timed run of the fixed signature workload through the side's net: nodes/s, None = unsupported.
@@ -348,7 +505,7 @@ pub fn run_gate(args: &[String]) -> ExitCode {
 }
 
 fn gate(args: &[String]) -> Result<ExitCode, String> {
-    let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    let root = engine_root()?;
     let gate_dir = root.parent().unwrap_or(&root).join("_gate");
     let net_mode = arg(args, "--net-test").is_some();
     let kind = arg(args, "--kind").ok_or("--kind is required (refs: search|eval|speed|rules|nonfunctional|tooling; nets: smaller|bigger|same|retrain)")?;
@@ -369,20 +526,7 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     // default book: the balanced 5k book, looked up in this worktree and every other worktree of the repo (data/ is git-ignored)
-    let book = arg(args, "--book").map(PathBuf::from).unwrap_or_else(|| {
-        let mut roots = vec![root.clone()];
-        for l in git(&root, &["worktree", "list", "--porcelain"]).unwrap_or_default().lines() {
-            if let Some(w) = l.strip_prefix("worktree ") {
-                roots.push(PathBuf::from(w));
-            }
-        }
-        for name in ["data/nnue/book50k_std5k.txt", "data/nnue/book50k_std.txt"] {
-            if let Some(p) = roots.iter().map(|r| r.join(name)).find(|p| p.exists()) {
-                return p;
-            }
-        }
-        root.join("data/nnue/book50k_std5k.txt")
-    });
+    let book = arg(args, "--book").map(PathBuf::from).unwrap_or_else(|| default_book(&root));
     if !book.exists() {
         return Err(format!("book not found: {}", fwd(&book)));
     }
@@ -508,8 +652,8 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
 // ---------------------------------------------------------------- ti log / ti merge-check
 
 pub fn run_log(args: &[String]) -> ExitCode {
-    let root = match git(Path::new("."), &["rev-parse", "--show-toplevel"]) {
-        Ok(r) => PathBuf::from(r),
+    let root = match engine_root() {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("log: {e}");
             return ExitCode::FAILURE;
@@ -540,7 +684,7 @@ pub fn run_merge_check(args: &[String]) -> ExitCode {
 }
 
 fn merge_check(args: &[String]) -> Result<String, String> {
-    let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    let root = engine_root()?;
     let recs = parse_recs(&fs::read_to_string(root.join(RECORDS)).unwrap_or_default());
     if let Some(net) = arg(args, "--net") {
         let new = hash::file_label(&net);
@@ -552,7 +696,11 @@ fn merge_check(args: &[String]) -> Result<String, String> {
     let refname = args.iter().find(|a| !a.starts_with("--") && Some(a.as_str()) != arg(args, "--base").as_deref()).ok_or("usage: ti merge-check REF [--base main] | --net FILE")?;
     let base = arg(args, "--base").unwrap_or_else(|| "main".into());
     let tc = git(&root, &["rev-parse", "--verify", &format!("{refname}^{{commit}}")])?[..8].to_string();
-    let bc = git(&root, &["rev-parse", "--verify", &format!("{base}^{{commit}}")])?[..8].to_string();
+    let bc = if base == "main" || base == "origin/main" {
+        resolve_main_commit(&root)?[..8].to_string()
+    } else {
+        git(&root, &["rev-parse", "--verify", &format!("{base}^{{commit}}")])?[..8].to_string()
+    };
     if nonfunctional {
         return nonfunctional_ready(&root, &recs, &tc, &bc);
     }
@@ -677,5 +825,19 @@ mod tests {
     fn signature_line_is_extracted() {
         let t = "x\npub const EXPECTED: u64 = 0xcc8d_cb4e_c15d_2077;\ny";
         assert_eq!(expected_line(t).unwrap(), "pub const EXPECTED: u64 = 0xcc8d_cb4e_c15d_2077;");
+    }
+
+    #[test]
+    fn info_bundle_parses() {
+        let sample = "titanium 0.1.0 | compiled with avx2 true avx512f false\n\
+                      bundled big net    46FCB5A4 (29067680 B)\n\
+                      bundled policy     AD686DBA (201288 B)\n\
+                      bundled small net  8F479ECB\n\
+                      active big net     bundled\n\
+                      policy head        ON weight 100000 min depth 1\n\
+                      futility small net ON\n\
+                      build knobs        FUT_CHEAP_M 350 FUT_SN_M 0 EVORD_W 0 EVORD_MIN_DEPTH 1 EVORD_CACHE 1\n";
+        let p = parse_info_bundle(sample).unwrap();
+        assert_eq!(p, ("46FCB5A4".into(), "AD686DBA".into(), "8F479ECB".into(), true, true, true, false));
     }
 }

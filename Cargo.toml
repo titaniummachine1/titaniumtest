@@ -10,12 +10,13 @@ name = "ti"
 path = "src/main.rs"
 
 [dependencies]
-# Published engine, pinned (origin/main 20c7acc). For local engine work add a gitignored .cargo/config.toml with
+# Published engine, pinned (origin/main 2c40ae5). For local engine work add a gitignored .cargo/config.toml with
 #   [patch."https://github.com/titaniummachine1/titanium-ataxx"]
-#   titanium = { path = "C:/gitProjects/titanium-ataxx/crates/titanium" }
-titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "20c7accb" }
+#   titanium = { path = "C:/gitProjects/mainpromo-ataxx/crates/titanium" }
+titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "2c40ae56" }
 
 flate2 = "1.1"
+serde_json = "1"
 # GPU backend (bullet, pinned). `--features gpu` type-checks anywhere; `--features cuda` needs the CUDA toolkit (Modal image).
 bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }
 bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }

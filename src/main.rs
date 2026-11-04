@@ -74,22 +74,25 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "titaniumtest — Fishtest/Fishnet/Bullet-style SPRT, Relabeling & NNUE Trainer for Titanium Ataxx\n\
+        "titaniumtest — Fishtest/Fishnet/Bullet-style SPRT, Gate & Trainer Hub for Titanium Ataxx\n\
          \n\
          SUBCOMMANDS:\n\
-         \x20 sprt         Run a multi-threaded Pentanomial SPRT gate locally\n\
-         \x20 relabel      Zero-overhead persistent multi-threaded local relabeler (reads .bin once!)\n\
-         \x20 train        Bullet-style native Rust sparse-feature NNUE trainer (+ optional --auto-sprt)\n\
+         \x20 gate         Build clean commits into _gate/exes/ and run a recorded SPRT against main\n\
+         \x20 sprt         Run a multi-threaded Pentanomial SPRT gate (--baseline defaults to verified `main`!)\n\
+         \x20 log          Show recorded gate history from docs/GATES.jsonl\n\
+         \x20 merge-check  Verify that a commit or net has a passing gate record against current main\n\
+         \x20 insight      Per-move evaluation & phase breakdown on <log>.games.jsonl\n\
+         \x20 analyze      Turning-point & blunder analysis on <log>.games.jsonl\n\
+         \x20 spsa         Multi-threaded SPSA search tuner\n\
+         \x20 relabel      Zero-overhead persistent multi-threaded local relabeler\n\
+         \x20 train        Bullet-style native Rust sparse-feature NNUE trainer\n\
          \x20 coordinator  Start the HTTP job coordinator + live web dashboard (:8080)\n\
          \x20 worker       Connect to a coordinator and execute SPRT / relabel jobs\n\
          \n\
          EXAMPLES:\n\
-         \x20 titaniumtest sprt --candidate self --baseline \"./old_titanium serve --network bundled\" \\\n\
-         \x20                   --book data/nnue/book100.txt --time-ms 100 --elo0 0 --elo1 10 --hyperthread\n\
-         \x20 titaniumtest relabel --bin dis_positions.bin --out out_dir --nodes 5000 --hyperthread\n\
-         \x20 titaniumtest train --init bundled --bin dis_positions.bin --labels-dir out_dir --out cand.tnn --auto-sprt\n\
-         \x20 titaniumtest coordinator --bind 0.0.0.0:8080 --relabel-bin dis_positions.bin --relabel-out out_dir\n\
-         \x20 titaniumtest worker --server http://127.0.0.1:8080 --hyperthread"
+         \x20 ti gate --test HEAD --kind search --time-ms 100\n\
+         \x20 ti sprt --candidate \"./target/release/titanium-cli.exe serve\" --time-ms 100\n\
+         \x20         (automatically resolves, builds & verifies `origin/main` champion as baseline!)"
     );
 }
 
@@ -822,14 +825,81 @@ fn play_single_game(
 // 1. Multi-Threaded Local SPRT Gate Command
 // ============================================================================
 
+fn normalize_engine_spec(spec: &str) -> String {
+    let trimmed = spec.trim();
+    if trimmed == "self"
+        || trimmed == "main"
+        || trimmed == "origin/main"
+        || trimmed.starts_with("tnn:")
+        || (trimmed.ends_with(".tnn") && !trimmed.contains(char::is_whitespace))
+    {
+        return trimmed.to_string();
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if let Some(&exe) = parts.first() {
+        let exe_lower = exe.to_ascii_lowercase();
+        let is_titanium_bin = exe_lower.contains("titanium");
+        let missing_serve = match parts.get(1) {
+            None => true,
+            Some(second) => second.starts_with('-'),
+        };
+        if is_titanium_bin && missing_serve {
+            let mut out = format!("{exe} serve");
+            for arg in &parts[1..] {
+                out.push(' ');
+                out.push_str(arg);
+            }
+            return out;
+        }
+    }
+    trimmed.to_string()
+}
+
 fn run_sprt_cli(args: &[String]) -> ExitCode {
-    let cand_spec = flag_str(args, "--candidate").unwrap_or_else(|| "self".to_string());
-    let Some(base_spec) = flag_str(args, "--baseline") else {
-        eprintln!("sprt: --baseline <CMD|self> is required");
-        return ExitCode::FAILURE;
+    let cand_spec = normalize_engine_spec(&flag_str(args, "--candidate").unwrap_or_else(|| "self".to_string()));
+    let raw_base_spec = normalize_engine_spec(&flag_str(args, "--baseline").unwrap_or_else(|| "main".to_string()));
+    let non_main_ab = has_flag(args, "--non-main-ab");
+    let main_side = match gate::ensure_main_champion() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sprt: failed to verify/build `main` champion: {e}");
+            return ExitCode::FAILURE;
+        }
     };
-    let book_path = flag_str(args, "--book");
-    let time_ms = flag_u64(args, "--time-ms");
+    let base_spec = if raw_base_spec == "main" || raw_base_spec == "origin/main" {
+        println!(
+            "sprt: auto-resolved --baseline main -> {} (commit {}, bundled net {}, [{}])",
+            main_side.spec(),
+            main_side.commit,
+            main_side.net,
+            main_side.exe_sha
+        );
+        main_side.spec()
+    } else {
+        let base_lbl = engine_label(&raw_base_spec);
+        let expected_lbl = format!("exe {}", main_side.exe_sha);
+        let is_exact_main = base_lbl == expected_lbl && raw_base_spec.trim() == main_side.spec().trim();
+        if !is_exact_main && !non_main_ab {
+            eprintln!(
+                "sprt: REFUSED — --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
+                 \x20     Canonical `main` is commit {} (bundled net {}, [{}]): `{}`\n\
+                 \x20     Promotion gates MUST run against `main`: omit `--baseline` or pass `--baseline main`.\n\
+                 \x20     For an internal A/B test between two experimental builds, pass `--non-main-ab` explicitly (and NEVER call its result 'vs main').",
+                main_side.commit,
+                main_side.net,
+                expected_lbl,
+                main_side.spec()
+            );
+            return ExitCode::FAILURE;
+        }
+        raw_base_spec
+    };
+    let book_path = flag_str(args, "--book").or_else(|| {
+        gate::engine_root()
+            .ok()
+            .map(|r| gate::default_book(&r).to_string_lossy().replace('\\', "/"))
+    });
+    let time_ms = flag_u64(args, "--time-ms").or_else(|| flag_u64(args, "--ms"));
     let nodes = flag_u64(args, "--nodes");
     let time_ms = if time_ms.is_none() && nodes.is_none() {
         Some(100)
@@ -842,9 +912,11 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let base_reset_every_move = has_flag(args, "--base-reset-every-move");
     let elo0 = flag_f64(args, "--elo0").unwrap_or(0.0);
     let elo1 = flag_f64(args, "--elo1").unwrap_or(20.0);
-    let max_games = flag_u64(args, "--max-games").unwrap_or(200) as usize;
+    let max_games = flag_u64(args, "--max-games")
+        .or_else(|| flag_u64(args, "--games"))
+        .unwrap_or(200) as usize;
     let threads = resolve_threads(args);
-    let out_path = flag_str(args, "--out");
+    let out_path = flag_str(args, "--out").or_else(|| flag_str(args, "--log"));
 
     // A gate never runs without a checked book (no silent single start position).
     let Some(book_path) = book_path else {
@@ -885,12 +957,15 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             }
         }
     }
+    let non_main_note = if non_main_ab { " | NON-MAIN-AB (not a promotion gate vs main)" } else { " | VS_MAIN_CHAMPION" };
     let header = format!(
-        "# ti sprt | candidate {} [{}] | baseline {} [{}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}{prov_note}",
+        "# ti sprt | candidate {} [{}] | baseline {} [{} commit={} net={}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}{prov_note}{non_main_note}",
         cand_spec,
         engine_label(&cand_spec),
         base_spec,
         engine_label(&base_spec),
+        if non_main_ab { "custom" } else { &main_side.commit },
+        if non_main_ab { "custom" } else { &main_side.net },
         book_path,
         hash::file_label(&book_path),
         book0,
