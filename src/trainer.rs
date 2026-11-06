@@ -216,9 +216,14 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         #[cfg(not(feature = "gpu"))]
         return Err("this ti was built without --features cuda".into());
     }
-    if f("--result-weight-phase").is_some() {
-        return Err("--result-weight-phase is only wired into --backend cuda".into());
-    }
+    // engine D427: the champion recipe (rwphase9 0.55/0.55/0.25) now also trains on the CPU backend
+    let result_weight: Option<[f32; 3]> = match f("--result-weight-phase") {
+        Some(v) => {
+            let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
+            Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values: <=6,7..12,>=13 empties")?)
+        }
+        None => None,
+    };
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
     let out = f("--out").ok_or("--out <dir> required")?;
@@ -296,7 +301,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                     s.spawn(move || {
                         let (mut l, mut wsum) = (0f64, 0f64);
                         for (r, &m) in rs.iter().zip(ms) {
-                            let t = target_of(r);
+                            let t = targets::target_train_rw(r, 1.0, result_weight);
                             let w = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
                             if w == 0.0 {
                                 continue;
