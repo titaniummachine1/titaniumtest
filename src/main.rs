@@ -33,6 +33,7 @@ mod train;
 use sprt::{SprtTally, SprtVerdict};
 mod hash;
 mod prov;
+mod repro;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -957,6 +958,33 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             }
         }
     }
+    // reproducibility guard (engine D416): explicit model files, gate-built candidate exe, every file argument hashed
+    let engine_root = gate::engine_root().ok();
+    for s in [&cand_spec, &base_spec] {
+        if let Err(e) = repro::check_explicit_models(s) {
+            eprintln!("sprt: REFUSED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let cand_exe = repro::first_token(&cand_spec).to_string();
+    let raw_exe = cand_spec != "self" && !cand_spec.starts_with("tnn:") && !cand_spec.ends_with(".tnn") && !repro::is_gate_built(&cand_exe);
+    let mut repro_note = String::new();
+    if raw_exe && !non_main_ab {
+        if has_flag(args, "--dev-raw-exe") {
+            repro_note.push_str(" | DEV_RAW_EXE (NOT reproducible, NOT a result)");
+        } else {
+            eprintln!(
+                "sprt: REFUSED: candidate `{cand_exe}` is a raw build, not a commit.\n\
+                 \x20     A gate vs main must be reproducible: commit + push the branch, then run\n\
+                 \x20       ti gate --kind eval --test <branch-or-sha> --test-args \"--tstg <model.ttst>\" --nodes 5000\n\
+                 \x20     (`ti gate` builds the exact commit in a clean worktree). For a throwaway smoke test pass --dev-raw-exe."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    repro_note.push_str(&format!(" | cand_files{} | base_files{}",
+        repro::file_args_label(&cand_spec, engine_root.as_deref()), repro::file_args_label(&base_spec, engine_root.as_deref())));
+    let prov_note = format!("{prov_note}{repro_note}");
     let non_main_note = if non_main_ab { " | NON-MAIN-AB (not a promotion gate vs main)" } else { " | VS_MAIN_CHAMPION" };
     let header = format!(
         "# ti sprt | candidate {} [{}] | baseline {} [{} commit={} net={}] | book {} [{}] @{} | rules {} | nodes {:?} cand_ms {:?} base_ms {:?} | elo0 {} elo1 {} | hub {}{prov_note}{non_main_note}",
@@ -985,6 +1013,8 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
         }
         let _ = fs::write(p, format!("{header}\n"));
     }
+    let run_log_name = out_path.clone().unwrap_or_else(|| "(no --out)".to_string());
+    repro::log_run(engine_root.as_deref(), "START", &run_log_name, &header);
 
     let max_pairs = (max_games + 1) / 2;
     println!(
@@ -1118,6 +1148,15 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
 
     let final_tally = tally.lock().unwrap();
     let st = final_tally.compute(elo0, elo1, 0.05, 0.05);
+    repro::log_run(
+        engine_root.as_deref(),
+        "DONE",
+        &run_log_name,
+        &format!(
+            "+{} -{} ={} ({} g) Elo {:+.1} +- {:.1} LOS {:.1}% LLR {:+.2} {:?}",
+            final_tally.wins, final_tally.losses, final_tally.draws, st.games, st.elo, st.elo_ci95, st.los * 100.0, st.llr, st.verdict
+        ),
+    );
     println!(
         "\n=== Final SPRT Summary ({:.1}s) ===\n\
          Games : {} (+{} -{} ={}, {:.1}%)\n\

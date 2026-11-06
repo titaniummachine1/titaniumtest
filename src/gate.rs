@@ -561,11 +561,14 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         if t.commit == b.commit {
             return Err("test and base are the same commit".into());
         }
+        // D416 (user: "local git is fine but it needs a way to track what was gated against what"): the test side is always
+        // a commit (ensure_exe); after the run a local annotated tag gate/<run_id> on it records base, limit, args, log.
         ("ref", t, b)
     };
 
     // ---- run the paired SPRT through the existing `ti sprt` path
-    let run_id = format!("{}-{}-vs-{}-{}", &iso_utc(now_secs())[..10], test.commit, base.commit, limit.replace(':', ""));
+    let args_tag = arg(args, "--test-args").map(|a| format!("-a{}", hash::short_hex(a.as_bytes()))).unwrap_or_default();
+    let run_id = format!("{}-{}{args_tag}-vs-{}-{}", &iso_utc(now_secs())[..10], test.commit, base.commit, limit.replace(':', ""));
     let out_dir = root.join("logs").join("gates").join(&run_id);
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let log = out_dir.join("sprt.log");
@@ -573,8 +576,14 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         return Err(format!("{} already exists: this exact gate was already run today", fwd(&log)));
     }
     let elo1 = arg(args, "--elo1").unwrap_or_else(|| "20".into());
+    // --test-args "..." = extra engine flags for the test side only (e.g. "--tstg C:/.../tstg_<sha8>.ttst"); the files in it
+    // are hashed into the sprt header by repro.rs
+    let test_spec = match arg(args, "--test-args") {
+        Some(extra) => format!("{} {extra}", test.spec()),
+        None => test.spec(),
+    };
     let mut sprt: Vec<String> = vec![
-        "--candidate".into(), test.spec(), "--baseline".into(), base.spec(),
+        "--candidate".into(), test_spec, "--baseline".into(), base.spec(),
         "--book".into(), fwd(&book),
         "--max-games".into(), arg(args, "--max-games").unwrap_or_else(|| "600".into()),
         "--elo0".into(), "0".into(), "--elo1".into(), elo1.clone(),
@@ -641,7 +650,26 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
     if !old.is_empty() && !old.ends_with('\n') {
         old.push('\n');
     }
+    // D416: test-side engine args and the hash of every file they name (e.g. the .ttst model), so the record alone replays the run
+    let test_args = arg(args, "--test-args").unwrap_or_default();
+    let test_files = crate::repro::file_args_label(&format!("x {test_args}"), Some(&root));
+    let rec = format!(
+        "{},\"test_args\":{},\"test_files\":{}}}",
+        rec.trim_end_matches('}'),
+        crate::json_str(&test_args),
+        crate::json_str(test_files.trim())
+    );
     fs::write(&rec_path, format!("{old}{rec}\n")).map_err(|e| e.to_string())?;
+    // local annotated tag on the tested commit: `git tag -l "gate/*" -n9` lists what was gated against what
+    let tag = format!("gate/{run_id}");
+    let msg = format!(
+        "{verdict} {} g +{} -{} ={} Elo {:+.1} +- {:.1}\ntest {} [{}] args `{test_args}`{test_files}\nbase {} [{}] net {}\nlimit {limit} book {}\nlog logs/gates/{run_id}/sprt.log",
+        st.games, tally.wins, tally.losses, tally.draws, st.elo, st.elo_ci95, test.label, test.commit, base.label, base.commit, base.net, hash::file_label(&fwd(&book))
+    );
+    match git(&root, &["tag", "-a", &tag, &test.commit, "-m", &msg]) {
+        Ok(_) => println!("  tagged {tag} on {}", test.commit),
+        Err(e) => eprintln!("gate: WARNING could not create tag {tag}: {e}"),
+    }
     println!(
         "\nGATE RESULT {verdict}: {} games {}-{}-{}, Elo {:+.1} +- {:.1}, LLR {:+.2} [{:.2}, {:.2}], seat split {:.0}%, identical play in {}/{} pairs  -> recorded in {RECORDS}\n  SPEED test vs base: played games {} ({} vs {} nps) [trust this], fixed workload {} ({} vs {} nps) [noisy]",
         st.games, tally.wins, tally.losses, tally.draws, st.elo, st.elo_ci95, st.llr, st.lower_bound, st.upper_bound, 100.0 * st.seat_split, identical, n_pairs, pct(game_nps(&games, "candidate"), game_nps(&games, "baseline")), game_nps(&games, "candidate"), game_nps(&games, "baseline"), pct(bench_t, bench_b), bench_t, bench_b
