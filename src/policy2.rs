@@ -192,6 +192,52 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
     }
 }
 
+/// D528: decode one Kata tdata npz into compact samples (+ their visit entries). Returns (stage0, stage1) counts.
+fn load_kata_file(path: &str, out: &mut Vec<S>, kpool: &mut Vec<(u8, u16)>, val: bool, bb: &mut Vec<u8>, pb: &mut Vec<u8>) -> Option<(usize, usize)> {
+    let z = crate::data::Npz::open(path).ok()?;
+    let (Ok(mut cb), Ok(mut cp)) = (z.col("binaryInputNCHWPacked"), z.col("policyTargetsNCMove")) else { return None };
+    if cb.width * cb.elem != 154 || cp.width * cp.elem != 200 {
+        return None;
+    }
+    let n = cb.rows;
+    if cb.read(n, bb).is_err() || cp.read(n, pb).is_err() {
+        return None;
+    }
+    let (mut n0, mut n1) = (0usize, 0usize);
+    for r in 0..n {
+        let row = &bb[r * 154..(r + 1) * 154];
+        let plane = |c: usize| -> u64 {
+            let mut x = 0u64;
+            for i in 0..49 {
+                if row[c * 7 + i / 8] >> (7 - i % 8) & 1 == 1 {
+                    x |= 1u64 << i;
+                }
+            }
+            x
+        };
+        let (own, opp, sel) = (plane(1), plane(2), plane(4));
+        let ko = kpool.len() as u32;
+        for i in 0..49 {
+            let v = i16::from_le_bytes([pb[r * 200 + 2 * i], pb[r * 200 + 2 * i + 1]]);
+            if v > 0 {
+                kpool.push((i as u8, v as u16));
+            }
+        }
+        let kn = kpool.len() as u32 - ko;
+        if kn == 0 {
+            continue;
+        }
+        let st1 = sel != 0;
+        out.push(S { own, opp, from: 0, to: 0, kind: if st1 { 2 } else { 1 }, sel: if st1 { sel.trailing_zeros() as u8 } else { 255 }, kn: kn as u8, val, ko });
+        if st1 {
+            n1 += 1;
+        } else {
+            n0 += 1;
+        }
+    }
+    Some((n0, n1))
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(net_path) = arg(args, "--net") else {
         eprintln!("usage: ti policy2 --net NET.tnn --games a.jsonl[,..] [--kata DIR[,DIR]] --pat k3c|k3 [--init POL.bin] --out-bin OUT.bin [--max-epochs 30] [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 1] [--max-samples N]");
@@ -211,7 +257,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let games_w: f32 = arg(args, "--games-w").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let patience: usize = arg(args, "--patience").and_then(|v| v.parse().ok()).unwrap_or(1);
     let max_samples: usize = arg(args, "--max-samples").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    let threads: usize = arg(args, "--threads").and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
+    // D528: default 6 of the 8 hardware threads (the PC stays usable); Kata TRAIN files are streamed, never all in RAM
+    let threads: usize = arg(args, "--threads").and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
+    let kata_val_max: usize = arg(args, "--kata-val-max").and_then(|v| v.parse().ok()).unwrap_or(400_000);
     let ring = ring1();
 
     let mut ss: Vec<S> = Vec::new();
@@ -255,72 +303,33 @@ pub fn run(args: &[String]) -> ExitCode {
     kf.sort();
     let (mut bb, mut pb) = (Vec::new(), Vec::new());
     let (mut nk0, mut nk1, mut bad) = (0usize, 0usize, 0usize);
+    let mut train_files: Vec<String> = Vec::new();
     for (fi, fp) in kf.iter().enumerate() {
-        if ss.len() >= max_samples {
-            break;
-        }
-        let val = fi % 10 == 0;
         let path = fp.to_string_lossy().to_string();
-        let z = match crate::data::Npz::open(&path) {
-            Ok(z) => z,
-            Err(e) => {
-                eprintln!("{path}: {e}");
-                bad += 1;
-                continue;
-            }
-        };
-        let (Ok(mut cb), Ok(mut cp)) = (z.col("binaryInputNCHWPacked"), z.col("policyTargetsNCMove")) else {
-            bad += 1;
-            continue;
-        };
-        if cb.width * cb.elem != 154 || cp.width * cp.elem != 200 {
-            bad += 1;
+        if fi % 10 != 0 {
+            train_files.push(path);
             continue;
         }
-        let n = cb.rows;
-        if cb.read(n, &mut bb).is_err() || cp.read(n, &mut pb).is_err() {
-            bad += 1;
+        if nk0 + nk1 >= kata_val_max {
             continue;
         }
-        for r in 0..n {
-            let row = &bb[r * 154..(r + 1) * 154];
-            let plane = |c: usize| -> u64 {
-                let mut x = 0u64;
-                for i in 0..49 {
-                    if row[c * 7 + i / 8] >> (7 - i % 8) & 1 == 1 {
-                        x |= 1u64 << i;
-                    }
-                }
-                x
-            };
-            let (own, opp, sel) = (plane(1), plane(2), plane(4));
-            let ko = kpool.len() as u32;
-            for i in 0..49 {
-                let v = i16::from_le_bytes([pb[r * 200 + 2 * i], pb[r * 200 + 2 * i + 1]]);
-                if v > 0 {
-                    kpool.push((i as u8, v as u16));
-                }
+        match load_kata_file(&path, &mut ss, &mut kpool, true, &mut bb, &mut pb) {
+            Some((a, b)) => {
+                nk0 += a;
+                nk1 += b;
             }
-            let kn = kpool.len() as u32 - ko;
-            if kn == 0 {
-                continue;
-            }
-            let st1 = sel != 0;
-            ss.push(S { own, opp, from: 0, to: 0, kind: if st1 { 2 } else { 1 }, sel: if st1 { sel.trailing_zeros() as u8 } else { 255 }, kn: kn as u8, val, ko });
-            if st1 {
-                nk1 += 1;
-            } else {
-                nk0 += 1;
-            }
-        }
-        if fi % 50 == 49 {
-            eprintln!("kata: {}/{} files, {} rows", fi + 1, kf.len(), nk0 + nk1);
+            None => bad += 1,
         }
     }
+    if max_samples < usize::MAX {
+        // smoke tests: keep only as many train files as needed for ~max_samples rows (50k rows per file)
+        train_files.truncate(max_samples.div_ceil(50_000).max(1));
+    }
+    println!("kata: {} files: {} train files STREAMED per epoch, val {} rows (stage0 {} stage1 {}) from every 10th file (cap {}), {} bad", kf.len(), train_files.len(), nk0 + nk1, nk0, nk1, kata_val_max, bad);
     let nval = ss.iter().filter(|s| s.val).count();
     println!(
-        "samples {} = games {} + kata {} (stage0 {} stage1 {}, {} bad files of {}); val {}; kpool {} entries; ~{} MB",
-        ss.len(), n_games, nk0 + nk1, nk0, nk1, bad, kf.len(), nval, kpool.len(),
+        "in RAM: games {} + kata val {} = {} samples (val {}), kpool {} entries, ~{} MB; train blocks = 1 Kata file + its share of the game rows",
+        n_games, nk0 + nk1, ss.len(), nval, kpool.len(),
         (ss.len() * std::mem::size_of::<S>() + kpool.len() * 4) / 1_000_000
     );
 
@@ -423,11 +432,17 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     let r0 = evaluate(&bias, &g, &td, &tor, &mut sc);
     show("val init", &r0);
-    let score = |r: &([f64; 5], [f64; 3])| -> f64 { (if r.0[4] > 0.0 { r.0[0] } else { 0.0 }) + (if r.1[2] > 0.0 { r.1[0] } else { 0.0 }) };
+    // D528: early-stop criterion: kata = Kata soft CE, games = our-label CE, sum = both (default)
+    let stop_on = arg(args, "--stop-on").unwrap_or_else(|| "sum".into());
+    let score = |r: &([f64; 5], [f64; 3])| -> f64 {
+        let gce = if r.0[4] > 0.0 { r.0[0] } else { 0.0 };
+        let kce = if r.1[2] > 0.0 { r.1[0] } else { 0.0 };
+        match stop_on.as_str() { "kata" => kce, "games" => gce, _ => gce + kce }
+    };
     let mut best = (score(&r0), bias.clone(), g.clone(), td.clone(), tor.clone(), 0usize);
 
     // Adam (dense on bias/g, lazy sparse on the tables)
-    let mut tr: Vec<u32> = (0..ss.len() as u32).filter(|&i| !ss[i as usize].val).collect();
+    let mut tr: Vec<u32> = (0..ss.len() as u32).filter(|&i| !ss[i as usize].val && ss[i as usize].kind == 0).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
     let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; SLOTS], vec![0f32; SLOTS], vec![0f32; NSCAL], vec![0f32; NSCAL]);
     let (mut mtd, mut vtd, mut mto, mut vto) = (vec![0f32; td.len()], vec![0f32; td.len()], vec![0f32; tor.len()], vec![0f32; tor.len()]);
@@ -448,24 +463,64 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         let t0 = std::time::Instant::now();
         let (mut gb, mut gg) = (vec![0f32; SLOTS], vec![0f32; NSCAL]);
+        let mut forder: Vec<usize> = (0..train_files.len()).collect();
+        for i in (1..forder.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            forder.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let nblocks = train_files.len().max(1);
+        let gper = tr.len().div_ceil(nblocks);
+        let mut rows_seen = 0usize;
+        std::thread::scope(|ps| {
+        // D528 producer: decodes the next Kata file while the workers train on the current block (2 blocks max in RAM)
+        let (txb, rxb) = std::sync::mpsc::sync_channel::<(Vec<S>, Vec<(u8, u16)>)>(2);
+        {
+            let (tr, ss, train_files, forder) = (&tr, &ss, &train_files, forder);
+            ps.spawn(move || {
+                let (mut bb, mut pb) = (Vec::new(), Vec::new());
+                for bi in 0..nblocks {
+                    let (mut bss, mut bkp) = (Vec::new(), Vec::new());
+                    if let Some(&fi) = forder.get(bi) {
+                        let _ = load_kata_file(&train_files[fi], &mut bss, &mut bkp, false, &mut bb, &mut pb);
+                    }
+                    for &gi in &tr[(bi * gper).min(tr.len())..((bi + 1) * gper).min(tr.len())] {
+                        bss.push(ss[gi as usize]);
+                    }
+                    if txb.send((bss, bkp)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        for (bss, bkp) in rxb {
+        let mut btr: Vec<u32> = (0..bss.len() as u32).collect();
+        for i in (1..btr.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            btr.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        rows_seen += btr.len();
         // D526: PERSISTENT workers (one spawn per epoch, two barriers per batch) instead of 8 spawns per batch.
         // Workers read the parameters only between `start` and `done`; the main thread updates them only outside.
         let grs: Vec<std::sync::Mutex<Grad>> = (0..threads)
             .map(|_| std::sync::Mutex::new(Grad { gb: vec![0f32; SLOTS], gg: vec![0f32; NSCAL], gtd: vec![0f32; td.len()], gto: vec![0f32; tor.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] }))
             .collect();
         let bt = bs * threads;
-        let nb = tr.len().div_ceil(bt);
+        let nb = btr.len().div_ceil(bt);
         let (start_b, done_b) = (std::sync::Barrier::new(threads + 1), std::sync::Barrier::new(threads + 1));
         let cur = std::sync::atomic::AtomicUsize::new(0);
         struct Ptr(*mut f32, usize);
         unsafe impl Send for Ptr {}
         unsafe impl Sync for Ptr {}
         let pp = [Ptr(bias.as_mut_ptr(), bias.len()), Ptr(g.as_mut_ptr(), g.len()), Ptr(td.as_mut_ptr(), td.len()), Ptr(tor.as_mut_ptr(), tor.len())];
-        let trr = &tr[..];
+        let trr = &btr[..];
         std::thread::scope(|scp| {
             for ti in 0..threads {
                 let (grs, start_b, done_b, cur, pp) = (&grs, &start_b, &done_b, &cur, &pp);
-                let (kp, rg, ssr) = (&kpool[..], &ring, &ss[..]);
+                let (kp, rg, ssr) = (&bkp[..], &ring, &bss[..]);
                 scp.spawn(move || loop {
                     start_b.wait();
                     let b = cur.load(std::sync::atomic::Ordering::Acquire);
@@ -564,6 +619,9 @@ pub fn run(args: &[String]) -> ExitCode {
             cur.store(usize::MAX, std::sync::atomic::Ordering::Release);
             start_b.wait();
         });
+        }
+        });
+        eprintln!(" {} rows trained this epoch", rows_seen);
         let r = evaluate(&bias, &g, &td, &tor, &mut sc);
         show(&format!("epoch {} lr {:.5} ({:.0} s)", ep + 1, lr, t0.elapsed().as_secs_f64()), &r);
         let sc_now = score(&r);
@@ -578,7 +636,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
     }
-    println!("best epoch {} (val score {:.4} = games CE + kata CE)", best.5, best.0);
+    println!("best epoch {} (val score {:.4}, --stop-on {})", best.5, best.0, stop_on);
     if let Some(p) = arg(args, "--out-bin") {
         let mut o = if k3c { b"TPOL3\0\0\0".to_vec() } else if use_pat { b"TPOL2\0\0\0".to_vec() } else { b"TPOL1\0\0\0".to_vec() };
         o.extend_from_slice(&0u32.to_le_bytes());
