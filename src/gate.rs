@@ -514,8 +514,10 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         return Err(format!("--kind {kind} not valid here; use one of {}", allowed.join("|")));
     }
     // D552: an unknown flag (e.g. --ms 100) used to be ignored silently and the gate ran at the 5k-node default
-    const VALUE_FLAGS: [&str; 14] =
-        ["--net-test", "--net-base", "--kind", "--nodes", "--time-ms", "--book", "--ref", "--test", "--base", "--test-args", "--book0", "--elo1", "--max-games", "--threads"];
+    const VALUE_FLAGS: [&str; 15] = [
+        "--net-test", "--net-base", "--kind", "--nodes", "--time-ms", "--book", "--ref", "--test", "--base", "--test-args", "--base-args", "--book0", "--elo1",
+        "--max-games", "--threads",
+    ];
     const BOOL_FLAGS: [&str; 1] = ["--allow-busy"];
     let mut i = 0;
     while i < args.len() {
@@ -576,7 +578,7 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         let b = ensure_exe(&root, &gate_dir, &base_ref)?;
         // D522: same commit is a valid A/B when the candidate differs only by --test-args (e.g. a --policy file);
         // the args are hashed into the run id and the log header (B14)
-        if t.commit == b.commit && arg(args, "--test-args").is_none() {
+        if t.commit == b.commit && arg(args, "--test-args").is_none() && arg(args, "--base-args").is_none() {
             return Err("test and base are the same commit (pass --test-args for a file/flag A/B)".into());
         }
         // D416 (user: "local git is fine but it needs a way to track what was gated against what"): the test side is always
@@ -585,7 +587,8 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
     };
 
     // ---- run the paired SPRT through the existing `ti sprt` path
-    let args_tag = arg(args, "--test-args").map(|a| format!("-a{}", hash::short_hex(a.as_bytes()))).unwrap_or_default();
+    let args_tag = arg(args, "--test-args").map(|a| format!("-a{}", hash::short_hex(a.as_bytes()))).unwrap_or_default()
+        + &arg(args, "--base-args").map(|a| format!("-B{}", hash::short_hex(a.as_bytes()))).unwrap_or_default();
     // D502: an extension on fresh book lines (--book0 N) is a different run, not a repeat
     let b0_tag = arg(args, "--book0").filter(|v| v != "0").map(|v| format!("-b{v}")).unwrap_or_default();
     let run_id = format!("{}-{}{args_tag}-vs-{}-{}{b0_tag}", &iso_utc(now_secs())[..10], test.commit, base.commit, limit.replace(':', ""));
@@ -603,7 +606,8 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         None => test.spec(),
     };
     let mut sprt: Vec<String> = vec![
-        "--candidate".into(), test_spec, "--baseline".into(), base.spec(),
+        // D572: --base-args "..." = extra engine flags for the baseline side (e.g. the same --tt-bits as the test side)
+        "--candidate".into(), test_spec, "--baseline".into(), match arg(args, "--base-args") { Some(x) => format!("{} {x}", base.spec()), None => base.spec() },
         "--book".into(), fwd(&book),
         "--max-games".into(), arg(args, "--max-games").unwrap_or_else(|| "600".into()),
         "--elo0".into(), "0".into(), "--elo1".into(), elo1.clone(),
