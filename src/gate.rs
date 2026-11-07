@@ -513,6 +513,22 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
     if !allowed.contains(&kind.as_str()) {
         return Err(format!("--kind {kind} not valid here; use one of {}", allowed.join("|")));
     }
+    // D552: an unknown flag (e.g. --ms 100) used to be ignored silently and the gate ran at the 5k-node default
+    const VALUE_FLAGS: [&str; 14] =
+        ["--net-test", "--net-base", "--kind", "--nodes", "--time-ms", "--book", "--ref", "--test", "--base", "--test-args", "--book0", "--elo1", "--max-games", "--threads"];
+    const BOOL_FLAGS: [&str; 1] = ["--allow-busy"];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUE_FLAGS.contains(&a) || a == "--rules" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") && !BOOL_FLAGS.contains(&a) {
+            return Err(format!("unknown flag {a} (value flags: {}, --rules; switches: --allow-busy)", VALUE_FLAGS.join(" ")));
+        }
+        i += 1;
+    }
     let (nodes, time_ms) = (crate::flag_u64(args, "--nodes"), crate::flag_u64(args, "--time-ms"));
     let limit = match (nodes, time_ms) {
         (Some(_), Some(_)) => return Err("use either --nodes or --time-ms".into()),
