@@ -32,6 +32,7 @@ mod train;
 mod policy;
 mod policy2;
 mod bzupload;
+mod botzone;
 
 use sprt::{SprtTally, SprtVerdict};
 mod hash;
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
         "policy" => policy::run_policy(&args[1..]),
         "policy2" => policy2::run(&args[1..]),
         "botzone-upload" => bzupload::run(&args[1..]),
+        "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
         "harvest" => games::run_harvest(&args[1..]),
