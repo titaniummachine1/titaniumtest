@@ -414,6 +414,68 @@ fn insight_phases(games: &[Game]) -> String {
     out.trim_end().to_string()
 }
 
+/// D578 (user: 'use the analysis tools to find where each improvement gains, keep it only there; that is the point of
+/// the 16 buckets for the NNUE and the search'): the same paired value-lost diff as insight_phases, but bucketed by the
+/// NNUE bucket of the position the move was played in (empties * 16 / 50, 14 = start, 0 = full board), so a per-bucket
+/// search knob can be kept exactly in the buckets where the candidate loses less value.
+fn insight_nnue_buckets(games: &[Game]) -> String {
+    use std::collections::HashMap;
+    const NB: usize = 16;
+    type G = [(f64, u32, f64, u32); NB];
+    let mut pairs: HashMap<(u64, u64), Vec<G>> = HashMap::new();
+    for g in games {
+        let Ok(boards) = replay(g) else { continue };
+        let ok = |r: &Rec| r.mate.is_none() && r.score.map_or(false, |s| s.abs() <= 1500);
+        let mut a: G = [(0.0, 0, 0.0, 0); NB];
+        for i in 0..g.moves.len().saturating_sub(1) {
+            let (r0, r1) = (&g.moves[i], &g.moves[i + 1]);
+            if !ok(r0) || !ok(r1) || r1.ply != r0.ply + 1 || i >= boards.len() {
+                continue;
+            }
+            let bk = ((boards[i].empty().count_ones() as usize) * NB / 50).min(NB - 1);
+            let swing = (r0.score.unwrap() + r1.score.unwrap()) as f64;
+            let e = &mut a[bk];
+            if r0.mover == "candidate" {
+                e.0 += swing;
+                e.1 += 1;
+            } else {
+                e.2 += swing;
+                e.3 += 1;
+            }
+        }
+        pairs.entry((g.pair, g.book)).or_default().push(a);
+    }
+    let full: Vec<&Vec<G>> = pairs.values().filter(|v| v.len() == 2).collect();
+    if full.len() < 50 {
+        return String::new();
+    }
+    let mut out = String::from("\n  by NNUE bucket (empties*16/50; per-move diff = baseline minus candidate value lost, + = candidate better):\n");
+    for b in (0..NB).rev() {
+        let (mut diff, mut moves) = (Vec::new(), 0u32);
+        for v in &full {
+            let (mut d, mut nd) = (0.0, 0.0);
+            for g in v.iter() {
+                let e = g[b];
+                if e.1 > 0 && e.3 > 0 {
+                    d += e.2 / e.3 as f64 - e.0 / e.1 as f64;
+                    nd += 1.0;
+                    moves += e.1 + e.3;
+                }
+            }
+            if nd > 0.0 {
+                diff.push(d / nd);
+            }
+        }
+        if diff.len() < 10 {
+            continue;
+        }
+        let (md, zd) = mean_z(&diff);
+        let (lo, hi) = ((b * 50 + 15) / 16, ((b + 1) * 50 + 15) / 16 - 1);
+        out += &format!("    b{b:<2} empties {lo:2}-{hi:<2} value lost diff {md:+7.2} cp/move (z {zd:+5.2}) | {} pairs, {moves} moves\n", diff.len());
+    }
+    out.trim_end().to_string()
+}
+
 pub fn run_insight(args: &[String]) -> ExitCode {
     let paths: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
     if paths.is_empty() {
@@ -431,7 +493,12 @@ pub fn run_insight(args: &[String]) -> ExitCode {
         }
     }
     match insight(&games) {
-        Some(r) => println!("{r}"),
+        Some(r) => {
+            println!("{r}");
+            if args.iter().any(|a| a == "--by-bucket") {
+                println!("{}", insight_nnue_buckets(&games));
+            }
+        }
         None => println!("insight: fewer than 50 complete pairs with scored moves ({} games read)", games.len()),
     }
     ExitCode::SUCCESS
