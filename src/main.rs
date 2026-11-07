@@ -29,6 +29,8 @@ mod games;
 mod sprt;
 mod spsa;
 mod train;
+mod policy;
+mod policy2;
 
 use sprt::{SprtTally, SprtVerdict};
 mod hash;
@@ -61,6 +63,8 @@ fn main() -> ExitCode {
         "data" => data::run_data(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
+        "policy" => policy::run_policy(&args[1..]),
+        "policy2" => policy2::run(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
         "harvest" => games::run_harvest(&args[1..]),

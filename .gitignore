@@ -2,3 +2,4 @@
 *.pdb
 *.log
 .cargo/
+target_*/

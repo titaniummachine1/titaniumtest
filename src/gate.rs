@@ -558,8 +558,10 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         let base_ref = arg(args, "--base").unwrap_or_else(|| "main".into());
         let t = ensure_exe(&root, &gate_dir, &test_ref)?;
         let b = ensure_exe(&root, &gate_dir, &base_ref)?;
-        if t.commit == b.commit {
-            return Err("test and base are the same commit".into());
+        // D522: same commit is a valid A/B when the candidate differs only by --test-args (e.g. a --policy file);
+        // the args are hashed into the run id and the log header (B14)
+        if t.commit == b.commit && arg(args, "--test-args").is_none() {
+            return Err("test and base are the same commit (pass --test-args for a file/flag A/B)".into());
         }
         // D416 (user: "local git is fine but it needs a way to track what was gated against what"): the test side is always
         // a commit (ensure_exe); after the run a local annotated tag gate/<run_id> on it records base, limit, args, log.
@@ -568,7 +570,9 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
 
     // ---- run the paired SPRT through the existing `ti sprt` path
     let args_tag = arg(args, "--test-args").map(|a| format!("-a{}", hash::short_hex(a.as_bytes()))).unwrap_or_default();
-    let run_id = format!("{}-{}{args_tag}-vs-{}-{}", &iso_utc(now_secs())[..10], test.commit, base.commit, limit.replace(':', ""));
+    // D502: an extension on fresh book lines (--book0 N) is a different run, not a repeat
+    let b0_tag = arg(args, "--book0").filter(|v| v != "0").map(|v| format!("-b{v}")).unwrap_or_default();
+    let run_id = format!("{}-{}{args_tag}-vs-{}-{}{b0_tag}", &iso_utc(now_secs())[..10], test.commit, base.commit, limit.replace(':', ""));
     let out_dir = root.join("logs").join("gates").join(&run_id);
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let log = out_dir.join("sprt.log");

@@ -196,7 +196,7 @@ fn open_col(path: &str, e: &ZipEntry) -> Result<Col, String> {
     let elem = match descr {
         "<u8" | "<i8" => 8,
         "<f4" | "<i4" | "<u4" => 4,
-        "<f2" => 2,
+        "<f2" | "<i2" | "<u2" => 2,
         "|u1" | "|i1" => 1,
         d => return Err(format!("dtype {d}")),
     };
@@ -208,7 +208,8 @@ fn open_col(path: &str, e: &ZipEntry) -> Result<Col, String> {
         .ok_or("no shape")?;
     let dims: Vec<usize> = shape.split(',').filter_map(|t| t.trim().parse().ok()).collect();
     let rows = *dims.first().ok_or("empty shape")?;
-    let width = dims.get(1).copied().unwrap_or(1);
+    // D517: N-d arrays (Kata tdata: binaryInputNCHWPacked N x 22 x 7, policyTargetsNCMove N x 2 x 50): width = product of the rest
+    let width = dims[1..].iter().product::<usize>().max(1);
     Ok(Col { rd, rows, width, elem })
 }
 
@@ -233,7 +234,8 @@ impl Npz {
     }
     pub fn col(&self, key: &str) -> Result<Col, String> {
         let want = format!("{key}.npy");
-        let e = self.entries.iter().find(|e| e.name == want).ok_or(format!("column {key} missing"))?;
+        // D517: KataGo tdata names its members without the .npy suffix
+        let e = self.entries.iter().find(|e| e.name == want || e.name == key).ok_or(format!("column {key} missing"))?;
         open_col(&self.path, e)
     }
 }
