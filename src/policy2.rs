@@ -238,6 +238,62 @@ fn load_kata_file(path: &str, out: &mut Vec<S>, kpool: &mut Vec<(u8, u16)>, val:
     Some((n0, n1))
 }
 
+/// D535: crash-safe write (temp file + rename); a crash or power cut mid-write never corrupts the previous file
+fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+fn head_bytes(k3c: bool, use_pat: bool, parts: [&[f32]; 4]) -> Vec<u8> {
+    let mut o = if k3c { b"TPOL3\0\0\0".to_vec() } else if use_pat { b"TPOL2\0\0\0".to_vec() } else { b"TPOL1\0\0\0".to_vec() };
+    o.extend_from_slice(&0u32.to_le_bytes());
+    for part in parts {
+        for v in part {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    o
+}
+
+/// checkpoint: "PCK1", u32 next epoch, i32 adam step, f64 best score, u32 best epoch, u32 bad epochs, then 16 f32 vectors
+/// (each u64 length + data): bias g td tor | mb vb mg vg mtd vtd mto vto | best bias g td tor
+fn ckpt_bytes(hdr: (u32, i32, f64, u32, u32), vs: [&[f32]; 16]) -> Vec<u8> {
+    let mut o = b"PCK1".to_vec();
+    o.extend_from_slice(&hdr.0.to_le_bytes());
+    o.extend_from_slice(&hdr.1.to_le_bytes());
+    o.extend_from_slice(&hdr.2.to_le_bytes());
+    o.extend_from_slice(&hdr.3.to_le_bytes());
+    o.extend_from_slice(&hdr.4.to_le_bytes());
+    for v in vs {
+        o.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    o
+}
+
+#[allow(clippy::type_complexity)]
+fn ckpt_read(path: &str) -> Option<((u32, i32, f64, u32, u32), Vec<Vec<f32>>)> {
+    let d = fs::read(path).ok()?;
+    if d.len() < 28 || &d[0..4] != b"PCK1" {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let hdr = (u32_at(4), i32::from_le_bytes(d[8..12].try_into().unwrap()), f64::from_le_bytes(d[12..20].try_into().unwrap()), u32_at(20), u32_at(24));
+    let mut off = 28;
+    let mut vs = Vec::new();
+    for _ in 0..16 {
+        let n = u64::from_le_bytes(d.get(off..off + 8)?.try_into().unwrap()) as usize;
+        off += 8;
+        let b = d.get(off..off + 4 * n)?;
+        vs.push(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
+        off += 4 * n;
+    }
+    Some((hdr, vs))
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(net_path) = arg(args, "--net") else {
         eprintln!("usage: ti policy2 --net NET.tnn --games a.jsonl[,..] [--kata DIR[,DIR]] --pat k3c|k3 [--init POL.bin] --out-bin OUT.bin [--max-epochs 30] [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 1] [--max-samples N]");
@@ -452,7 +508,37 @@ pub fn run(args: &[String]) -> ExitCode {
     let bs = 256usize;
     let mut bad_epochs = 0usize;
     let _z: Vec<f32> = Vec::new();
-    for ep in 0..max_epochs {
+    // D535: crash safety: --out-bin is rewritten (atomically) after every improving epoch, a full checkpoint
+    // <out>.ckpt after every epoch, --resume continues from it, <out>.stop ends the run after the current epoch
+    let out_bin = arg(args, "--out-bin");
+    let ckpt_path = out_bin.as_ref().map(|p| format!("{p}.ckpt"));
+    let stop_path = out_bin.as_ref().map(|p| format!("{p}.stop"));
+    let mut ep0 = 0usize;
+    if args.iter().any(|a| a == "--resume") {
+        match ckpt_path.as_deref().and_then(ckpt_read) {
+            Some((h, vs)) if vs[0].len() == bias.len() && vs[2].len() == td.len() && vs[3].len() == tor.len() => {
+                bias.copy_from_slice(&vs[0]);
+                g.copy_from_slice(&vs[1]);
+                td.copy_from_slice(&vs[2]);
+                tor.copy_from_slice(&vs[3]);
+                mb.copy_from_slice(&vs[4]);
+                vb.copy_from_slice(&vs[5]);
+                mg.copy_from_slice(&vs[6]);
+                vg.copy_from_slice(&vs[7]);
+                mtd.copy_from_slice(&vs[8]);
+                vtd.copy_from_slice(&vs[9]);
+                mto.copy_from_slice(&vs[10]);
+                vto.copy_from_slice(&vs[11]);
+                best = (h.2, vs[12].clone(), vs[13].clone(), vs[14].clone(), vs[15].clone(), h.3 as usize);
+                ep0 = h.0 as usize;
+                t = h.1;
+                bad_epochs = h.4 as usize;
+                println!("resumed from {} at epoch {} (best epoch {}, score {:.4})", ckpt_path.as_deref().unwrap_or(""), ep0 + 1, best.5, best.0);
+            }
+            _ => println!("--resume: no usable checkpoint, starting fresh"),
+        }
+    }
+    for ep in ep0..max_epochs {
         let lr = lr0 * (0.85f32).powi(ep as i32);
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ (ep as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         for i in (1..tr.len()).rev() {
@@ -625,25 +711,42 @@ pub fn run(args: &[String]) -> ExitCode {
         let r = evaluate(&bias, &g, &td, &tor, &mut sc);
         show(&format!("epoch {} lr {:.5} ({:.0} s)", ep + 1, lr, t0.elapsed().as_secs_f64()), &r);
         let sc_now = score(&r);
+        let mut stop = false;
         if sc_now < best.0 - 0.0005 {
             best = (sc_now, bias.clone(), g.clone(), td.clone(), tor.clone(), ep + 1);
             bad_epochs = 0;
+            if let Some(p) = &out_bin {
+                match write_atomic(p, &head_bytes(k3c, use_pat, [&best.1, &best.2, &best.3, &best.4])) {
+                    Ok(()) => println!("  saved best (epoch {}) -> {p}", ep + 1),
+                    Err(e) => eprintln!("  {p}: {e}"),
+                }
+            }
         } else {
             bad_epochs += 1;
             if bad_epochs > patience {
                 println!("early stop: no val improvement for {} epochs (best epoch {})", bad_epochs, best.5);
-                break;
+                stop = true;
             }
+        }
+        if let Some(cp) = &ckpt_path {
+            let hdr = ((ep + 1) as u32, t, best.0, best.5 as u32, bad_epochs as u32);
+            let vs: [&[f32]; 16] = [&bias, &g, &td, &tor, &mb, &vb, &mg, &vg, &mtd, &vtd, &mto, &vto, &best.1, &best.2, &best.3, &best.4];
+            if let Err(e) = write_atomic(cp, &ckpt_bytes(hdr, vs)) {
+                eprintln!("  {cp}: {e}");
+            }
+        }
+        if stop_path.as_deref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false) {
+            println!("stop file found: ending after epoch {}", ep + 1);
+            stop = true;
+        }
+        if stop {
+            break;
         }
     }
     println!("best epoch {} (val score {:.4}, --stop-on {})", best.5, best.0, stop_on);
-    if let Some(p) = arg(args, "--out-bin") {
-        let mut o = if k3c { b"TPOL3\0\0\0".to_vec() } else if use_pat { b"TPOL2\0\0\0".to_vec() } else { b"TPOL1\0\0\0".to_vec() };
-        o.extend_from_slice(&0u32.to_le_bytes());
-        for v in best.1.iter().chain(best.2.iter()).chain(best.3.iter()).chain(best.4.iter()) {
-            o.extend_from_slice(&v.to_le_bytes());
-        }
-        match fs::write(&p, &o) {
+    if let Some(p) = &out_bin {
+        let o = head_bytes(k3c, use_pat, [&best.1, &best.2, &best.3, &best.4]);
+        match write_atomic(p, &o) {
             Ok(()) => println!("wrote {p} ({} B, best epoch {})", o.len(), best.5),
             Err(e) => {
                 eprintln!("{p}: {e}");
