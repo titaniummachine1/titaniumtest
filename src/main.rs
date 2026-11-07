@@ -887,7 +887,17 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     } else {
         let base_lbl = engine_label(&raw_base_spec);
         let expected_lbl = format!("exe {}", main_side.exe_sha);
-        let is_exact_main = base_lbl == expected_lbl && raw_base_spec.trim() == main_side.spec().trim();
+        // D594: the verified main exe may carry resource-only flags (same engine, Botzone-like table size), e.g.
+        // `--tt-bits 22` via ti gate --base-args; anything else stays refused
+        let extra_ok = raw_base_spec
+            .trim()
+            .strip_prefix(main_side.spec().trim())
+            .map(|rest| {
+                let t: Vec<&str> = rest.split_whitespace().collect();
+                t.len() % 2 == 0 && t.chunks(2).all(|c| c[0] == "--tt-bits" && c[1].parse::<u32>().is_ok())
+            })
+            .unwrap_or(false);
+        let is_exact_main = base_lbl == expected_lbl && (raw_base_spec.trim() == main_side.spec().trim() || extra_ok);
         if !is_exact_main && !non_main_ab {
             eprintln!(
                 "sprt: REFUSED — --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
