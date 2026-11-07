@@ -518,7 +518,8 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         "--net-test", "--net-base", "--kind", "--nodes", "--time-ms", "--book", "--ref", "--test", "--base", "--test-args", "--base-args", "--book0", "--elo1",
         "--max-games", "--threads",
     ];
-    const BOOL_FLAGS: [&str; 1] = ["--allow-busy"];
+    // D595: --non-main-ab = stacking A/B (base = main + accepted knobs on the same commit); never reported as "vs main"
+    const BOOL_FLAGS: [&str; 2] = ["--allow-busy", "--non-main-ab"];
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -617,6 +618,9 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         Some(("ms", v)) => sprt.extend(["--time-ms".into(), v.to_string()]),
         Some((_, v)) => sprt.extend(["--nodes".into(), v.to_string()]),
         None => {}
+    }
+    if args.iter().any(|a| a == "--non-main-ab") {
+        sprt.push("--non-main-ab".into());
     }
     for flag in ["--threads", "--book0", "--rules"] {
         if let Some(v) = arg(args, flag) {
