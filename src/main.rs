@@ -1,4 +1,4 @@
-//! TitaniumTest — Distributed & Multi-Threaded SPRT Gate + Teacher Relabeling System (Fishtest / Fishnet style).
+﻿//! TitaniumTest â€” Distributed & Multi-Threaded SPRT Gate + Teacher Relabeling System (Fishtest / Fishnet style).
 //!
 //! Subcommands:
 //!   titaniumtest sprt --candidate <CMD|self> --baseline <CMD> --book <FILE>
@@ -27,6 +27,7 @@ mod targets;
 mod gate;
 mod games;
 mod gamedata;
+mod gen;
 mod sprt;
 mod spsa;
 mod train;
@@ -72,6 +73,7 @@ fn main() -> ExitCode {
         "botzone-upload" => bzupload::run(&args[1..]),
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
+        "gen" => gen::run_gen(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
         "bookprune" => games::run_bookprune(&args[1..]),
         "pool" => games::run_pool(&args[1..]),
@@ -87,7 +89,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "titaniumtest — Fishtest/Fishnet/Bullet-style SPRT, Gate & Trainer Hub for Titanium Ataxx\n\
+        "titaniumtest â€” Fishtest/Fishnet/Bullet-style SPRT, Gate & Trainer Hub for Titanium Ataxx\n\
          \n\
          SUBCOMMANDS:\n\
          \x20 gate         Build clean commits into _gate/exes/ and run a recorded SPRT against main\n\
@@ -1067,7 +1069,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             let is_exact_main = base_lbl == expected_lbl && (raw_base_spec.trim() == ms.spec().trim() || extra_ok);
             if !is_exact_main {
                 eprintln!(
-                    "sprt: REFUSED — --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
+                    "sprt: REFUSED â€” --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
                      \x20     Canonical `main` is commit {} (bundled net {}, [{}]): `{}`\n\
                      \x20     Promotion gates MUST run against `main`: omit `--baseline` or pass `--baseline main`.\n\
                      \x20     For an internal A/B test between two experimental builds, pass `--non-main-ab` explicitly (and NEVER call its result 'vs main').",
@@ -2110,3 +2112,5 @@ pub fn mate_in_moves(score: i32) -> Option<i32> {
     let moves = (plies + 1) / 2;
     Some(if score > 0 { moves.max(1) } else { -moves.max(1) })
 }
+
+
