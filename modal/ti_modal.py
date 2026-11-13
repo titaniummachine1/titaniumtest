@@ -1,4 +1,4 @@
-"""The ONE Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs a
+﻿"""The ONE Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs a
 `ti` command line in it; all logic (training, export, parity, preflight) is in the Rust hub. A new job = new `ti`
 arguments or a new `ti` subcommand, never a new script. Drive it with `ti train modal ...` (src/modal.rs), not by hand.
 
@@ -18,7 +18,7 @@ import os
 import modal
 
 HUB_REPO = r"C:\gitProjects\titaniumtest"
-ENGINE = r"C:\gitProjects\hub-ataxx"  # engine crate the hub is patched to locally (see .cargo/config.toml)
+ENGINE = r"C:\gitProjects\mainpromo-ataxx"  # engine crate the hub is patched to locally (see .cargo/config.toml)
 SNAP_ROOT = r"C:\gitProjects\logs\ti_snap"
 PATCH = '[patch."https://github.com/titaniummachine1/titanium-ataxx"]\ntitanium = { path = "/src/engine/crates/titanium" }\n'
 CPU = float(os.environ.get("TI_CPU", "4"))  # vCPUs of the container (loader threads); the loader may be the cap, see REVIEW_NOTES N4
@@ -104,3 +104,40 @@ def main(tag: str, args: str, timeout_min: int = 30):
     rc = run.remote(tag, args, timeout_min)
     print("RUN %s exit code %d" % (tag, rc))
     raise SystemExit(rc)
+
+
+# ---------------------------------------------------------------- game generation
+# CPU-only: game generation needs no GPU, and the GPU function above would bill an
+# L4/T4/A10G for pure CPU work. Measured locally: ~8.2 core-s per 100 ms game plus
+# ~2.3 core-s to relabel it at 5k, i.e. ~7.3k games per dollar at Modal CPU rates.
+GEN_CPU = float(os.environ.get("TI_GEN_CPU", "2"))
+GEN_MEM = int(os.environ.get("TI_GEN_MEM_MB", "2048"))
+
+
+@app.function(cpu=GEN_CPU, memory=GEN_MEM, timeout=4 * 3600, volumes={"/vol": vol}, max_containers=100)
+def gen(tag: str, shard: int, games: int, time_ms: int = 100, timeout_min: int = 120, book0: int = 0) -> int:
+    """One shard of fresh self-play games, written straight onto the volume."""
+    os.makedirs("/vol/runs/%s" % tag, exist_ok=True)
+    out = "/vol/runs/%s/shard%03d" % (tag, shard)
+    # botzone rules are built into `ti gen` (bz_over/bz_counts); no flags needed
+    cmd = (
+        "timeout %dm ti gen --out %s.jsonl --games %d --time-ms %d "
+        "--book /vol/data/book50k_std5k.txt --book0 %d --tt-bits 18"
+    ) % (timeout_min, out, games, time_ms, book0)
+    rc = sh(cmd)
+    if rc == 124:
+        print("TIMEOUT: shard %d killed after %d min (cost cap)" % (shard, timeout_min))
+    vol.commit()
+    return rc
+
+
+@app.local_entrypoint()
+def gen_main(tag: str, games: int = 250, shards: int = 20, time_ms: int = 100, timeout_min: int = 120):
+    """Fan out `shards` CPU containers; each plays `games` games on its own book slice."""
+    hs = [gen.spawn(tag, i, games, time_ms, timeout_min, i * games) for i in range(shards)]
+    rcs = [h.get() for h in hs]
+    bad = [r for r in rcs if r != 0]
+    print("gen: %d shards, %d games each, exit codes %s" % (shards, games, rcs))
+    raise SystemExit(0 if not bad else 1)
+
+
