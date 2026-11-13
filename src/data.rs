@@ -367,11 +367,328 @@ pub fn run_data(args: &[String]) -> ExitCode {
         Some("check-targets") => crate::targets::run_check(args),
         Some("check-leak") => crate::leak::run_check(args),
         Some("stats") => run_stats(args),
+        Some("sample") => run_sample(args),
+        Some("mix") => run_mix(args),
+        Some("chains") => crate::gamedata::run_chains(args),
+        Some("lambda") => crate::gamedata::run_lambda(args),
+        Some("chain-audit") => crate::gamedata::run_chain_audit(args),
+        Some("pack-games") => crate::gamedata::run_pack_games(args),
+        Some("games-stat") => crate::gamedata::run_games_stat(args),
+        Some("games-tdat") => crate::gamedata::run_games_tdat(args),
         _ => {
-            eprintln!("usage: ti data pack --npz <v9.npz> --out <stem>");
+            eprintln!("usage: ti data <pack|sample|mix|stats|check-targets|check-leak|chains|lambda|chain-audit|pack-games|games-stat|games-tdat> ...");
             ExitCode::FAILURE
         }
     }
+}
+
+pub fn write_tdat_and_manifest(out_stem: &str, src_desc: &str, recs: &[Rec]) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(out_stem).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let tmp = format!("{out_stem}.tdat.tmp");
+    {
+        let f = File::create(&tmp).map_err(|e| format!("{tmp}: {e}"))?;
+        let mut w = BufWriter::with_capacity(1 << 20, f);
+        for r in recs {
+            w.write_all(&r.to_bytes()).map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+    }
+    let final_p = format!("{out_stem}.tdat");
+    std::fs::rename(&tmp, &final_p).map_err(|e| format!("rename {tmp} -> {final_p}: {e}"))?;
+    write_tdat_manifest(out_stem, src_desc, recs.len())
+}
+
+pub fn write_tdat_manifest(out_stem: &str, src_desc: &str, rows: usize) -> Result<(), String> {
+    let json = format!(
+        "{{\"src\":{},\"rows\":{rows},\"rec\":{REC}}}",
+        crate::json_str(src_desc)
+    );
+    std::fs::write(format!("{out_stem}.manifest.json"), json).map_err(|e| e.to_string())
+}
+
+fn split_input_spec(s: &str) -> (&str, Option<usize>) {
+    if let Some((head, tail)) = s.rsplit_once(':') {
+        if !head.is_empty() && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = tail.parse::<usize>() {
+                return (head, Some(n));
+            }
+        }
+    }
+    (s, None)
+}
+
+/// `ti data sample --data <stem> --out <out_stem> [--rows N] [--empties-min E] [--empties-max E] [--force]`
+pub fn run_sample(args: &[String]) -> ExitCode {
+    let Some(data) = crate::flag_str(args, "--data") else {
+        eprintln!("usage: ti data sample --data <stem> --out <out_stem> [--rows N] [--empties-min E] [--empties-max E] [--force]");
+        return ExitCode::FAILURE;
+    };
+    let Some(out_stem) = crate::flag_str(args, "--out") else {
+        eprintln!("usage: ti data sample --data <stem> --out <out_stem> ...");
+        return ExitCode::FAILURE;
+    };
+    let force = crate::has_flag(args, "--force");
+    let out_tdat = format!("{out_stem}.tdat");
+    if !force && std::path::Path::new(&out_tdat).exists() {
+        eprintln!("data sample: {out_tdat} already exists (pass --force to overwrite)");
+        return ExitCode::FAILURE;
+    }
+    let emin = crate::flag_u64(args, "--empties-min").unwrap_or(0) as u32;
+    let emax = crate::flag_u64(args, "--empties-max").unwrap_or(49) as u32;
+    if emin > emax || emax > 49 {
+        eprintln!("data sample: invalid empties range {emin}..={emax}");
+        return ExitCode::FAILURE;
+    }
+    let mut t = match crate::trainer::Tdat::open(&data) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("data sample: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(parent) = std::path::Path::new(&out_stem).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("data sample: mkdir: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let req_rows = crate::flag_u64(args, "--rows").map(|v| v as usize);
+    let tmp = format!("{out_stem}.tdat.tmp");
+    let mut w = BufWriter::with_capacity(1 << 20, match File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("data sample: create {tmp}: {e}");
+            return ExitCode::FAILURE;
+        }
+    });
+    let t0 = std::time::Instant::now();
+    let mut written = 0usize;
+    let mut buf = Vec::with_capacity(1 << 16);
+
+    if emin == 0 && emax == 49 {
+        let want = req_rows.unwrap_or(1_228_800).min(t.rows);
+        const BLK: usize = 1024;
+        if want < t.rows && t.rows >= BLK && want >= BLK {
+            let nblk = t.rows / BLK;
+            let blocks = (want / BLK).max(1).min(nblk);
+            for i in 0..blocks {
+                buf.clear();
+                let start = (i * nblk / blocks) * BLK;
+                if let Err(e) = t.read_block(start, BLK, &mut buf) {
+                    eprintln!("data sample: read: {e}");
+                    return ExitCode::FAILURE;
+                }
+                for r in &buf {
+                    if let Err(e) = w.write_all(&r.to_bytes()) {
+                        eprintln!("data sample: write: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                written += buf.len();
+            }
+        } else {
+            let mut s = 0usize;
+            let mut picked = 0usize;
+            while s < t.rows && picked < want {
+                buf.clear();
+                if let Err(e) = t.read_block(s, 1 << 16, &mut buf) {
+                    eprintln!("data sample: read: {e}");
+                    return ExitCode::FAILURE;
+                }
+                for r in &buf {
+                    let row_idx = s;
+                    s += 1;
+                    let target_idx = ((picked as u128 * t.rows as u128) / want.max(1) as u128) as usize;
+                    if row_idx == target_idx {
+                        if let Err(e) = w.write_all(&r.to_bytes()) {
+                            eprintln!("data sample: write: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                        written += 1;
+                        picked += 1;
+                        if picked >= want {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Pass 1: count matches in range emin..=emax
+        let mut matches = 0usize;
+        let mut s = 0usize;
+        while s < t.rows {
+            buf.clear();
+            if let Err(e) = t.read_block(s, 1 << 16, &mut buf) {
+                eprintln!("data sample: scan: {e}");
+                return ExitCode::FAILURE;
+            }
+            s += buf.len();
+            for r in &buf {
+                let ne = crate::mapper::board_of(r, 0).empty().count_ones();
+                if ne >= emin && ne <= emax {
+                    matches += 1;
+                }
+            }
+        }
+        let want = req_rows.map(|v| v.min(matches)).unwrap_or(matches);
+        if matches == 0 || want == 0 {
+            eprintln!("data sample: 0 rows matched empties {emin}..={emax}");
+            let _ = std::fs::remove_file(&tmp);
+            return ExitCode::FAILURE;
+        }
+        // Pass 2: deterministic strided pick over matching rows
+        let mut t2 = crate::trainer::Tdat::open(&data).unwrap();
+        s = 0;
+        let mut seen = 0usize;
+        let mut picked = 0usize;
+        while s < t2.rows && picked < want {
+            buf.clear();
+            if let Err(e) = t2.read_block(s, 1 << 16, &mut buf) {
+                eprintln!("data sample: read pass2: {e}");
+                return ExitCode::FAILURE;
+            }
+            s += buf.len();
+            for r in &buf {
+                let ne = crate::mapper::board_of(r, 0).empty().count_ones();
+                if ne >= emin && ne <= emax {
+                    let target_idx = ((picked as u128 * matches as u128) / want as u128) as usize;
+                    if seen == target_idx {
+                        if let Err(e) = w.write_all(&r.to_bytes()) {
+                            eprintln!("data sample: write: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                        written += 1;
+                        picked += 1;
+                        if picked >= want {
+                            break;
+                        }
+                    }
+                    seen += 1;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = w.flush() {
+        eprintln!("data sample: flush: {e}");
+        return ExitCode::FAILURE;
+    }
+    drop(w);
+    if std::path::Path::new(&out_tdat).exists() {
+        let _ = std::fs::remove_file(&out_tdat);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &out_tdat) {
+        eprintln!("data sample: rename: {e}");
+        return ExitCode::FAILURE;
+    }
+    let src_desc = format!("{data} [empties {emin}..={emax}]");
+    if let Err(e) = write_tdat_manifest(&out_stem, &src_desc, written) {
+        eprintln!("data sample: manifest: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "data sample: {} -> {out_tdat} ({written} rows, {:.1} MB, empties {emin}..={emax}) in {:.1}s",
+        data,
+        (written * REC) as f64 / 1_048_576.0,
+        t0.elapsed().as_secs_f64()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `ti data mix --inputs <stemA[:maxA],stemB[:maxB],...> --out <out_stem> [--no-shuffle] [--seed 7] [--force]`
+pub fn run_mix(args: &[String]) -> ExitCode {
+    let Some(inputs_str) = crate::flag_str(args, "--inputs") else {
+        eprintln!("usage: ti data mix --inputs <stem[:limit],...> --out <out_stem> [--no-shuffle] [--seed 7] [--force]");
+        return ExitCode::FAILURE;
+    };
+    let Some(out_stem) = crate::flag_str(args, "--out") else {
+        eprintln!("usage: ti data mix --inputs ... --out <out_stem>");
+        return ExitCode::FAILURE;
+    };
+    let force = crate::has_flag(args, "--force");
+    let out_tdat = format!("{out_stem}.tdat");
+    if !force && std::path::Path::new(&out_tdat).exists() {
+        eprintln!("data mix: {out_tdat} already exists (pass --force to overwrite)");
+        return ExitCode::FAILURE;
+    }
+    let shuffle = !crate::has_flag(args, "--no-shuffle");
+    let seed = crate::flag_u64(args, "--seed").unwrap_or(7) | 1;
+
+    let mut all: Vec<Rec> = Vec::new();
+    let mut parts_desc = Vec::new();
+    for spec in inputs_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (stem, limit) = split_input_spec(spec);
+        let mut t = match crate::trainer::Tdat::open(stem) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("data mix: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let want = limit.map(|n| n.min(t.rows)).unwrap_or(t.rows);
+        let mut picked = 0usize;
+        let mut s = 0usize;
+        let mut seen = 0usize;
+        let mut buf = Vec::with_capacity(1 << 16);
+        while s < t.rows && picked < want {
+            buf.clear();
+            if let Err(e) = t.read_block(s, 1 << 16, &mut buf) {
+                eprintln!("data mix: read {stem}: {e}");
+                return ExitCode::FAILURE;
+            }
+            s += buf.len();
+            for r in &buf {
+                let target_idx = ((picked as u128 * t.rows as u128) / want.max(1) as u128) as usize;
+                if want == t.rows || seen == target_idx {
+                    all.push(*r);
+                    picked += 1;
+                    if picked >= want {
+                        break;
+                    }
+                }
+                seen += 1;
+            }
+        }
+        parts_desc.push(format!("{stem}:{picked}"));
+    }
+    if all.is_empty() {
+        eprintln!("data mix: 0 rows total");
+        return ExitCode::FAILURE;
+    }
+    if shuffle {
+        let mut rng = seed;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for i in (1..all.len()).rev() {
+            let j = (next_u64() % (i as u64 + 1)) as usize;
+            all.swap(i, j);
+        }
+    }
+    if std::path::Path::new(&out_tdat).exists() {
+        let _ = std::fs::remove_file(&out_tdat);
+    }
+    if let Err(e) = write_tdat_and_manifest(&out_stem, &parts_desc.join("+"), &all) {
+        eprintln!("data mix: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "data mix: {} -> {out_tdat} ({} rows, {:.1} MB, shuffle={shuffle})",
+        parts_desc.join(" + "),
+        all.len(),
+        (all.len() * REC) as f64 / 1_048_576.0
+    );
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -392,6 +709,79 @@ mod tests {
         let (rows, _) = pack(p, out.to_str().unwrap()).unwrap();
         assert_eq!(rows, 601_957);
         assert_eq!(std::fs::metadata(format!("{}.tdat", out.display())).unwrap().len(), (rows * REC) as u64);
+    }
+
+    #[test]
+    fn split_input_spec_parses_limits_and_windows_paths() {
+        assert_eq!(split_input_spec("a:100"), ("a", Some(100)));
+        assert_eq!(split_input_spec("C:/dir/train_v9:50000"), ("C:/dir/train_v9", Some(50000)));
+        assert_eq!(split_input_spec("C:/dir/train_v9"), ("C:/dir/train_v9", None));
+        assert_eq!(split_input_spec("a:notnum"), ("a:notnum", None));
+    }
+
+    #[test]
+    fn sample_and_mix_write_valid_tdat_and_manifests() {
+        let dir = std::env::temp_dir().join(format!("ti_data_sample_mix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk_rec = |stones: u32, cp: f32| Rec {
+            occ0: if stones == 0 { 0 } else { (1u64 << stones) - 1 },
+            occ1: 0,
+            outcome: 1.0,
+            cp,
+            wsum: 1.0,
+            p3: 0.5,
+            cp5k: cp,
+            zx: 0,
+            stm: 0,
+            teacher_kind: 1,
+            proof_kind: 0,
+            relabel_src: 0,
+            ti_clash: 0,
+        };
+        let a_recs = vec![
+            mk_rec(40, 10.0), mk_rec(42, 20.0), mk_rec(44, 30.0), mk_rec(43, 40.0), mk_rec(41, 50.0),
+            mk_rec(10, -10.0), mk_rec(12, -20.0), mk_rec(15, -30.0),
+        ];
+        let b_recs = vec![mk_rec(20, 100.0), mk_rec(21, 200.0), mk_rec(22, 300.0)];
+
+        let stem_a = dir.join("a").to_string_lossy().into_owned();
+        let stem_b = dir.join("b").to_string_lossy().into_owned();
+        let stem_s = dir.join("samp").to_string_lossy().into_owned();
+        let stem_m = dir.join("mix").to_string_lossy().into_owned();
+        write_tdat_and_manifest(&stem_a, "srcA", &a_recs).unwrap();
+        write_tdat_and_manifest(&stem_b, "srcB", &b_recs).unwrap();
+
+        let args_s: Vec<String> = [
+            "--data", &stem_s_arg(&stem_a), "--out", &stem_s,
+            "--empties-min", "4", "--empties-max", "10", "--rows", "3", "--force",
+        ].iter().map(|s| s.to_string()).collect();
+        fn stem_s_arg(s: &str) -> &str { s }
+        assert_eq!(run_sample(&args_s), ExitCode::SUCCESS);
+
+        let manifest_s = std::fs::read_to_string(format!("{stem_s}.manifest.json")).unwrap();
+        assert!(manifest_s.contains("\"rows\":3,"), "manifest: {manifest_s}");
+        assert_eq!(std::fs::metadata(format!("{stem_s}.tdat")).unwrap().len(), (3 * REC) as u64);
+        let mut ts = crate::trainer::Tdat::open(&stem_s).unwrap();
+        let mut out_s = Vec::new();
+        ts.read_block(0, 10, &mut out_s).unwrap();
+        assert_eq!(out_s.len(), 3);
+        for r in &out_s {
+            let ne = crate::mapper::board_of(r, 0).empty().count_ones();
+            assert!((4..=10).contains(&ne), "unexpected empties {ne}");
+        }
+
+        let mix_in = format!("{stem_s}:2,{stem_b}:2");
+        let args_m: Vec<String> = [
+            "--inputs", &mix_in, "--out", &stem_m, "--no-shuffle", "--force",
+        ].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run_mix(&args_m), ExitCode::SUCCESS);
+        let manifest_m = std::fs::read_to_string(format!("{stem_m}.manifest.json")).unwrap();
+        assert!(manifest_m.contains("\"rows\":4,"), "manifest: {manifest_m}");
+        assert_eq!(std::fs::metadata(format!("{stem_m}.tdat")).unwrap().len(), (4 * REC) as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -26,11 +26,13 @@ mod trainer;
 mod targets;
 mod gate;
 mod games;
+mod gamedata;
 mod sprt;
 mod spsa;
 mod train;
 mod policy;
 mod policy2;
+mod smallnet;
 mod bzupload;
 mod botzone;
 
@@ -71,6 +73,8 @@ fn main() -> ExitCode {
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
+        "bookprune" => games::run_bookprune(&args[1..]),
+        "pool" => games::run_pool(&args[1..]),
         "harvest" => games::run_harvest(&args[1..]),
         "coordinator" => run_coordinator(&args[1..]),
         "worker" => run_worker(&args[1..]),
@@ -92,6 +96,7 @@ fn print_help() {
          \x20 merge-check  Verify that a commit or net has a passing gate record against current main\n\
          \x20 insight      Per-move evaluation & phase breakdown on <log>.games.jsonl\n\
          \x20 analyze      Turning-point & blunder analysis on <log>.games.jsonl\n\
+         \x20 bookprune    Per-book-line decisiveness census; drop seat-decided lines into a pruned book\n\
          \x20 spsa         Multi-threaded SPSA search tuner\n\
          \x20 relabel      Zero-overhead persistent multi-threaded local relabeler\n\
          \x20 train        Bullet-style native Rust sparse-feature NNUE trainer\n\
@@ -106,16 +111,177 @@ fn print_help() {
 }
 
 fn run_relabel_local(args: &[String]) -> ExitCode {
+    if let Some(pol) = flag_str(args, "--policy") {
+        titanium::policy::configure(&pol);
+    }
+    let nodes = flag_u64(args, "--nodes").unwrap_or(5000);
+    let threads = resolve_threads(args);
+    let bz_rules = has_flag(args, "--bz");
+    let tt_bits = flag_u64(args, "--tt-bits").unwrap_or(18) as usize;
+    let net_spec = flag_str(args, "--net").unwrap_or_else(|| "bundled".into());
+    let force = has_flag(args, "--force");
+
+    if let Some(tdat_in) = flag_str(args, "--tdat") {
+        let Some(tdat_out) = flag_str(args, "--tdat-out") else {
+            eprintln!("relabel: --tdat-out <out_stem> is required with --tdat");
+            return ExitCode::FAILURE;
+        };
+        let out_file = format!("{tdat_out}.tdat");
+        if !force && Path::new(&out_file).exists() {
+            eprintln!("relabel: {out_file} exists (pass --force to overwrite)");
+            return ExitCode::FAILURE;
+        }
+        let owned_net = if net_spec == "bundled" {
+            None
+        } else {
+            match Nnue::load(&net_spec) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    eprintln!("relabel: load net {net_spec}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        let nn: &Nnue = owned_net.as_ref().unwrap_or_else(|| Nnue::bundled_static());
+        let mut t = match trainer::Tdat::open(&tdat_in) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("relabel: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(parent) = Path::new(&tdat_out).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("relabel: mkdir: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let tmp = format!("{tdat_out}.tdat.tmp");
+        let mut w = std::io::BufWriter::with_capacity(
+            1 << 20,
+            match fs::File::create(&tmp) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("relabel: create {tmp}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        );
+        let total = t.rows;
+        println!(
+            "=== TitaniumTest Persistent .tdat Relabeler ===\n\
+             Input    : {tdat_in}.tdat ({total} rows, {:.1} MB streaming)\n\
+             Output   : {out_file}\n\
+             Config   : {nodes} nodes/pos, {threads} threads, tt_bits={tt_bits}, bz={bz_rules}, net={net_spec}",
+            (total * data::REC) as f64 / 1_048_576.0
+        );
+        let t0 = Instant::now();
+        let mut done = 0usize;
+        let mut batch: Vec<data::Rec> = Vec::with_capacity(1 << 16);
+        while done < total {
+            batch.clear();
+            let take = (total - done).min(1 << 16);
+            if let Err(e) = t.read_block(done, take, &mut batch) {
+                eprintln!("relabel: read: {e}");
+                return ExitCode::FAILURE;
+            }
+            let scores: Vec<std::sync::atomic::AtomicI32> = (0..batch.len())
+                .map(|_| std::sync::atomic::AtomicI32::new(0))
+                .collect();
+            let next_idx = AtomicUsize::new(0);
+            let t_b = Instant::now();
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    let batch_ref = &batch;
+                    let scores_ref = &scores;
+                    let next_ref = &next_idx;
+                    sc.spawn(move || {
+                        let mut searcher = Searcher::with_tt_bits_unconfigured(tt_bits);
+                        searcher.set_nnue(Some(nn));
+                        let limits = SearchLimits {
+                            time: None,
+                            max_nodes: Some(nodes),
+                            max_depth: u8::MAX,
+                        };
+                        loop {
+                            let i = next_ref.fetch_add(16, Ordering::Relaxed);
+                            if i >= batch_ref.len() {
+                                break;
+                            }
+                            for j in i..(i + 16).min(batch_ref.len()) {
+                                let b = mapper::board_of(&batch_ref[j], 0);
+                                searcher.reset_for_new_game();
+                                let r = if bz_rules {
+                                    searcher.search_bz(&b, &limits)
+                                } else {
+                                    searcher.search(&b, &limits)
+                                };
+                                scores_ref[j].store(r.score, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            });
+            for (r, s_at) in batch.iter_mut().zip(scores.iter()) {
+                r.cp = s_at.load(Ordering::Relaxed) as f32;
+                r.relabel_src = 3;
+                if let Err(e) = w.write_all(&r.to_bytes()) {
+                    eprintln!("relabel: write: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            done += batch.len();
+            let dt = t_b.elapsed().as_secs_f64();
+            println!(
+                "[tdat {done:>8}/{total} ({:.1}%)] {} pos in {dt:.1}s ({:.0} pos/s, total {:.1}m)",
+                done as f64 * 100.0 / total.max(1) as f64,
+                batch.len(),
+                batch.len() as f64 / dt.max(1e-6),
+                t0.elapsed().as_secs_f64() / 60.0
+            );
+        }
+        if let Err(e) = w.flush() {
+            eprintln!("relabel: flush: {e}");
+            return ExitCode::FAILURE;
+        }
+        drop(w);
+        if fs::metadata(&out_file).is_ok() {
+            let _ = fs::remove_file(&out_file);
+        }
+        if let Err(e) = fs::rename(&tmp, &out_file) {
+            eprintln!("relabel: rename: {e}");
+            return ExitCode::FAILURE;
+        }
+        let desc = format!("relabel({tdat_in},nodes={nodes},bz={bz_rules},net={net_spec})");
+        if let Err(e) = data::write_tdat_manifest(&tdat_out, &desc, total) {
+            eprintln!("relabel: manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let Some(bin_path) = flag_str(args, "--bin") else {
-        eprintln!("relabel: --bin <dis_positions.bin> is required");
+        eprintln!("relabel: --bin <dis_positions.bin> or --tdat <stem> is required");
         return ExitCode::FAILURE;
     };
     let Some(out_dir) = flag_str(args, "--out") else {
         eprintln!("relabel: --out <out_dir> is required");
         return ExitCode::FAILURE;
     };
-    let nodes = flag_u64(args, "--nodes").unwrap_or(5000);
-    let threads = resolve_threads(args);
+    let owned_net = if net_spec == "bundled" {
+        None
+    } else {
+        match Nnue::load(&net_spec) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("relabel: load net {net_spec}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let nn: &Nnue = owned_net.as_ref().unwrap_or_else(|| Nnue::bundled_static());
 
     fs::create_dir_all(&out_dir).expect("relabel: create out_dir");
     let data = fs::read(&bin_path).unwrap_or_else(|e| panic!("relabel: read {bin_path}: {e}"));
@@ -140,7 +306,6 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
         todo_chunks.len()
     );
 
-    let nn = Nnue::bundled_static();
     let t0 = Instant::now();
     for (k, &cid) in todo_chunks.iter().enumerate() {
         let p_c = format!("{out_dir}/c_{cid}.txt");
@@ -160,7 +325,7 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                 let results_ref = &results;
                 let next_idx_ref = &next_idx;
                 sc.spawn(move || {
-                    let mut searcher = Searcher::with_tt_bits_unconfigured(18);
+                    let mut searcher = Searcher::with_tt_bits_unconfigured(tt_bits);
                     searcher.set_nnue(Some(nn));
                     let limits = SearchLimits {
                         time: None,
@@ -178,7 +343,7 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                             let u = |off: usize| u64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
                             let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
                             searcher.reset_for_new_game();
-                            let r = searcher.search(&b, &limits);
+                            let r = if bz_rules { searcher.search_bz(&b, &limits) } else { searcher.search(&b, &limits) };
                             *results_ref[j].lock().unwrap() = (r.score, r.depth, r.nodes);
                         }
                     }
@@ -220,6 +385,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("upscale") => return shrink::run_upscale(&args[1..]),
         Some("split") => return shrink::run_split(&args[1..]),
         Some("remap") => return shrink::run_remap(&args[1..]),
+        Some("smallnet") => return smallnet::run_smallnet(&args[1..]),
         Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {
@@ -868,48 +1034,50 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let cand_spec = normalize_engine_spec(&flag_str(args, "--candidate").unwrap_or_else(|| "self".to_string()));
     let raw_base_spec = normalize_engine_spec(&flag_str(args, "--baseline").unwrap_or_else(|| "main".to_string()));
     let non_main_ab = has_flag(args, "--non-main-ab");
-    let main_side = match gate::ensure_main_champion() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sprt: failed to verify/build `main` champion: {e}");
-            return ExitCode::FAILURE;
+    let need_main_side = !non_main_ab || raw_base_spec == "main" || raw_base_spec == "origin/main";
+    let main_side: Option<gate::Side> = if need_main_side {
+        match gate::ensure_main_champion() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("sprt: failed to verify/build `main` champion: {e}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        None
     };
     let base_spec = if raw_base_spec == "main" || raw_base_spec == "origin/main" {
+        let ms = main_side.as_ref().expect("main_side required when baseline=main");
         println!(
             "sprt: auto-resolved --baseline main -> {} (commit {}, bundled net {}, [{}])",
-            main_side.spec(),
-            main_side.commit,
-            main_side.net,
-            main_side.exe_sha
+            ms.spec(),
+            ms.commit,
+            ms.net,
+            ms.exe_sha
         );
-        main_side.spec()
+        ms.spec()
     } else {
-        let base_lbl = engine_label(&raw_base_spec);
-        let expected_lbl = format!("exe {}", main_side.exe_sha);
-        // D594: the verified main exe may carry resource-only flags (same engine, Botzone-like table size), e.g.
-        // `--tt-bits 22` via ti gate --base-args; anything else stays refused
-        let extra_ok = raw_base_spec
-            .trim()
-            .strip_prefix(main_side.spec().trim())
-            .map(|rest| {
-                let t: Vec<&str> = rest.split_whitespace().collect();
-                t.len() % 2 == 0 && t.chunks(2).all(|c| c[0] == "--tt-bits" && c[1].parse::<u32>().is_ok())
-            })
-            .unwrap_or(false);
-        let is_exact_main = base_lbl == expected_lbl && (raw_base_spec.trim() == main_side.spec().trim() || extra_ok);
-        if !is_exact_main && !non_main_ab {
-            eprintln!(
-                "sprt: REFUSED — --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
-                 \x20     Canonical `main` is commit {} (bundled net {}, [{}]): `{}`\n\
-                 \x20     Promotion gates MUST run against `main`: omit `--baseline` or pass `--baseline main`.\n\
-                 \x20     For an internal A/B test between two experimental builds, pass `--non-main-ab` explicitly (and NEVER call its result 'vs main').",
-                main_side.commit,
-                main_side.net,
-                expected_lbl,
-                main_side.spec()
-            );
-            return ExitCode::FAILURE;
+        if let Some(ms) = main_side.as_ref() {
+            let base_lbl = engine_label(&raw_base_spec);
+            let expected_lbl = format!("exe {}", ms.exe_sha);
+            // D594/D691: the verified main exe may carry resource-only flags (e.g. `--tt-bits 22`)
+            // and `--bz` strictly under `--rules botzone`; anything else stays refused.
+            let is_bz_rules = flag_str(args, "--rules").as_deref() == Some("botzone");
+            let extra_ok = main_extra_args_ok(&raw_base_spec, &ms.spec(), is_bz_rules);
+            let is_exact_main = base_lbl == expected_lbl && (raw_base_spec.trim() == ms.spec().trim() || extra_ok);
+            if !is_exact_main {
+                eprintln!(
+                    "sprt: REFUSED — --baseline '{raw_base_spec}' [{base_lbl}] is NOT the verified `main` champion!\n\
+                     \x20     Canonical `main` is commit {} (bundled net {}, [{}]): `{}`\n\
+                     \x20     Promotion gates MUST run against `main`: omit `--baseline` or pass `--baseline main`.\n\
+                     \x20     For an internal A/B test between two experimental builds, pass `--non-main-ab` explicitly (and NEVER call its result 'vs main').",
+                    ms.commit,
+                    ms.net,
+                    expected_lbl,
+                    ms.spec()
+                );
+                return ExitCode::FAILURE;
+            }
         }
         raw_base_spec
     };
@@ -1010,8 +1178,8 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
         engine_label(&cand_spec),
         base_spec,
         engine_label(&base_spec),
-        if non_main_ab { "custom" } else { &main_side.commit },
-        if non_main_ab { "custom" } else { &main_side.net },
+        main_side.as_ref().filter(|_| !non_main_ab).map(|m| m.commit.as_str()).unwrap_or("custom"),
+        main_side.as_ref().filter(|_| !non_main_ab).map(|m| m.net.as_str()).unwrap_or("custom"),
         book_path,
         hash::file_label(&book_path),
         book0,
@@ -1901,6 +2069,34 @@ mod thought_tests {
         assert!(!j.contains('\n'));
         assert!(j.contains("\"book\":7") && j.contains("\"score\":12") && j.contains("\"mate\":null") && j.contains("\\\"x\\\""));
     }
+
+    #[test]
+    fn main_extra_args_allows_bz_only_under_botzone_rules() {
+        let base = "C:/gitProjects/_gate/exes/titanium-bfec1623.exe serve";
+        assert!(main_extra_args_ok(&format!("{base} --tt-bits 22"), base, false));
+        assert!(!main_extra_args_ok(&format!("{base} --bz --tt-bits 22"), base, false));
+        assert!(main_extra_args_ok(&format!("{base} --bz --tt-bits 22"), base, true));
+        assert!(main_extra_args_ok(&format!("{base} --tt-bits 22 --bz"), base, true));
+        assert!(!main_extra_args_ok(&format!("{base} --bz --no-fut-sn"), base, true));
+    }
+}
+
+fn main_extra_args_ok(raw_base_spec: &str, canonical_main_spec: &str, is_bz_rules: bool) -> bool {
+    let Some(rest) = raw_base_spec.trim().strip_prefix(canonical_main_spec.trim()) else {
+        return false;
+    };
+    let t: Vec<&str> = rest.split_whitespace().collect();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] == "--tt-bits" && i + 1 < t.len() && t[i + 1].parse::<u32>().is_ok() {
+            i += 2;
+        } else if is_bz_rules && t[i] == "--bz" {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// UAI mate distance in MOVES for a mate score (`MATE - plies` = side to move wins in `plies`), None otherwise.
