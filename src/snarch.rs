@@ -70,9 +70,74 @@ struct Ext {
     mv: bool,
     ent: bool,
     h1: bool,
+    /// D861 (user): move-source tuple: the 8-neighbour pattern of the square a JUMP left (the hole) or of a CLONE's
+    /// destination, plus (mover pieces bordering it x can the side to move reach it) = the weakness the move created
+    src: bool,
+    /// D863 (user H12) move-relative input: every stone / empty within Chebyshev radius `rel` of the move square(s), as
+    /// (role clone-dest / jump-dest / jump-source) x (offset from that square) x (mover / side to move / empty / blocked);
+    /// 0 = off, "+rel" = radius 2 (the Ataxx move range), "+relf" = radius 6 (the whole board)
+    rel: u8,
 }
 
 const HMAX: usize = 48;
+const REL_ROLES: usize = 3;
+const REL_ST: usize = 4;
+fn rel_noff(r: u8) -> usize {
+    let d = 2 * r as usize + 1;
+    d * d
+}
+fn rel_half(r: u8) -> usize {
+    REL_ROLES * rel_noff(r) * REL_ST
+}
+/// D863 +rel rows of a child (indices within one perspective half), pushed onto `out` with offset `base`; returns the count.
+fn rel_rows(s: &Sample, r: u8, base: usize, out: &mut Vec<u32>) -> usize {
+    let left = s.popp & !s.opp;
+    let dest = s.opp & !s.popp & !s.pown;
+    if dest.count_ones() != 1 || r == 0 {
+        return 0;
+    }
+    let jump = left != 0;
+    let mut anchors = [(0usize, 0usize); 2];
+    let mut na = 0;
+    anchors[na] = (if jump { 1 } else { 0 }, dest.trailing_zeros() as usize);
+    na += 1;
+    if jump {
+        anchors[na] = (2, left.trailing_zeros() as usize);
+        na += 1;
+    }
+    let ri = r as i32;
+    let d = 2 * ri + 1;
+    let n0 = out.len();
+    for &(role, a) in &anchors[..na] {
+        let (ar, ac) = ((a / 7) as i32, (a % 7) as i32);
+        for dr in -ri..=ri {
+            for dc in -ri..=ri {
+                let (rr, cc) = (ar + dr, ac + dc);
+                if (dr, dc) == (0, 0) || !(0..7).contains(&rr) || !(0..7).contains(&cc) {
+                    continue;
+                }
+                let q = (rr * 7 + cc) as usize;
+                let st = if s.opp >> q & 1 == 1 {
+                    0
+                } else if s.own >> q & 1 == 1 {
+                    1
+                } else if s.blk >> q & 1 == 1 {
+                    3
+                } else {
+                    2
+                };
+                let off = ((dr + ri) * d + (dc + ri)) as usize;
+                out.push((base + (role * rel_noff(r) + off) * REL_ST + st) as u32);
+            }
+        }
+    }
+    out.len() - n0
+}
+/// D861 +src: 3^8 neighbour patterns per kind (clone dest / jump source) + 2 kinds x 9 adjacent-mover counts x 3 reach classes
+const SRC_PAT: usize = 6561;
+const SRC_CNT: usize = 54;
+const SRC_HALF: usize = 2 * SRC_PAT + SRC_CNT;
+const SRC_NF: usize = 2 * SRC_HALF;
 const DIS_BINS: usize = 16;
 const MV_ROWS: usize = 18;
 const ENT_BINS: usize = 16;
@@ -89,6 +154,9 @@ impl Ext {
                 "mv" => e.mv = true,
                 "ent" => e.ent = true,
                 "h1" => e.h1 = true,
+                "src" => e.src = true,
+                "rel" => e.rel = 2,
+                "relf" => e.rel = 6,
                 _ => return Err(format!("unknown input group +{p} in {s}")),
             }
         }
@@ -96,21 +164,125 @@ impl Ext {
     }
     fn suffix(self) -> String {
         let mut s = String::new();
-        for (on, n) in [(self.pol, "+pol"), (self.dis, "+dis"), (self.mv, "+mv"), (self.ent, "+ent"), (self.h1, "+h1")] {
+        for (on, n) in [(self.pol, "+pol"), (self.dis, "+dis"), (self.mv, "+mv"), (self.ent, "+ent"), (self.h1, "+h1"), (self.src, "+src")] {
             if on {
                 s.push_str(n);
             }
+        }
+        match self.rel {
+            0 => {}
+            2 => s.push_str("+rel"),
+            r => s.push_str(&format!("+rel{r}")),
         }
         s
     }
     /// extra accumulator rows (both perspectives)
     fn nf(self) -> usize {
-        (if self.pol { POL_NF } else { 0 }) + (if self.dis { 2 * DIS_BINS } else { 0 }) + (if self.mv { 2 * MV_ROWS } else { 0 }) + (if self.ent { 4 * ENT_BINS } else { 0 })
+        (if self.pol { POL_NF } else { 0 }) + (if self.dis { 2 * DIS_BINS } else { 0 }) + (if self.mv { 2 * MV_ROWS } else { 0 }) + (if self.ent { 4 * ENT_BINS } else { 0 }) + (if self.src { SRC_NF } else { 0 }) + 2 * rel_half(self.rel) * (self.rel > 0) as usize
     }
     /// extra row updates per child per perspective in the engine (h1 is per node: 0 per child)
     fn touched(self) -> usize {
-        2 * self.pol as usize + self.dis as usize + self.mv as usize + 2 * self.ent as usize
+        2 * self.pol as usize + self.dis as usize + self.mv as usize + 2 * self.ent as usize + 2 * self.src as usize
     }
+}
+
+/// All squares at Chebyshev distance 1..=d of `sq` (d = 1: clone reach, d = 2: clone + jump reach).
+fn ring_mask(sq: usize, d: i32) -> u64 {
+    let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
+    let mut m = 0u64;
+    for dr in -d..=d {
+        for dc in -d..=d {
+            let (rr, cc) = (r + dr, c + dc);
+            if (dr, dc) != (0, 0) && (0..7).contains(&rr) && (0..7).contains(&cc) {
+                m |= 1u64 << (rr * 7 + cc);
+            }
+        }
+    }
+    m
+}
+
+/// The 8 neighbours of `sq` in fixed order (row-major, centre skipped); None = off the board.
+fn nb8(sq: usize) -> [Option<usize>; 8] {
+    let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
+    let mut o = [None; 8];
+    let mut k = 0;
+    for dr in -1..=1 {
+        for dc in -1..=1 {
+            if (dr, dc) == (0, 0) {
+                continue;
+            }
+            let (rr, cc) = (r + dr, c + dc);
+            o[k] = if (0..7).contains(&rr) && (0..7).contains(&cc) { Some((rr * 7 + cc) as usize) } else { None };
+            k += 1;
+        }
+    }
+    o
+}
+
+/// Base-3 code of a list of cells: 0 = empty / blocked / off-board, 1 = `us`, 2 = `them` (same states as the 2x2 windows).
+fn code3(cells: impl Iterator<Item = Option<usize>>, us: u64, them: u64) -> usize {
+    let mut c = 0;
+    let mut p = 1;
+    for q in cells {
+        let s = match q {
+            Some(q) if us >> q & 1 == 1 => 1,
+            Some(q) if them >> q & 1 == 1 => 2,
+            _ => 0,
+        };
+        c += s * p;
+        p *= 3;
+    }
+    c
+}
+
+/// D861 +src rows of a child: (pattern index in 0..2*SRC_PAT, count index in 0..SRC_CNT), None for a pass.
+/// The mover is the child's OPPONENT (`opp`). Jump: the square it left (popp & !opp); clone: its destination.
+/// Pattern = the 8 neighbours as 0 empty / 1 mover / 2 side to move; count = mover pieces bordering the square x reach
+/// (2 = the side to move can clone there, 1 = only jump there, 0 = cannot reach it).
+fn src_rows(s: &Sample) -> Option<(usize, usize)> {
+    let left = s.popp & !s.opp;
+    let dest = s.opp & !s.popp & !s.pown;
+    if dest.count_ones() != 1 {
+        return None;
+    }
+    let jump = left != 0;
+    let sq = if jump { left.trailing_zeros() as usize } else { dest.trailing_zeros() as usize };
+    let pat = code3(nb8(sq).into_iter(), s.opp, s.own);
+    let adj = (ring_mask(sq, 1) & s.opp).count_ones() as usize;
+    let reach = if ring_mask(sq, 1) & s.own != 0 { 2 } else if ring_mask(sq, 2) & s.own != 0 { 1 } else { 0 };
+    Some((jump as usize * SRC_PAT + pat, jump as usize * 27 + adj * 3 + reach))
+}
+
+/// D861 (user) "artificial 3x3": per centre square a CROSS (centre + N S W E) and an X (centre + 4 diagonals), 5 cells each.
+const NX3: usize = 49 * 2;
+const X3S: usize = 243;
+fn x3_cells(k: usize) -> [Option<usize>; 5] {
+    let c = k / 2;
+    let (r, col) = ((c / 7) as i32, (c % 7) as i32);
+    let d: [(i32, i32); 4] = if k % 2 == 0 { [(-1, 0), (1, 0), (0, -1), (0, 1)] } else { [(-1, -1), (-1, 1), (1, -1), (1, 1)] };
+    let mut o = [Some(c), None, None, None, None];
+    for (i, (dr, dc)) in d.iter().enumerate() {
+        let (rr, cc) = (r + dr, col + dc);
+        if (0..7).contains(&rr) && (0..7).contains(&cc) {
+            o[i + 1] = Some((rr * 7 + cc) as usize);
+        }
+    }
+    o
+}
+fn x3_mask(k: usize) -> u64 {
+    x3_cells(k).iter().flatten().fold(0u64, |m, &s| m | 1u64 << s)
+}
+
+/// D861 (user) full 3x3 windows: 25 overlapping windows x 3^9 states.
+const NW3: usize = 25;
+const W3S: usize = 19683;
+fn w3_squares(w: usize) -> [usize; 9] {
+    let (i, j) = (w / 5, w % 5);
+    let a = i * 7 + j;
+    [a, a + 1, a + 2, a + 7, a + 8, a + 9, a + 14, a + 15, a + 16]
+}
+fn w3_mask(w: usize) -> u64 {
+    w3_squares(w).iter().fold(0u64, |m, &s| m | 1u64 << s)
 }
 
 fn dis_bin(d: i16) -> usize {
@@ -147,6 +319,10 @@ enum Arch {
     DSq,
     DW2,
     DW2Sq,
+    /// D861 (user): cross + X per centre (artificial 3x3)
+    X3,
+    /// D861 (user): full 3x3 windows
+    W3,
 }
 
 impl Arch {
@@ -159,6 +335,8 @@ impl Arch {
             "dsq" => Arch::DSq,
             "dw2" => Arch::DW2,
             "dw2sq" => Arch::DW2Sq,
+            "x3" => Arch::X3,
+            "w3" => Arch::W3,
             _ => return None,
         })
     }
@@ -171,12 +349,14 @@ impl Arch {
             Arch::DSq => "dsq",
             Arch::DW2 => "dw2",
             Arch::DW2Sq => "dw2sq",
+            Arch::X3 => "x3",
+            Arch::W3 => "w3",
         }
     }
     /// The full-child-input part of a design (None for pure delta) and whether it carries the delta block (D835).
     fn split(self) -> (Option<Arch>, bool) {
         match self {
-            Arch::Sq | Arch::W2 | Arch::W2Sq => (Some(self), false),
+            Arch::Sq | Arch::W2 | Arch::W2Sq | Arch::X3 | Arch::W3 => (Some(self), false),
             Arch::Delta => (None, true),
             Arch::DSq => (Some(Arch::Sq), true),
             Arch::DW2 => (Some(Arch::W2), true),
@@ -189,6 +369,8 @@ impl Arch {
             Some(Arch::Sq) => 147,
             Some(Arch::W2) => NWIN * WSTATES,
             Some(Arch::W2Sq) => NWIN * WSTATES + 147,
+            Some(Arch::X3) => NX3 * X3S,
+            Some(Arch::W3) => NW3 * W3S,
             _ => 0,
         };
         b + if d { DELTA_NF } else { 0 }
@@ -200,6 +382,8 @@ impl Arch {
             Some(Arch::Sq) => 25.0,
             Some(Arch::W2) => 36.0,
             Some(Arch::W2Sq) => 61.0,
+            Some(Arch::X3) => NX3 as f32,
+            Some(Arch::W3) => NW3 as f32,
             _ => 0.0,
         };
         b + if d { 24.0 } else { 0.0 }
@@ -279,6 +463,16 @@ fn feats(arch: Arch, us: u64, them: u64, blk: u64, pus: u64, pthem: u64, out: &m
                 sq(out, off + NWIN * WSTATES);
             }
         }
+        Some(Arch::X3) => {
+            for k in 0..NX3 {
+                out.push((off + k * X3S + code3(x3_cells(k).into_iter(), us, them)) as u32);
+            }
+        }
+        Some(Arch::W3) => {
+            for w in 0..NW3 {
+                out.push((off + w * W3S + code3(w3_squares(w).into_iter().map(Some), us, them)) as u32);
+            }
+        }
         _ => {}
     }
 }
@@ -292,6 +486,8 @@ struct Model {
     o_dis: usize,
     o_mv: usize,
     o_ent: usize,
+    o_src: usize,
+    o_rel: usize,
     nb: usize,
     p: Vec<f32>,
     o_ftb: usize,
@@ -336,8 +532,10 @@ impl Model {
         let o_dis = o_pol + if ext.pol { POL_NF } else { 0 };
         let o_mv = o_dis + if ext.dis { 2 * DIS_BINS } else { 0 };
         let o_ent = o_mv + if ext.mv { 2 * MV_ROWS } else { 0 };
+        let o_src = o_ent + if ext.ent { 4 * ENT_BINS } else { 0 };
+        let o_rel = o_src + if ext.src { SRC_NF } else { 0 };
         let nf = pol_off + ext.nf();
-        debug_assert_eq!(o_ent + if ext.ent { 4 * ENT_BINS } else { 0 }, nf);
+        debug_assert_eq!(o_rel + if ext.rel > 0 { 2 * rel_half(ext.rel) } else { 0 }, nf);
         let o_ftb = nf * W;
         let o_l1w = o_ftb + W;
         let o_l1b = o_l1w + nb * H * D2;
@@ -371,7 +569,7 @@ impl Model {
         for k in 0..nb {
             p[o_sk + k] = 0.8;
         }
-        Model { arch, ext, o_pol, o_dis, o_mv, o_ent, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, o_wh, np }
+        Model { arch, ext, o_pol, o_dis, o_mv, o_ent, o_src, o_rel, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, o_wh, np }
     }
 
     fn name(&self) -> String {
@@ -415,6 +613,21 @@ impl Model {
             fu.push((self.o_ent + ENT_BINS + t1) as u32);
             ft.push((self.o_ent + 2 * ENT_BINS + en) as u32);
             ft.push((self.o_ent + 3 * ENT_BINS + t1) as u32);
+        }
+        if e.src {
+            // D861: the move-source tuple (pattern + count row), separate tables per perspective half
+            if let Some((pt, ct)) = src_rows(s) {
+                let (o, o2) = (self.o_src, self.o_src + SRC_HALF);
+                fu.push((o + pt) as u32);
+                fu.push((o + 2 * SRC_PAT + ct) as u32);
+                ft.push((o2 + pt) as u32);
+                ft.push((o2 + 2 * SRC_PAT + ct) as u32);
+            }
+        }
+        if e.rel > 0 {
+            // D863: move-relative rows, separate tables per perspective half
+            rel_rows(s, e.rel, self.o_rel, &mut fu);
+            rel_rows(s, e.rel, self.o_rel + rel_half(e.rel), &mut ft);
         }
         let mut a = [0f32; D2];
         a[..W].copy_from_slice(&p[self.o_ftb..self.o_ftb + W]);
@@ -626,6 +839,8 @@ fn touched(arch: Arch, s: &Sample) -> usize {
         Some(Arch::Sq) => sq_ops,
         Some(Arch::W2) => 2 * cw,
         Some(Arch::W2Sq) => 2 * cw + sq_ops,
+        Some(Arch::X3) => 2 * (0..NX3).filter(|&k| x3_mask(k) & changed != 0).count(),
+        Some(Arch::W3) => 2 * (0..NW3).filter(|&w| w3_mask(w) & changed != 0).count(),
         _ => 0,
     };
     b + if delta { 2 * cw } else { 0 }
@@ -697,7 +912,9 @@ fn report(m: &Model, a: &[Sample], b: &[Sample], tau: f64) -> Report {
         let mut fu = Vec::new();
         feats(m.arch, s.own, s.opp, s.blk, s.pown, s.popp, &mut fu);
         rows += fu.len() as f64;
-        tch += (touched(m.arch, s) + m.ext.touched()) as f64;
+        // D863: +rel rows have no parent accumulator to reuse: every active rel row is a row op
+        let rel_n = if m.ext.rel > 0 { rel_rows(s, m.ext.rel, 0, &mut Vec::new()) } else { 0 };
+        tch += (touched(m.arch, s) + m.ext.touched() + rel_n) as f64;
     }
     sl.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let q = |p: f64| sl[((p * nb) as usize).min(sl.len().saturating_sub(1))];
@@ -1075,9 +1292,9 @@ mod tests {
     // D847: a +pol model must be EXACTLY its control at step 0 (zero policy rows + zero policy skip, same RNG stream)
     #[test]
     fn pol_model_equals_control_at_init() {
-        for arch in [Arch::Sq, Arch::W2, Arch::DW2Sq] {
+        for arch in [Arch::Sq, Arch::W2, Arch::DW2Sq, Arch::X3] {
             let a = Model::new(arch, 8, 3, Ext::default());
-            let b = Model::new(arch, 8, 3, Ext { pol: true, dis: true, mv: true, ent: true, h1: true });
+            let b = Model::new(arch, 8, 3, Ext { pol: true, dis: true, mv: true, ent: true, h1: true, src: true, rel: 2 });
             for (i, s) in [samp(0, 1 | 1 << 8, 1, 0), samp(1 << 20 | 1 << 21, 1 << 30, 1 << 20, 1 << 30 | 1 << 21)].iter().enumerate() {
                 let mut s = *s;
                 s.parent = 123;
@@ -1090,8 +1307,75 @@ mod tests {
                 s.h = [37; HMAX];
                 assert_eq!(a.forward(&s).y.to_bits(), b.forward(&s).y.to_bits(), "{arch:?} sample {i}");
             }
-            assert_eq!(b.np - a.np, (POL_NF + 2 * DIS_BINS + 2 * MV_ROWS + 4 * ENT_BINS) * W + 2 * HMAX * W);
+            assert_eq!(b.np - a.np, (POL_NF + 2 * DIS_BINS + 2 * MV_ROWS + 4 * ENT_BINS + SRC_NF + 2 * rel_half(2)) * W + 2 * HMAX * W);
         }
+    }
+
+    #[test]
+    fn rel_rows_match_hand() {
+        // clone to b2 (8, row 1 col 1): radius 2 on the board = rows 0..3 x cols 0..3 = 16 cells minus the centre = 15 rows;
+        // a1 (0) is the mover's stone at offset (-1,-1) -> offset index (1*5+1) = 6, role 0, state 0 -> row (0*25+6)*4+0 = 24
+        let s = samp(0, 1 | 1 << 8, 1, 0);
+        let mut v = Vec::new();
+        assert_eq!(rel_rows(&s, 2, 0, &mut v), 15);
+        assert!(v.contains(&24));
+        assert!(v.iter().all(|&x| (x as usize) < rel_half(2)));
+        // jump a1 (0) -> c3 (16): dest role 1 at row 2 col 2 = 5x5 - 1 = 24 rows; source role 2 at the corner = 3x3 - 1 = 8 rows
+        let j = samp(1 << 14, 1 << 16, 1 << 14, 1);
+        let mut v = Vec::new();
+        assert_eq!(rel_rows(&j, 2, 0, &mut v), 32);
+        // a3 (14) seen from the hole a1 at offset (+2, 0) -> offset (4*5+2) = 22, role 2, side to move (state 1)
+        assert!(v.contains(&(((2 * 25 + 22) * 4 + 1) as u32)));
+        // whole-board radius: the clone destination b2 sees all 48 other squares
+        assert_eq!(rel_rows(&s, 6, 0, &mut Vec::new()), 48);
+    }
+
+    // D861: hand-worked shapes of the artificial 3x3 (cross + X) and the full 3x3 windows
+    #[test]
+    fn x3_and_w3_cells() {
+        // square 24 (row 3, col 3): cross = centre, N 17, S 31, W 23, E 25; X = centre, NW 16, NE 18, SW 30, SE 32
+        assert_eq!(x3_cells(48), [Some(24), Some(17), Some(31), Some(23), Some(25)]);
+        assert_eq!(x3_cells(49), [Some(24), Some(16), Some(18), Some(30), Some(32)]);
+        // corner a1 = square 0: cross has only S (7) and E (1); X only SE (8)
+        assert_eq!(x3_cells(0), [Some(0), None, Some(7), None, Some(1)]);
+        assert_eq!(x3_cells(1), [Some(0), None, None, None, Some(8)]);
+        assert_eq!(w3_squares(0), [0, 1, 2, 7, 8, 9, 14, 15, 16]);
+        assert_eq!(w3_squares(24), [32, 33, 34, 39, 40, 41, 46, 47, 48]);
+        // codes stay inside their state range
+        let all = (1u64 << 49) - 1;
+        assert!(code3(x3_cells(48).into_iter(), all, 0) < X3S);
+        assert!(code3(w3_squares(12).into_iter().map(Some), 0, all) < W3S);
+        assert_eq!(code3(w3_squares(12).into_iter().map(Some), 0, all), W3S - 1);
+    }
+
+    #[test]
+    fn touched_x3_w3_match_hand() {
+        // same move as touched_counts_match_hand: changed squares a1 (0) and b2 (8)
+        let s = samp(0, 1 | 1 << 8, 1, 0);
+        // crosses containing 0: centres 0, 1, 7; containing 8: centres 8, 1, 7, 9, 15 -> {0,1,7,8,9,15} = 6
+        // X shapes containing 0: centres 0, 8; containing 8: centres 8, 0, 2, 14, 16 -> {0,2,8,14,16} = 5 -> 11 shapes x 2
+        assert_eq!(touched(Arch::X3, &s), 22);
+        // 3x3 windows containing 0: (0,0); containing 8: (0,0),(0,1),(1,0),(1,1) -> 4 windows x 2
+        assert_eq!(touched(Arch::W3, &s), 8);
+    }
+
+    #[test]
+    fn src_rows_match_hand() {
+        // clone: the mover (child opp) had nothing, clones to b2 (8) and converts a1 (0). Neighbours of b2 in order
+        // [a1, b1, c1, a2, c2, a3, b3, c3]: only a1 = mover -> pattern 1; 1 mover piece borders b2; the side to move has no
+        // stones -> reach 0 -> count 0*27 + 1*3 + 0 = 3
+        let s = samp(0, 1 | 1 << 8, 1, 0);
+        assert_eq!(src_rows(&s), Some((1, 3)));
+        // jump: the mover jumps a1 (0) -> c3 (16), no flips; the side to move has a3 (14): distance 2 from a1 (jump reach)
+        let j = samp(1 << 14, 1 << 16, 1 << 14, 1);
+        // neighbours of a1: only b1 (1), a2 (7), b2 (8) are on the board, all empty -> pattern 0; 0 mover pieces border it
+        assert_eq!(src_rows(&j), Some((SRC_PAT, 27 + 0 * 3 + 1)));
+        // the side to move on b1 (1) = adjacent to the hole -> clone reach 2; b1 is neighbour index 4 (3 off-board above,
+        // 1 off-board left) with state 2 -> pattern 2 * 3^4 = 162
+        let j2 = samp(1 << 1, 1 << 16, 1 << 1, 1);
+        assert_eq!(src_rows(&j2), Some((SRC_PAT + 162, 27 + 2)));
+        // a pass (nothing changed) has no move square
+        assert_eq!(src_rows(&samp(1, 2, 1, 2)), None);
     }
 
     #[test]
