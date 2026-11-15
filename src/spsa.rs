@@ -196,7 +196,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .args(["sprt", "--candidate", &cmd(&plus), "--baseline", &cmd(&minus)])
             .args(["--book", &book, "--book0", &(book0 + k * pairs).to_string(), "--nodes", &nd.to_string()])
             .args(["--max-games", &(pairs * 2).to_string(), "--threads", &threads.to_string()])
-            .args(["--elo0", "-1000", "--elo1", "1000"])
+            .args(["--elo0", "-1000", "--elo1", "1000", "--non-main-ab"])
             .output()
             .map_err(|e| format!("sprt child: {e}"))?;
         let text = String::from_utf8_lossy(&o.stdout).to_string();

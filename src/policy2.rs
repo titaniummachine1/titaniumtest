@@ -8,6 +8,12 @@
 //!
 //!   ti policy2 --net NET.tnn --games a.jsonl,.. --kata DIR[,DIR] --pat k3c --init POL.bin --out-bin OUT.bin
 //!              [--max-epochs 30] [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 1]
+//!              [--adv-lambda L [--adv-scale 0.10] [--adv-clip 1]]
+//!
+//! `--adv-lambda L` (D765, off by default): weight every game move by exp(clip(advantage / scale, +-clip)), where
+//! advantage = TD(L) return that followed the move - the mover's own logged score, in win-probability units. The
+//! weights are scaled to mean 1. Needs game logs with a score per move (gate logs, `ti gen` output). Validation
+//! numbers stay unweighted, so runs with and without it are comparable.
 use crate::games;
 use crate::policy::{arg, feats, k3code, npz_files, patidx, ring1, NONE, NSCAL, P3, SLOTS};
 use std::fs;
@@ -28,12 +34,161 @@ struct S {
     kn: u8,
     val: bool,
     ko: u32,
+    /// loss weight of a hard (game move) sample: 1, or the advantage weight of `--adv-lambda` (D765)
+    aw: f32,
+    /// what followed the move in its game: 1 = advantage above +0.02, 2 = below -0.02, 0 = unknown / in between
+    up: u8,
+}
+
+/// Advantage of each played move of a game (D765): `G_t - V_t` from the mover's view, in win-probability units.
+/// `V_t` = sigmoid(the mover's logged score / 400). `G_t` = the TD(lambda) return over the LATER positions' values
+/// and the game result, i.e. the value that actually followed the move. `None` where the ply has no logged score.
+fn move_advantages(g: &games::Game, boards: &[Board], lambda: f32) -> Vec<Option<f32>> {
+    let n = g.moves.len().min(boards.len());
+    let sig = |cp: i32| 1.0 / (1.0 + (-(cp.clamp(-1500, 1500) as f32) / 400.0).exp());
+    // everything from side 0's (x) view
+    let vx: Vec<Option<f32>> = (0..n).map(|t| g.moves[t].score.map(|s| if boards[t].turn == 0 { sig(s) } else { 1.0 - sig(s) })).collect();
+    let zx = if g.cand_seat == "x" { g.cand_points as f32 } else { 1.0 - g.cand_points as f32 };
+    let mut out = vec![None; n];
+    let mut ret = zx;
+    for t in (0..n).rev() {
+        let next = if t + 1 < n { vx[t + 1] } else { Some(zx) };
+        if let Some(v) = next {
+            ret = (1.0 - lambda) * v + lambda * ret;
+        }
+        if let Some(v) = vx[t] {
+            out[t] = Some(if boards[t].turn == 0 { ret - v } else { v - ret });
+        }
+    }
+    out
+}
+
+/// D537 jump ring: the 16 cells at distance 2 around a destination as 4 sides of 4 cells (clockwise, N E S W), base 3,
+/// first cell most significant, 0 = empty or off-board, 1 = mover, 2 = opponent. MUST match the engine (policy.rs TPOL4).
+pub(crate) const RING_SIDES: [[(i32, i32); 4]; 4] = [
+    [(-2, -2), (-2, -1), (-2, 0), (-2, 1)],
+    [(-2, 2), (-1, 2), (0, 2), (1, 2)],
+    [(2, 2), (2, 1), (2, 0), (2, -1)],
+    [(2, -2), (1, -2), (0, -2), (-1, -2)],
+];
+pub(crate) const RING_N: usize = 49 * 2 * 4 * 81;
+
+const fn file_mask(f: usize) -> u64 {
+    let mut m = 0u64;
+    let mut r = 0usize;
+    while r < 7 {
+        m |= 1u64 << (r * 7 + f);
+        r += 1;
+    }
+    m
+}
+const FULL49: u64 = (1u64 << 49) - 1;
+const FILE_A: u64 = file_mask(0);
+const FILE_G: u64 = file_mask(6);
+pub(crate) const NSEE_BASE: usize = 18 * 19; // my_diff (0..17) x opp_state (0=stalemate, 1..18=1+max_opp_diff)
+
+#[inline(always)]
+fn box1(x: u64) -> u64 {
+    let h = x | ((x & !FILE_A) >> 1) | ((x & !FILE_G) << 1);
+    (h | (h >> 7) | (h << 7)) & FULL49
+}
+
+#[inline(always)]
+fn victim_planes(v: u64) -> [u64; 4] {
+    let s0 = (v >> 1) & !FILE_G;
+    let s1 = (v << 1) & !FILE_A;
+    let s2 = v >> 7;
+    let s3 = (v << 7) & FULL49;
+    let s4 = (v >> 8) & !FILE_G;
+    let s5 = (v << 8) & !FILE_A & FULL49;
+    let s6 = (v >> 6) & !FILE_A;
+    let s7 = (v << 6) & !FILE_G & FULL49;
+    let t0 = s0 ^ s1 ^ s2;
+    let c0 = (s0 & s1) | (s2 & (s0 ^ s1));
+    let t1 = s3 ^ s4 ^ s5;
+    let c1 = (s3 & s4) | (s5 & (s3 ^ s4));
+    let t2 = s6 ^ s7;
+    let c2 = s6 & s7;
+    let ones = t0 ^ t1 ^ t2;
+    let k0 = (t0 & t1) | (t2 & (t0 ^ t1));
+    let u0 = c0 ^ c1 ^ c2;
+    let uc = (c0 & c1) | (c2 & (c0 ^ c1));
+    [ones, u0 ^ k0, uc ^ (u0 & k0), uc & (u0 & k0)]
+}
+
+#[inline(always)]
+fn planes_add(p: &mut [u64; 4], m: u64) {
+    let c0 = p[0] & m;
+    p[0] ^= m;
+    let c1 = p[1] & c0;
+    p[1] ^= c0;
+    let c2 = p[2] & c1;
+    p[2] ^= c1;
+    p[3] ^= c2;
+}
+
+#[inline(always)]
+fn planes_sub(p: &mut [u64; 4], m: u64) {
+    let b0 = !p[0] & m;
+    p[0] ^= m;
+    let b1 = !p[1] & b0;
+    p[1] ^= b0;
+    let b2 = !p[2] & b1;
+    p[2] ^= b1;
+    p[3] ^= b2;
+}
+
+#[inline(always)]
+fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
+    let mut m = cand;
+    let mut best = 0u32;
+    for k in (0..4).rev() {
+        let x = m & p[k];
+        if x != 0 {
+            best |= 1 << k;
+            m = x;
+        }
+    }
+    best
+}
+
+/// Exact 1-ply opponent reply differential state after our move:
+/// 0 = opponent has no legal moves; 1..=18 = 1 + max_opp_diff (0..=17).
+#[inline(always)]
+fn opp_state(b1_empty: u64, b2_empty: u64, p: &[u64; 4]) -> usize {
+    if b2_empty == 0 {
+        return 0;
+    }
+    let cl = if b1_empty != 0 { 1 + 2 * planes_max(b1_empty, p) } else { 0 };
+    let jp = 2 * planes_max(b2_empty, p);
+    1 + cl.max(jp) as usize
+}
+
+/// ring table index of side `k` for a move to `to` (clone/jump), relative to the start of the ring block
+pub(crate) fn ring_idx(me: u64, opp: u64, to: u8, jump: bool, k: usize) -> u32 {
+    let (r, c) = ((to / 7) as i32, (to % 7) as i32);
+    let mut code = 0u32;
+    for &(dr, dc) in &RING_SIDES[k] {
+        let (rr, cc) = (r + dr, c + dc);
+        let d = if (0..7).contains(&rr) && (0..7).contains(&cc) {
+            let bit = 1u64 << (rr * 7 + cc);
+            if me & bit != 0 { 1 } else if opp & bit != 0 { 2 } else { 0 }
+        } else {
+            0
+        };
+        code = code * 3 + d;
+    }
+    (((to as u32 * 2 + jump as u32) * 4 + k as u32) * 81) + code
 }
 
 struct Scratch {
     ml: MoveList,
     mv: Vec<[u8; 5]>,
     pv: Vec<[u32; 2]>,
+    /// D537 ring indices (absolute into the extended origin table), empty without --ring
+    rv: Vec<[u32; 4]>,
+    /// D741 2-ply SEE scalar indices into `g[NSCAL..]`, empty without --see
+    sv: Vec<u16>,
     kg: Vec<i8>,
     ky: Vec<f32>,
     keys: Vec<u8>,
@@ -44,7 +199,22 @@ struct Scratch {
 
 /// Rebuild moves / features / pattern rows / labels of a sample. Returns the hard label index (hard samples) or
 /// Some(usize::MAX) for a soft sample with >= 2 groups; None = skip.
+static RING_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// 0 = none, 1 = 2d (342), 2 = 2dp (4*342), 3 = 2dpt (2*4*342), 4 = 2d8 (8*342)
+static SEE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn see_n(mode: u8) -> usize {
+    match mode {
+        1 => NSEE_BASE,
+        2 => 4 * NSEE_BASE,
+        3 | 4 => 8 * NSEE_BASE,
+        _ => 0,
+    }
+}
+
 fn expand(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bool, x: &mut Scratch) -> Option<usize> {
+    let rb = RING_BASE.load(std::sync::atomic::Ordering::Relaxed);
+    let sm = SEE_MODE.load(std::sync::atomic::Ordering::Relaxed);
     let b = Board::from_occ(s.own, s.opp, 0, 0);
     b.legal_moves_dedup_into(&mut x.ml);
     if x.ml.len() < 2 {
@@ -52,14 +222,88 @@ fn expand(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bool
     }
     x.mv.clear();
     x.pv.clear();
+    x.rv.clear();
+    x.sv.clear();
     x.kg.clear();
     x.ky.clear();
     x.keys.clear();
+
+    let (me, opp, empty) = (b.me(), b.opp(), b.empty());
+    let (p_base, b1_opp0, b2_opp0, see_prefix) = if sm != 0 {
+        let pb = victim_planes(me);
+        let b1 = box1(opp);
+        let b2 = box1(b1);
+        let ec = empty.count_ones() as usize;
+        let blk = if sm == 4 {
+            (ec.saturating_sub(1) / 6).min(7)
+        } else if sm >= 2 {
+            let ph = (ec.saturating_sub(1) / 12).min(3);
+            let th = if sm == 3 {
+                let os = opp_state(b1 & empty, b2 & empty, &pb);
+                usize::from(os >= 8)
+            } else {
+                0
+            };
+            th * 4 + ph
+        } else {
+            0
+        };
+        (pb, b1, b2, blk * NSEE_BASE)
+    } else {
+        ([0; 4], 0, 0, 0)
+    };
+    let mut dest_ok = 0u64;
+    let mut dest_p = [[0u64; 4]; 49];
+    let mut dest_b1 = [0u64; 49];
+    let mut dest_b2 = [0u64; 49];
+
     let mut label = None;
     for (i, m) in x.ml.iter().enumerate() {
         x.mv.push(feats(&b, m, ring));
         if use_pat {
             x.pv.push(patidx(&b, m, k3c));
+        }
+        if rb != u32::MAX {
+            let j = !m.is_clone();
+            x.rv.push([0, 1, 2, 3].map(|k| rb + ring_idx(b.me(), b.opp(), m.to, j, k)));
+        }
+        if sm != 0 {
+            let tu = m.to as usize;
+            if (dest_ok >> tu) & 1 == 0 {
+                dest_ok |= 1u64 << tu;
+                let flips_m = opp & ring[tu];
+                let (b1o, b2o) = if flips_m == 0 {
+                    (b1_opp0, b2_opp0)
+                } else {
+                    let b1 = box1(opp & !flips_m);
+                    (b1, box1(b1))
+                };
+                let mut pt = p_base;
+                planes_add(&mut pt, ring[tu]);
+                let mut fm = flips_m;
+                while fm != 0 {
+                    let u = fm.trailing_zeros() as usize;
+                    fm &= fm - 1;
+                    planes_add(&mut pt, ring[u]);
+                }
+                dest_p[tu] = pt;
+                dest_b1[tu] = b1o;
+                dest_b2[tu] = b2o;
+            }
+            let clone = m.is_clone();
+            let flips = (opp & ring[tu]).count_ones() as usize;
+            let my_diff = clone as usize + 2 * flips;
+            let tbit = 1u64 << tu;
+            let oi = if clone {
+                let ea = empty & !tbit;
+                opp_state(dest_b1[tu] & ea, dest_b2[tu] & ea, &dest_p[tu])
+            } else {
+                let mut pa = dest_p[tu];
+                planes_sub(&mut pa, ring[m.from as usize]);
+                let ea = (empty & !tbit) | (1u64 << m.from);
+                opp_state(dest_b1[tu] & ea, dest_b2[tu] & ea, &pa)
+            };
+            x.sv.push((NSCAL + see_prefix + my_diff * 19 + oi) as u16);
         }
         if s.kind == 0 {
             if m.to == s.to && (m.is_clone() || m.from == s.from) && m.is_clone() == (Move { from: s.from, to: s.to }).is_clone() {
@@ -116,7 +360,7 @@ struct Grad {
 }
 
 fn new_scratch() -> Scratch {
-    Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] }
+    Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -131,11 +375,19 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
         if m[3] != 255 {
             v += g[m[3] as usize];
         }
+        if let Some(&si) = x.sv.get(i) {
+            v += g[si as usize];
+        }
         if !td.is_empty() {
             let [d, o] = x.pv[i];
             v += td[d as usize];
             if o != NONE {
                 v += tor[o as usize];
+            }
+        }
+        if let Some(rr) = x.rv.get(i) {
+            for &q in rr {
+                v += tor[q as usize];
             }
         }
         z.push(v);
@@ -145,7 +397,7 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
         let mx = z.iter().cloned().fold(f32::MIN, f32::max);
         let den: f32 = z.iter().map(|v| (v - mx).exp()).sum();
         for (i, v) in z.iter().enumerate() {
-            x.dz.push(w.0 * ((v - mx).exp() / den - (i == lab) as u32 as f32));
+            x.dz.push(w.0 * s.aw * ((v - mx).exp() / den - (i == lab) as u32 as f32));
         }
     } else {
         let mx = z.iter().zip(&x.kg).filter(|(_, k)| **k >= 0).map(|(v, _)| *v).fold(f32::MIN, f32::max);
@@ -180,6 +432,9 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
         if m[3] != 255 {
             gr.gg[m[3] as usize] += d;
         }
+        if let Some(&si) = x.sv.get(i) {
+            gr.gg[si as usize] += d;
+        }
         if use_pat {
             let [pd, po] = x.pv[i];
             gr.touched.push(pd);
@@ -187,6 +442,12 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
             if po != NONE {
                 gr.touched_o.push(po);
                 gr.gto[po as usize] += d;
+            }
+        }
+        if let Some(rr) = x.rv.get(i) {
+            for &q in rr {
+                gr.touched_o.push(q);
+                gr.gto[q as usize] += d;
             }
         }
     }
@@ -228,7 +489,7 @@ fn load_kata_file(path: &str, out: &mut Vec<S>, kpool: &mut Vec<(u8, u16)>, val:
             continue;
         }
         let st1 = sel != 0;
-        out.push(S { own, opp, from: 0, to: 0, kind: if st1 { 2 } else { 1 }, sel: if st1 { sel.trailing_zeros() as u8 } else { 255 }, kn: kn as u8, val, ko });
+        out.push(S { own, opp, from: 0, to: 0, kind: if st1 { 2 } else { 1 }, sel: if st1 { sel.trailing_zeros() as u8 } else { 255 }, kn: kn as u8, val, ko, aw: 1.0, up: 0 });
         if st1 {
             n1 += 1;
         } else {
@@ -246,7 +507,19 @@ fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn head_bytes(k3c: bool, use_pat: bool, parts: [&[f32]; 4]) -> Vec<u8> {
-    let mut o = if k3c { b"TPOL3\0\0\0".to_vec() } else if use_pat { b"TPOL2\0\0\0".to_vec() } else { b"TPOL1\0\0\0".to_vec() };
+    let ring = RING_BASE.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX;
+    let see = SEE_MODE.load(std::sync::atomic::Ordering::Relaxed) != 0;
+    let mut o = if see {
+        b"TPOL5\0\0\0".to_vec()
+    } else if ring {
+        b"TPOL4\0\0\0".to_vec()
+    } else if k3c {
+        b"TPOL3\0\0\0".to_vec()
+    } else if use_pat {
+        b"TPOL2\0\0\0".to_vec()
+    } else {
+        b"TPOL1\0\0\0".to_vec()
+    };
     o.extend_from_slice(&0u32.to_le_bytes());
     for part in parts {
         for v in part {
@@ -315,8 +588,35 @@ pub fn run(args: &[String]) -> ExitCode {
     let max_samples: usize = arg(args, "--max-samples").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // D528: default 6 of the 8 hardware threads (the PC stays usable); Kata TRAIN files are streamed, never all in RAM
     let threads: usize = arg(args, "--threads").and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
+    // D537: --ring adds the jump-ring tables (TPOL4 = TPOL3 + ring [49][2][4][81]); needs --pat k3c
+    let use_ring = args.iter().any(|a| a == "--ring");
+    let see_arg = arg(args, "--see").unwrap_or_else(|| "none".into());
+    let see_mode: u8 = match see_arg.as_str() {
+        "none" => 0,
+        "2d" => 1,
+        "2dp" => 2,
+        "2dpt" => 3,
+        "2d8" => 4,
+        other => {
+            eprintln!("bad --see {other} (expected none|2d|2dp|2dpt|2d8)");
+            return ExitCode::from(2);
+        }
+    };
+    let see_prior: f32 = arg(args, "--see-prior").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    if see_mode != 0 && (use_ring || !k3c) {
+        eprintln!("--see needs --pat k3c and cannot combine with --ring");
+        return ExitCode::from(2);
+    }
+    SEE_MODE.store(see_mode, std::sync::atomic::Ordering::Relaxed);
+    let nsee = see_n(see_mode);
     let kata_val_max: usize = arg(args, "--kata-val-max").and_then(|v| v.parse().ok()).unwrap_or(400_000);
     let ring = ring1();
+
+    // Advantage-weighted game labels (D765, off by default): --adv-lambda L turns it on.
+    let adv_lambda: Option<f32> = arg(args, "--adv-lambda").and_then(|v| v.parse().ok());
+    let adv_scale: f32 = arg(args, "--adv-scale").and_then(|v| v.parse().ok()).unwrap_or(0.10);
+    let adv_clip: f32 = arg(args, "--adv-clip").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let (mut adv_n, mut adv_clipped, mut adv_abs, mut adv_sum) = (0u64, 0u64, 0f64, 0f64);
 
     let mut ss: Vec<S> = Vec::new();
     let mut kpool: Vec<(u8, u16)> = Vec::new();
@@ -332,11 +632,13 @@ pub fn run(args: &[String]) -> ExitCode {
             let Ok(g) = games::parse_game(&line) else { continue };
             let Ok(boards) = games::replay(&g) else { continue };
             let val = g.pair % 10 == 0;
-            for (r, b) in g.moves.iter().zip(&boards) {
+            // Always computed (the validation report splits by it); it changes the loss only with --adv-lambda.
+            let adv: Vec<Option<f32>> = move_advantages(&g, &boards, adv_lambda.unwrap_or(0.9));
+            for (t, (r, b)) in g.moves.iter().zip(&boards).enumerate() {
                 if r.mv == "FORFEIT" {
                     break;
                 }
-                let pm = match b.parse_uai_move(&r.mv) {
+                let pm = match b.parse_uai_move(r.label_mv()) {
                     Some(m) if !m.is_pass() => m,
                     _ => continue,
                 };
@@ -344,11 +646,49 @@ pub fn run(args: &[String]) -> ExitCode {
                 if ml.len() < 2 {
                     continue;
                 }
-                ss.push(S { own: b.me(), opp: b.opp(), from: pm.from, to: pm.to, kind: 0, sel: 255, kn: 0, val, ko: 0 });
+                // A move after which the game went better than its own score promised gets more weight, a move
+                // that was followed by a drop gets less: weight = exp(clip(advantage / scale)).
+                let a_t = adv.get(t).copied().flatten();
+                let up = match a_t {
+                    Some(a) if a > 0.02 => 1u8,
+                    Some(a) if a < -0.02 => 2u8,
+                    _ => 0u8,
+                };
+                let aw = match a_t.filter(|_| adv_lambda.is_some()) {
+                    Some(a) => {
+                        adv_n += 1;
+                        adv_abs += a.abs() as f64;
+                        adv_sum += a as f64;
+                        let x = a / adv_scale;
+                        if x.abs() >= adv_clip {
+                            adv_clipped += 1;
+                        }
+                        x.clamp(-adv_clip, adv_clip).exp()
+                    }
+                    None => 1.0,
+                };
+                ss.push(S { own: b.me(), opp: b.opp(), from: pm.from, to: pm.to, kind: 0, sel: 255, kn: 0, val, ko: 0, aw, up });
                 got += 1;
             }
         }
         eprintln!("{f}: {got} positions");
+    }
+    if let (Some(l), true) = (adv_lambda, adv_n > 0) {
+        // Scale to mean 1 so `--games-w` keeps its meaning against the Kata rows.
+        let mean = ss.iter().map(|s| s.aw as f64).sum::<f64>() / ss.len() as f64;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for s in ss.iter_mut() {
+            s.aw = (s.aw as f64 / mean) as f32;
+            lo = lo.min(s.aw);
+            hi = hi.max(s.aw);
+        }
+        eprintln!(
+            "advantage weights (--adv-lambda {l}, scale {adv_scale}, clip {adv_clip}): {adv_n} of {} game moves weighted; advantage mean {:+.4}, mean |.| {:.4}; at the clip {:.1}%; weight {lo:.2} .. {hi:.2} after scaling to mean 1",
+            ss.len(),
+            adv_sum / adv_n as f64,
+            adv_abs / adv_n as f64,
+            100.0 * adv_clipped as f64 / adv_n as f64
+        );
     }
     let n_games = ss.len();
     // Kata tdata (all npz under the dirs); val = every 10th file
@@ -391,30 +731,51 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // parameters (dim 0 head)
     let mut bias = vec![0f32; SLOTS];
-    let mut g = vec![0f32; NSCAL];
+    let mut g = vec![0f32; NSCAL + nsee];
+    if see_prior != 0.0 {
+        for blk in 0..(nsee / NSEE_BASE) {
+            for md in 0..18usize {
+                for oi in 1..19usize {
+                    let opp_diff = oi - 1;
+                    g[NSCAL + blk * NSEE_BASE + md * 19 + oi] = see_prior * (md as f32 - opp_diff as f32);
+                }
+            }
+        }
+    }
     let mut td = vec![0f32; if use_pat { nd_slots * P3 } else { 0 }];
-    let mut tor = vec![0f32; if use_pat { no_slots * P3 } else { 0 }];
+    if use_ring && !k3c {
+        eprintln!("--ring needs --pat k3c");
+        return ExitCode::from(2);
+    }
+    let mut tor = vec![0f32; if use_pat { no_slots * P3 } else { 0 } + if use_ring { RING_N } else { 0 }];
+    if use_ring {
+        RING_BASE.store((no_slots * P3) as u32, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(ip) = arg(args, "--init") {
         let Ok(d) = fs::read(&ip) else {
             eprintln!("{ip}: cannot read");
             return ExitCode::from(1);
         };
         let idim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
-        let (v2, v3) = (&d[0..5] == b"TPOL2", &d[0..5] == b"TPOL3");
-        let n1 = SLOTS + NSCAL + SLOTS * idim;
-        let ntab = if v3 { 27 * P3 } else if v2 { (SLOTS + 49) * P3 } else { 0 };
-        if !(&d[0..5] == b"TPOL1" || v2 || v3) || d.len() != 12 + 4 * (n1 + ntab) || ((v2 || v3) && v3 != k3c) {
-            eprintln!("--init {ip}: bad file or table kind does not match --pat");
+        let v5 = &d[0..5] == b"TPOL5";
+        let v4 = &d[0..5] == b"TPOL4";
+        let (v2, v3) = (&d[0..5] == b"TPOL2", &d[0..5] == b"TPOL3" || v4 || v5);
+        let in_see = if v5 { nsee } else { 0 };
+        let n1 = SLOTS + NSCAL + in_see + SLOTS * idim;
+        let ntab = if v4 { 27 * P3 + RING_N } else if v3 { 27 * P3 } else if v2 { (SLOTS + 49) * P3 } else { 0 };
+        if !(&d[0..5] == b"TPOL1" || v2 || v3) || d.len() != 12 + 4 * (n1 + ntab) || ((v2 || v3) && v3 != k3c) || (v4 && !use_ring) {
+            eprintln!("--init {ip}: bad file or table kind does not match --pat/--see");
             return ExitCode::from(2);
         }
         let f: Vec<f32> = d[12..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         bias.copy_from_slice(&f[..SLOTS]);
-        g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
+        g[..NSCAL + in_see].copy_from_slice(&f[SLOTS..SLOTS + NSCAL + in_see]);
         if (v2 || v3) && use_pat {
             td.copy_from_slice(&f[n1..n1 + nd_slots * P3]);
-            tor.copy_from_slice(&f[n1 + nd_slots * P3..]);
+            let rest = &f[n1 + nd_slots * P3..];
+            tor[..rest.len()].copy_from_slice(rest); // a TPOL3 init leaves the ring block at 0 (step-0 parity, C14)
         }
-        println!("init from {ip} (file dim {idim}{}, tables {})", if idim > 0 { ", U dropped as in the engine" } else { "" }, if v2 || v3 { "loaded" } else { "zero" });
+        println!("init from {ip} (file dim {idim}{}, tables {}, see {see_arg})", if idim > 0 { ", U dropped as in the engine" } else { "" }, if v2 || v3 { "loaded" } else { "zero" });
     }
 
     let logits = |x: &Scratch, bias: &[f32], g: &[f32], td: &[f32], tor: &[f32], out: &mut Vec<f32>| {
@@ -424,6 +785,9 @@ pub fn run(args: &[String]) -> ExitCode {
             if m[3] != 255 {
                 z += g[m[3] as usize];
             }
+            if let Some(&si) = x.sv.get(i) {
+                z += g[si as usize];
+            }
             if !td.is_empty() {
                 let [d, o] = x.pv[i];
                 z += td[d as usize];
@@ -431,13 +795,21 @@ pub fn run(args: &[String]) -> ExitCode {
                     z += tor[o as usize];
                 }
             }
+            if let Some(rr) = x.rv.get(i) {
+                for &q in rr {
+                    z += tor[q as usize];
+                }
+            }
             out.push(z);
         }
     };
-    let mut sc = Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] };
+    let mut sc = Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] };
     // validation: (game CE, top1, top3, top5, n) and (kata soft CE, top1 most-visited group, n)
+    // (top1 hits, n) on validation game moves with a positive advantage, then the same for a negative one
+    let split = std::cell::Cell::new([0f64; 4]);
     let evaluate = |bias: &[f32], g: &[f32], td: &[f32], tor: &[f32], sc: &mut Scratch| -> ([f64; 5], [f64; 3]) {
         let (mut gm, mut km) = ([0f64; 5], [0f64; 3]);
+        let mut sp = [0f64; 4];
         let mut z = std::mem::take(&mut sc.z);
         for s in ss.iter().filter(|s| s.val) {
             let Some(lab) = expand(s, &kpool, &ring, k3c, use_pat, sc) else { continue };
@@ -448,6 +820,13 @@ pub fn run(args: &[String]) -> ExitCode {
                 gm[0] += (den.ln() + mx - z[lab]) as f64;
                 let rank = z.iter().filter(|v| **v > z[lab]).count();
                 gm[1] += (rank == 0) as u32 as f64;
+                if s.up == 1 {
+                    sp[0] += (rank == 0) as u32 as f64;
+                    sp[1] += 1.0;
+                } else if s.up == 2 {
+                    sp[2] += (rank == 0) as u32 as f64;
+                    sp[3] += 1.0;
+                }
                 gm[2] += (rank < 3) as u32 as f64;
                 gm[3] += (rank < 5) as u32 as f64;
                 gm[4] += 1.0;
@@ -478,6 +857,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         km[0] /= km[2].max(1.0);
         km[1] /= km[2].max(1.0);
+        split.set(sp);
         (gm, km)
     };
     let show = |tag: &str, r: &([f64; 5], [f64; 3])| {
@@ -485,6 +865,18 @@ pub fn run(args: &[String]) -> ExitCode {
             "{tag}: games CE {:.4} top1 {:.4} top3 {:.4} top5 {:.4} ({:.0}) | kata soft CE {:.4} top1 {:.4} ({:.0})",
             r.0[0], r.0[1], r.0[2], r.0[3], r.0[4], r.1[0], r.1[1], r.1[2]
         );
+        // The same validation moves, split by what followed them in the game (advantage beyond +-0.02).
+        let sp = split.get();
+        if sp[1] > 0.0 && sp[3] > 0.0 {
+            println!(
+                "{tag}:   top1 on moves the game then proved RIGHT {:.4} ({:.0}) | on moves it proved WRONG {:.4} ({:.0}) | gap {:+.4}",
+                sp[0] / sp[1],
+                sp[1],
+                sp[2] / sp[3],
+                sp[3],
+                sp[0] / sp[1] - sp[2] / sp[3]
+            );
+        }
     };
     let r0 = evaluate(&bias, &g, &td, &tor, &mut sc);
     show("val init", &r0);
@@ -500,7 +892,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Adam (dense on bias/g, lazy sparse on the tables)
     let mut tr: Vec<u32> = (0..ss.len() as u32).filter(|&i| !ss[i as usize].val && ss[i as usize].kind == 0).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; SLOTS], vec![0f32; SLOTS], vec![0f32; NSCAL], vec![0f32; NSCAL]);
+    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; SLOTS], vec![0f32; SLOTS], vec![0f32; g.len()], vec![0f32; g.len()]);
     let (mut mtd, mut vtd, mut mto, mut vto) = (vec![0f32; td.len()], vec![0f32; td.len()], vec![0f32; tor.len()], vec![0f32; tor.len()]);
     let (mut gtd, mut gto) = (vec![0f32; td.len()], vec![0f32; tor.len()]);
     let (mut touched, mut touched_o): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
@@ -516,7 +908,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut ep0 = 0usize;
     if args.iter().any(|a| a == "--resume") {
         match ckpt_path.as_deref().and_then(ckpt_read) {
-            Some((h, vs)) if vs[0].len() == bias.len() && vs[2].len() == td.len() && vs[3].len() == tor.len() => {
+            Some((h, vs)) if vs[0].len() == bias.len() && vs[1].len() == g.len() && vs[2].len() == td.len() && vs[3].len() == tor.len() => {
                 bias.copy_from_slice(&vs[0]);
                 g.copy_from_slice(&vs[1]);
                 td.copy_from_slice(&vs[2]);
@@ -548,7 +940,7 @@ pub fn run(args: &[String]) -> ExitCode {
             tr.swap(i, (x % (i as u64 + 1)) as usize);
         }
         let t0 = std::time::Instant::now();
-        let (mut gb, mut gg) = (vec![0f32; SLOTS], vec![0f32; NSCAL]);
+        let (mut gb, mut gg) = (vec![0f32; SLOTS], vec![0f32; g.len()]);
         let mut forder: Vec<usize> = (0..train_files.len()).collect();
         for i in (1..forder.len()).rev() {
             x ^= x << 13;
@@ -592,7 +984,7 @@ pub fn run(args: &[String]) -> ExitCode {
         // D526: PERSISTENT workers (one spawn per epoch, two barriers per batch) instead of 8 spawns per batch.
         // Workers read the parameters only between `start` and `done`; the main thread updates them only outside.
         let grs: Vec<std::sync::Mutex<Grad>> = (0..threads)
-            .map(|_| std::sync::Mutex::new(Grad { gb: vec![0f32; SLOTS], gg: vec![0f32; NSCAL], gtd: vec![0f32; td.len()], gto: vec![0f32; tor.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] }))
+            .map(|_| std::sync::Mutex::new(Grad { gb: vec![0f32; SLOTS], gg: vec![0f32; g.len()], gtd: vec![0f32; td.len()], gto: vec![0f32; tor.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] }))
             .collect();
         let bt = bs * threads;
         let nb = btr.len().div_ceil(bt);
@@ -756,4 +1148,94 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let _ = k3code; // shared definition lives in policy.rs
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mvv2_see_bitplanes_match_bruteforce_2ply() {
+        let ring = ring1();
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut ml = MoveList::new();
+        let mut ml2 = MoveList::new();
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let occ = x & FULL49;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let me = occ & x;
+            let opp = occ & !me;
+            if me == 0 || opp == 0 || (me | opp) == FULL49 {
+                continue;
+            }
+            let b = Board::from_occ(me, opp, 0, 0);
+            b.legal_moves_dedup_into(&mut ml);
+            if ml.is_empty() {
+                continue;
+            }
+            let pb = victim_planes(me);
+            let b1_0 = box1(opp);
+            let b2_0 = box1(b1_0);
+            let mut dest_ok = 0u64;
+            let mut dest_p = [[0u64; 4]; 49];
+            let mut dest_b1 = [0u64; 49];
+            let mut dest_b2 = [0u64; 49];
+            let empty = b.empty();
+            for m in ml.iter() {
+                let tu = m.to as usize;
+                if (dest_ok >> tu) & 1 == 0 {
+                    dest_ok |= 1u64 << tu;
+                    let flips_m = opp & ring[tu];
+                    let (b1o, b2o) = if flips_m == 0 {
+                        (b1_0, b2_0)
+                    } else {
+                        let b1 = box1(opp & !flips_m);
+                        (b1, box1(b1))
+                    };
+                    let mut pt = pb;
+                    planes_add(&mut pt, ring[tu]);
+                    let mut fm = flips_m;
+                    while fm != 0 {
+                        let u = fm.trailing_zeros() as usize;
+                        fm &= fm - 1;
+                        planes_add(&mut pt, ring[u]);
+                    }
+                    dest_p[tu] = pt;
+                    dest_b1[tu] = b1o;
+                    dest_b2[tu] = b2o;
+                }
+                let clone = m.is_clone();
+                let tbit = 1u64 << tu;
+                let oi_fast = if clone {
+                    let ea = empty & !tbit;
+                    opp_state(dest_b1[tu] & ea, dest_b2[tu] & ea, &dest_p[tu])
+                } else {
+                    let mut pa = dest_p[tu];
+                    planes_sub(&mut pa, ring[m.from as usize]);
+                    let ea = (empty & !tbit) | (1u64 << m.from);
+                    opp_state(dest_b1[tu] & ea, dest_b2[tu] & ea, &pa)
+                };
+
+                // Brute-force oracle: make(m), enumerate opp's legal moves
+                let b2 = b.make(m);
+                b2.legal_moves_dedup_into(&mut ml2);
+                let oi_ref = if ml2.is_empty() {
+                    0usize
+                } else {
+                    let mut best = 0usize;
+                    for rm in ml2.iter() {
+                        let c = (b2.opp() & ring[rm.to as usize]).count_ones() as usize;
+                        best = best.max(rm.is_clone() as usize + 2 * c);
+                    }
+                    1 + best
+                };
+                assert_eq!(oi_fast, oi_ref, "mismatch on move {m:?} me={me:#x} opp={opp:#x}");
+            }
+        }
+    }
 }

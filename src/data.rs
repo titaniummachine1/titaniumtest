@@ -375,8 +375,11 @@ pub fn run_data(args: &[String]) -> ExitCode {
         Some("pack-games") => crate::gamedata::run_pack_games(args),
         Some("games-stat") => crate::gamedata::run_games_stat(args),
         Some("games-tdat") => crate::gamedata::run_games_tdat(args),
+        Some("append") => crate::gamedata::run_append(args),
+        Some("bestmove") => crate::gamedata::run_bestmove(args),
+        Some("stitch") => crate::gamedata::run_stitch(args),
         _ => {
-            eprintln!("usage: ti data <pack|sample|mix|stats|check-targets|check-leak|chains|lambda|chain-audit|pack-games|games-stat|games-tdat> ...");
+            eprintln!("usage: ti data <pack|sample|mix|stats|check-targets|check-leak|chains|lambda|chain-audit|pack-games|games-stat|games-tdat|bestmove> ...");
             ExitCode::FAILURE
         }
     }

@@ -30,6 +30,8 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use titanium::board::Move;
 use titanium::search::MATE;
@@ -344,6 +346,126 @@ fn check_index(tdat_rows: u64, idx_rows: u64, chains: &[Chain]) -> Result<(), St
     Ok(())
 }
 
+/// Key of a position for de-duplication: (mover stones, opponent stones), whatever the row convention (old rows keep the mover
+/// in occ0 with stm 0; rows from game files keep colour 0 in occ0 and name the mover in stm). Blocked squares are not in rows.
+pub fn pos_key(occ0: u64, occ1: u64, stm: u8) -> u64 {
+    let (m, o) = if stm == 0 { (occ0, occ1) } else { (occ1, occ0) };
+    crate::dag::splitmix(crate::dag::splitmix(m) ^ o.rotate_left(17))
+}
+
+/// Reader of the `.tbst` label file `ti gen` writes next to a `.tgam` (layout: see `gen::BinOut`).
+pub struct TbstReader {
+    rd: BufReader<File>,
+    pub games: u64,
+    pub plies: u64,
+}
+
+impl TbstReader {
+    pub fn open(tgam: &str) -> Result<TbstReader, String> {
+        let p = format!("{}.tbst", tgam.trim_end_matches(".tgam"));
+        let mut rd = BufReader::with_capacity(1 << 20, File::open(&p).map_err(|e| format!("{p}: {e}"))?);
+        let mut h = [0u8; 24];
+        rd.read_exact(&mut h).map_err(|e| format!("{p}: {e}"))?;
+        if &h[0..4] != b"TBST" || u32::from_le_bytes(h[4..8].try_into().unwrap()) != 1 {
+            return Err(format!("{p}: not a TBST version 1 file"));
+        }
+        Ok(TbstReader { rd, games: u64::from_le_bytes(h[8..16].try_into().unwrap()), plies: u64::from_le_bytes(h[16..24].try_into().unwrap()) })
+    }
+
+    /// Next game: its DAG id and the (best move code, best score code) of each of its `n` plies.
+    pub fn next_game(&mut self, n: usize) -> Result<(u32, Vec<(u16, i16)>), String> {
+        let mut b = vec![0u8; 4 + n * 4];
+        self.rd.read_exact(&mut b).map_err(|e| format!("tbst: {e}"))?;
+        let gid = u32::from_le_bytes(b[0..4].try_into().unwrap());
+        Ok((gid, b[4..].chunks_exact(4).map(|c| (u16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]]))).collect()))
+    }
+}
+
+/// `ti data append --base STEM --add STEM --out STEM`: the rows of `--add` appended to a COPY of `--base` (both stay
+/// untouched). Copies STEM.tdat / .kata / .aux, appends the new rows, zero-pads .kata (16 B) and .aux (12 B) for them
+/// (no Kata policy target, no aux data: exactly as the 2026-11-14 append did), merges .chains (new runs shifted by the
+/// base row count) and writes the manifest. The row count of every file is checked afterwards.
+pub fn run_append(args: &[String]) -> ExitCode {
+    let (Some(base), Some(add), Some(out)) = (crate::flag_str(args, "--base"), crate::flag_str(args, "--add"), crate::flag_str(args, "--out")) else {
+        eprintln!("usage: ti data append --base STEM --add STEM --out STEM   (STEM = path without .tdat)");
+        return ExitCode::FAILURE;
+    };
+    let strip = |s: &str| s.trim_end_matches(".tdat").to_string();
+    let (base, add, out) = (strip(&base), strip(&add), strip(&out));
+    let r = || -> Result<(u64, u64), String> {
+        if out == base || out == add {
+            return Err("--out must be a new stem".into());
+        }
+        if std::path::Path::new(&format!("{out}.tdat")).exists() {
+            return Err(format!("{out}.tdat already exists; refusing to overwrite"));
+        }
+        let len = |p: &str| fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{p}: {e}"));
+        let (nb, na) = (len(&format!("{base}.tdat"))? / REC as u64, len(&format!("{add}.tdat"))? / REC as u64);
+        for (ext, rec) in [("tdat", REC as u64), ("kata", 16), ("aux", 12)] {
+            let (src, dst) = (format!("{base}.{ext}"), format!("{out}.{ext}"));
+            if !std::path::Path::new(&src).exists() {
+                if ext == "tdat" {
+                    return Err(format!("{src} missing"));
+                }
+                continue;
+            }
+            let have = len(&src)?;
+            if have != nb * rec {
+                // sidecars shorter than the rows: pad with zeros up to the base row count first (keeps row i <-> record i)
+                eprintln!("append: {src} holds {} records for {nb} rows; zero-padding the copy", have / rec);
+            }
+            fs::copy(&src, &dst).map_err(|e| format!("copy {src} -> {dst}: {e}"))?;
+            let mut f = fs::OpenOptions::new().append(true).open(&dst).map_err(|e| format!("{dst}: {e}"))?;
+            if ext == "tdat" {
+                let mut a = BufReader::with_capacity(1 << 22, File::open(format!("{add}.tdat")).map_err(|e| e.to_string())?);
+                std::io::copy(&mut a, &mut f).map_err(|e| format!("{dst}: {e}"))?;
+            } else {
+                let want = (nb + na) * rec;
+                let mut left = want.saturating_sub(have);
+                let zeros = vec![0u8; 1 << 20];
+                while left > 0 {
+                    let n = left.min(zeros.len() as u64) as usize;
+                    f.write_all(&zeros[..n]).map_err(|e| format!("{dst}: {e}"))?;
+                    left -= n as u64;
+                }
+            }
+            f.flush().map_err(|e| e.to_string())?;
+            let want = if ext == "tdat" { (nb + na) * rec } else { (nb + na) * rec };
+            if len(&dst)? != want {
+                return Err(format!("{dst}: {} bytes, expected {want}", len(&dst)?));
+            }
+        }
+        // chains: base runs, then the added runs shifted by the base row count
+        let mut chains: Vec<Chain> = Vec::new();
+        if std::path::Path::new(&format!("{base}.chains")).exists() {
+            chains.extend(read_chains(&format!("{base}.chains"))?.1);
+        }
+        if std::path::Path::new(&format!("{add}.chains")).exists() {
+            for c in read_chains(&format!("{add}.chains"))?.1 {
+                chains.push(Chain { start: (c.start as u64 + nb) as u32, len: c.len, conv: c.conv });
+            }
+        }
+        write_chains(&format!("{out}.chains"), nb + na, &chains)?;
+        let manifest = format!(
+            "{{\"src\":{},\"rows\":{},\"rec\":{REC},\"kata_rec\":16,\"aux_rec\":12}}",
+            crate::json_str(&format!("{base}.tdat ({nb} rows, unchanged) + {add}.tdat ({na} rows appended by ti data append; kata/aux zero-padded for them)")),
+            nb + na
+        );
+        fs::write(format!("{out}.manifest.json"), manifest).map_err(|e| e.to_string())?;
+        Ok((nb, na))
+    };
+    match r() {
+        Ok((nb, na)) => {
+            println!("data append: {out}.tdat = {nb} base rows + {na} new rows = {} rows (base and add files untouched)", nb + na);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data append: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `ti data games-tdat`: replay a `.tgam` and write trainer rows. This is the
 /// missing link for the data flywheel: gate/self-play games (`.tgam`) could be
 /// packed and analysed but never trained on. Every position is relabelled with
@@ -351,17 +473,76 @@ fn check_index(tdat_rows: u64, idx_rows: u64, chains: &[Chain]) -> Result<(), St
 /// result from the mover's view, and one chain per game is written so
 /// `ti data lambda` works on the result.
 pub fn run_games_tdat(args: &[String]) -> ExitCode {
-    let (Some(tgam), Some(out)) = (crate::flag_str(args, "--tgam"), crate::flag_str(args, "--out")) else {
-        eprintln!("usage: ti data games-tdat --tgam F.tgam --out STEM [--nodes 5000] [--limit-games N] [--relabel-src 0] [--net FILE]");
+    let tgam = crate::flag_str(args, "--tgam").unwrap_or_default();
+    let (true, Some(out)) = (!tgam.is_empty() || crate::flag_str(args, "--tgam-roots").is_some(), crate::flag_str(args, "--out")) else {
+        eprintln!("usage: ti data games-tdat (--tgam F.tgam[,G.tgam] | --tgam-roots DIR,DIR) --out STEM [--best-scores] [--min-cand-elo -50] [--nodes 5000] [--limit-games N] [--relabel-src 0] [--net FILE]");
         return ExitCode::FAILURE;
     };
     let nodes = crate::flag_u64(args, "--nodes").unwrap_or(5000);
     let limit = crate::flag_u64(args, "--limit-games").map(|v| v as usize).unwrap_or(usize::MAX);
-    let src: u8 = crate::flag_u64(args, "--relabel-src").unwrap_or(0) as u8;
+    // 200 = in-game eval, no separate relabel ran (see DATASET_GUIDE.md: 0/1/2 are
+    // real relabel passes, so reusing one of them would mislabel the provenance).
+    let src: u8 = crate::flag_u64(args, "--relabel-src").unwrap_or(200) as u8;
+    // Labels come from the game itself by default (both engines evaluated every
+    // position while playing); `--scores search` re-labels with a fresh search.
+    let use_game_scores = crate::flag_str(args, "--scores").as_deref() != Some("search");
     let out_tdat = format!("{}.tdat", out.trim_end_matches(".tdat"));
     let t0 = std::time::Instant::now();
-    let work = || -> Result<(u64, u64, u64, Vec<Chain>, u64), String> {
-        let mut rd = GameReader::open(&tgam)?;
+    // D809: several game files (comma list); `--best-scores` = cp is the score of the ENGINE'S BEST move from the sibling .tbst
+    // (the value of the position), not the score of the move that was played (novelty can play a worse one);
+    // `--dedup-against X.tdat` / `--dedup` = write each position once (against X.tdat and against what this run wrote);
+    // a skipped position ends the chain exactly like a pass does.
+    let mut tgams: Vec<String> = tgam.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+    // --tgam-roots DIR,DIR: every *.tgam below these folders (gate logs and generated batches), sorted
+    if let Some(roots) = crate::flag_str(args, "--tgam-roots") {
+        let mut stack: Vec<std::path::PathBuf> = roots.split(',').filter(|s| !s.is_empty()).map(std::path::PathBuf::from).collect();
+        let mut found = Vec::new();
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("tgam") {
+                    found.push(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        found.sort();
+        tgams.extend(found);
+    }
+    let min_cand_elo = crate::flag_str(args, "--min-cand-elo").and_then(|v| v.parse::<f64>().ok());
+    let use_best = args.iter().any(|a| a == "--best-scores");
+    let against = crate::flag_str(args, "--dedup-against");
+    let want_dedup = against.is_some() || args.iter().any(|a| a == "--dedup");
+    let work = || -> Result<(u64, u64, u64, Vec<Chain>, u64, u64, u64, u64), String> {
+        let mut skipped_gates: Vec<String> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut base_rows = 0u64;
+        if let Some(p) = &against {
+            let mut rd = BufReader::with_capacity(1 << 22, File::open(p).map_err(|e| format!("{p}: {e}"))?);
+            let mut buf = vec![0u8; REC * 65536];
+            loop {
+                let mut got = 0;
+                while got < buf.len() {
+                    let n = rd.read(&mut buf[got..]).map_err(|e| format!("{p}: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                for c in buf[..got - got % REC].chunks_exact(REC) {
+                    let r = Rec::from_bytes(c);
+                    seen.insert(pos_key(r.occ0, r.occ1, r.stm));
+                    base_rows += 1;
+                }
+                if got < buf.len() {
+                    break;
+                }
+            }
+            eprintln!("games-tdat: {} distinct positions loaded from {p} ({base_rows} rows)", seen.len());
+        }
+        let (mut dups, mut n_best) = (0u64, 0u64);
         let mut w = BufWriter::with_capacity(1 << 22, File::create(&out_tdat).map_err(|e| format!("{out_tdat}: {e}"))?);
         let mut se = Searcher::with_tt_bits_unconfigured(18);
         let nn = match crate::flag_str(args, "--net") {
@@ -374,16 +555,48 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
         let mut row: u64 = 0;
         let mut games_out = 0u64;
         let (mut n_out, mut n_draw, mut n_unknown) = (0u64, 0u64, 0u64);
+        for tpath in &tgams {
+        // D832 (user): a GATE file whose candidate scored more than 50 Elo below its baseline gives no rows (the files stay).
+        // Only gate files (<run>/sprt.log.tgam, cand_seat 0/1 per game); generated batches are self-play and never skipped.
+        if let Some(min_elo) = min_cand_elo {
+            if tpath.ends_with(".log.tgam") {
+                let (mut pts, mut n) = (0f64, 0u64);
+                for g in GameReader::open(tpath)?.flatten() {
+                    if g.cand_seat <= 1 && g.result <= 2 {
+                        let p0 = g.result as f64 / 2.0;
+                        pts += if g.cand_seat == 0 { p0 } else { 1.0 - p0 };
+                        n += 1;
+                    }
+                }
+                let s = (pts / n.max(1) as f64).clamp(1e-3, 1.0 - 1e-3);
+                let elo = -400.0 * (1.0 / s - 1.0).log10();
+                if n > 0 && elo < min_elo {
+                    skipped_gates.push(format!("{tpath} ({n} games, candidate {elo:+.0} Elo)"));
+                    continue;
+                }
+            }
+        }
+        let mut rd = GameReader::open(tpath)?;
+        let mut tb = if use_best { Some(TbstReader::open(tpath)?) } else { None };
         for (gi, g) in rd.by_ref().enumerate() {
             if gi >= limit {
                 break;
             }
-            let Ok(g) = g else { continue };
+            let g = match g {
+                Ok(g) => g,
+                Err(e) if tb.is_some() => return Err(e),
+                Err(_) => continue,
+            };
+            let labels: Vec<(u16, i16)> = match tb.as_mut() {
+                Some(t) => t.next_game(g.plies.len())?.1,
+                None => Vec::new(),
+            };
             if g.forfeit || g.result == 3 {
                 n_unknown += 1; // no trustworthy outcome -> not a training game
                 continue;
             }
-            let start_row = row;
+            let mut start_row = row;
+            let mut wrote_any = false;
             // outcome from side 0's view: 2 = won, 1 = draw, 0 = lost
             let o0: f32 = match g.result {
                 2 => 1.0,
@@ -395,20 +608,63 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
             }
             let mut b = g.start();
             se.reset_for_new_game();
-            for ply in &g.plies {
-                let mv = titanium::ttcodec::decode_move(&b, ply.0 & 0x3ff);
+            for (pi, ply) in g.plies.iter().enumerate() {
+                let code = ply.0 & 0x3ff;
+                // A pass, or a ply without a logged score, gives no row. The run is closed there, so inside
+                // one chain consecutive rows are always exactly one ply apart (`ti data lambda` relies on it).
+                // The game itself goes on: before 2026-11-13 it was cut at its first pass.
+                let no_row = code == PASS_CODE || (use_game_scores && ply.1 == NO_SCORE);
+                if no_row {
+                    if row > start_row {
+                        chains.push(Chain { start: start_row as u32, len: (row - start_row).min(u16::MAX as u64) as u16, conv: 0 });
+                        wrote_any = true;
+                    }
+                    start_row = row;
+                    if code == PASS_CODE {
+                        b = b.make_uai(Move::PASS);
+                        continue;
+                    }
+                }
+                let mv = titanium::ttcodec::decode_move(&b, code);
                 let Some(mv) = mv else { break };
-                let r = se.search(&b, &limits);
+                if no_row {
+                    b = b.make(mv);
+                    continue;
+                }
+                // Default: use the eval BOTH engines already produced while playing
+                // (the score recorded for this ply). No second search: the game is
+                // already a labelled run. `--scores search` re-labels instead.
+                if want_dedup && !seen.insert(pos_key(b.occ[0], b.occ[1], b.turn)) {
+                    dups += 1;
+                    if row > start_row {
+                        chains.push(Chain { start: start_row as u32, len: (row - start_row).min(u16::MAX as u64) as u16, conv: 0 });
+                        wrote_any = true;
+                    }
+                    start_row = row;
+                    b = b.make(mv);
+                    continue;
+                }
+                let cp: i32 = if use_game_scores {
+                    match labels.get(pi) {
+                        Some(&(lc, ls)) if lc & 0x3ff != 0 && ls != NO_SCORE => {
+                            n_best += 1;
+                            dec_score(ls)
+                        }
+                        _ => dec_score(ply.1),
+                    }
+                } else {
+                    se.search(&b, &limits).score
+                };
                 let outcome = if b.turn == 0 { o0 } else { 1.0 - o0 };
                 let rec = crate::data::Rec {
                     occ0: b.occ[0],
                     occ1: b.occ[1],
 
                     outcome,
-                    cp: r.score as f32,
+                    cp: cp as f32,
                     wsum: 1.0,
                     p3: 0.0,
-                    cp5k: r.score as f32,
+                    cp5k: cp as f32,
                     zx: 0,
                     stm: b.turn,
                     teacher_kind: 2,
@@ -423,20 +679,38 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
             let len = row - start_row;
             if len > 0 {
                 chains.push(Chain { start: start_row as u32, len: len.min(u16::MAX as u64) as u16, conv: 0 });
+                wrote_any = true;
+            }
+            if wrote_any {
                 games_out += 1;
             }
         }
+        }
         w.flush().map_err(|e| e.to_string())?;
-        Ok((row, games_out, n_out + n_draw, chains, n_unknown))
+        if min_cand_elo.is_some() {
+            println!("data games-tdat: {} of {} input files skipped (gate candidate below --min-cand-elo, D832; files kept):", skipped_gates.len(), tgams.len());
+            for s in &skipped_gates {
+                println!("  skipped {s}");
+            }
+        }
+        Ok((row, games_out, n_out + n_draw, chains, n_unknown, dups, n_best, base_rows))
     };
     match work() {
-        Ok((rows, games, decided, chains, unknown)) => {
+        Ok((rows, games, decided, chains, unknown, dups, n_best, _base_rows)) => {
+            if want_dedup || use_best {
+                println!("data games-tdat: positions skipped as duplicates {dups}; rows whose cp is the engine's best-move score {n_best} of {rows}");
+            }
             let idx = format!("{}.chains", out.trim_end_matches(".tdat"));
             if let Err(e) = write_chains(&idx, rows, &chains) {
                 eprintln!("data games-tdat: chains: {e}");
                 return ExitCode::FAILURE;
             }
-            let desc = format!("{tgam} replayed and relabelled at {nodes} nodes by the current engine; {games} games, one chain per game; ti data games-tdat");
+            let labels = if use_game_scores {
+                "cp = the score the playing engine logged for that ply (no second search; plies without a logged score give no row)".to_string()
+            } else {
+                format!("cp = fresh search at {nodes} nodes by the linked engine (--scores search)")
+            };
+            let desc = format!("{tgam} replayed; {labels}; outcome = game result from the mover's view; a pass or an unscored ply gives no row and ends the chain; {games} games; ti data games-tdat");
             if let Err(e) = crate::data::write_tdat_manifest(out.trim_end_matches(".tdat"), &desc, rows as usize) {
                 eprintln!("data games-tdat: manifest: {e}");
                 return ExitCode::FAILURE;
@@ -1231,6 +1505,1284 @@ pub fn run_games_stat(args: &[String]) -> ExitCode {
     if games != hg || plies != hp || bad > 0 {
         eprintln!("data games-stat: MISMATCH against the header or failed replays");
         return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// bestmove: reconstruct the search-best move per row, with early stop on dataset agreement.
+//   ti data bestmove --tdat X.tdat --dag DB [--out STEM] [--rows N] [--seed S] [--all]
+//       [--threads 4] [--tt-bits 18] [--network bundled] [--tol-base 3] [--gap-conf 30] [--gap-dec 50]
+//       [--first-check 1000] [--fresh-rows 101830]
+//   Per row: forced single legal move costs 0 nodes. Otherwise chunked search (default 1k steps to a 5k
+//   budget); at each checkpoint the root best must (a) match a dataset-attested DAG edge out of the
+//   position and (b) sit within tol(N) = tol-base + (5000-N)/1000 cp of the row label before the second
+//   best is even measured (exclusion search). Gap >= gap-dec stops decisively, gap >= gap-conf stops
+//   confidently. Anything else runs to the full budget. Smoke mode (default) samples --rows stratified
+//   by empties x proven (+ fresh tail), always completes to 5k to measure early-vs-full agreement, and
+//   reports full-budget % / flip % / node extrapolation. --all writes STEM.best (u16 LE per row:
+//   move code, PASS_CODE for pass, 0xFFFF unknown) plus a manifest; early stop is then real.
+// ---------------------------------------------------------------------------------------------------------------
+
+pub const BEST_UNKNOWN: u16 = 0xFFFF;
+
+/// In-RAM index of every dataset position, bucketed by stone count.
+/// A legal child with k stones is looked up ONLY in bucket[k]; clones (+1) and jumps (+0)
+/// never cross buckets, so each attestation check is one O(1) hash probe.
+struct DatasetIndex {
+    buckets: Vec<std::collections::HashMap<(u64, u64, u8), u32>>,
+}
+
+fn build_dataset_index(tdat: &str) -> Result<DatasetIndex, String> {
+    let f = File::open(tdat).map_err(|e| format!("{tdat}: {e}"))?;
+    let total = f.metadata().map_err(|e| e.to_string())?.len() / REC as u64;
+    let mut idx = DatasetIndex { buckets: (0..50).map(|_| std::collections::HashMap::new()).collect() };
+    let mut rd = BufReader::with_capacity(1 << 20, f);
+    let mut buf = vec![0u8; REC * 16384];
+    let mut left = total;
+    let mut done = 0u64;
+    while left > 0 {
+        let n = (left as usize).min(16384);
+        rd.read_exact(&mut buf[..n * REC]).map_err(|e| format!("{tdat}: short read at row {done}: {e}"))?;
+        for c in buf[..n * REC].chunks_exact(REC) {
+            let r = Rec::from_bytes(c);
+            let stones = (r.occ0 | r.occ1).count_ones() as usize;
+            if stones < 50 {
+                let e = idx.buckets[stones].entry((r.occ0, r.occ1, r.stm)).or_insert(0);
+                *e = e.saturating_add(1);
+            }
+            done += 1;
+        }
+        left -= n as u64;
+        if done % 5_000_000 < 16384 {
+            eprintln!("data bestmove: index {done}/{total} rows");
+        }
+    }
+    let uniq: usize = idx.buckets.iter().map(|b| b.len()).sum();
+    eprintln!("data bestmove: index built: {total} rows -> {uniq} unique positions in 50 buckets");
+    Ok(idx)
+}
+
+impl DatasetIndex {
+    /// True when the child position occurs anywhere in the dataset (any game, any time).
+    fn attested(&self, occ0: u64, occ1: u64, stm: u8, stones: usize) -> bool {
+        if stones >= 50 {
+            return false;
+        }
+        self.buckets[stones].contains_key(&(occ0, occ1, stm))
+    }
+    /// How many dataset rows hold the position (0 = unattested). Saturates.
+    fn count(&self, occ0: u64, occ1: u64, stm: u8, stones: usize) -> u32 {
+        if stones >= 50 {
+            return 0;
+        }
+        self.buckets[stones].get(&(occ0, occ1, stm)).copied().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// stitch: unroll dataset-supported game lines from the root(s), classify F1-F4, report. No DB writes.
+//   ti data stitch --tdat X.tdat [--max-lines N] [--max-nodes M] [--max-depth D] [--threads T]
+//   Phase 1 (this command): DFS from the start position over ATTESTED children only (piece-count buckets
+//   k/k+1), most-travelled first. Every completed terminal line is hashed (F3), checked for mid-line
+//   ambiguity (F2: >1 attested child off the opening 8 plies) and counted. Dead ends (no attested child)
+//   and caps stop lines. Report-only: lines completed/unique, main-bucket vs purgatory-bucket, dead
+//   ends, node visits, branching histogram, coverage vs the index. Commit (phase 2) is separate.
+// ---------------------------------------------------------------------------------------------------------------
+
+struct StLine {
+    path: Vec<u16>,
+    result: u8,
+    amb_mid: u32,
+    amb_open: u32,
+    forced: u32,
+}
+
+#[derive(Default)]
+struct StStats {
+    nodes: u64,
+    dead_ends: u64,
+    capped: u64,
+    branch_hist: [u64; 8],
+}
+
+fn enc_stitch_move(m: Move) -> u16 {
+    if m.is_pass() {
+        return PASS_CODE;
+    }
+    move_code(m)
+}
+
+fn stitch_finish(path: &[u16], amb_path: &[bool], b: &Board, out_lines: &mut Vec<StLine>) {
+    let (bx, bo) = b.bz_counts();
+    let res = if bx > bo { 2 } else if bx == bo { 1 } else { 0 };
+    let amb_open = amb_path.iter().take(8).filter(|&&x| x).count() as u32;
+    let amb_mid = amb_path.iter().skip(8).filter(|&&x| x).count() as u32;
+    let forced = path.len() as u32 - amb_open - amb_mid;
+    out_lines.push(StLine { path: path.to_vec(), result: res, amb_mid, amb_open, forced });
+}
+
+/// Legal moves whose child occurs anywhere in the dataset (either row convention),
+/// most-travelled first. Empty = dead end from here.
+fn attested_children(b: &Board, idx: &DatasetIndex) -> Vec<(Move, u32)> {
+    let legal = b.legal_moves();
+    let mut kids: Vec<(Move, u32)> = Vec::new();
+    for i in 0..legal.len() {
+        let m = legal.move_at(i);
+        let c = b.make(m);
+        let stones = (c.occ[0] | c.occ[1]).count_ones() as usize;
+        if stones >= 50 {
+            continue;
+        }
+        // Two storage forms (D769): mover-relative rows (the teacher_kind-1 body) keep the mover's stones in
+        // occ0 and stm 0 ALWAYS; colour-absolute rows keep side 0 in occ0 and the real stm. Probing the first
+        // form with stm = c.turn missed every child of a body row. When the child's mover is side 0 both forms
+        // are the same key, so it is counted once.
+        let (a0, a1) = if c.turn == 0 { (c.occ[0], c.occ[1]) } else { (c.occ[1], c.occ[0]) };
+        let n = idx.count(a0, a1, 0, stones) + if c.turn == 0 { 0 } else { idx.count(c.occ[0], c.occ[1], c.turn, stones) };
+        if n > 0 {
+            kids.push((m, n));
+        }
+    }
+    kids.sort_by(|x, y| y.1.cmp(&x.1));
+    kids
+}
+
+fn stitch_subtree(
+    root: Board,
+    root_moves: Vec<Move>,
+    idx: &DatasetIndex,
+    max_lines: u64,
+    max_nodes: u64,
+    max_depth: usize,
+    lines_done: &AtomicUsize,
+    nodes_done: &AtomicU64,
+    out_lines: &mut Vec<StLine>,
+    out_visited: &mut std::collections::HashSet<(u64, u64, u8)>,
+    st: &mut StStats,
+) {
+    struct Frame {
+        board: Board,
+        children: Vec<(Move, u32)>,
+        next: usize,
+    }
+    macro_rules! backtrack {
+        ($stack:expr, $path:expr, $amb_path:expr, $depth:expr, $b:expr) => {{
+            let mut advanced = false;
+            while let Some(mut fr) = $stack.pop() {
+                $path.pop();
+                $amb_path.pop();
+                $depth -= 1;
+                if fr.next < fr.children.len() {
+                    let (m, _) = fr.children[fr.next];
+                    fr.next += 1;
+                    let nb = fr.board.make(m);
+                    let multi = fr.children.len() > 1;
+                    $stack.push(fr);
+                    $b = nb;
+                    $path.push(enc_stitch_move(m));
+                    $amb_path.push(multi);
+                    $depth += 1;
+                    advanced = true;
+                    break;
+                }
+            }
+            advanced
+        }};
+    }
+    for &first in &root_moves {
+        if lines_done.load(Ordering::Relaxed) as u64 >= max_lines {
+            break;
+        }
+        let mut b = root.make(first);
+        let mut path: Vec<u16> = vec![enc_stitch_move(first)];
+        let mut amb_path: Vec<bool> = vec![root_moves.len() > 1];
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut depth = 1usize;
+        loop {
+            if nodes_done.fetch_add(1, Ordering::Relaxed) >= max_nodes {
+                st.capped += 1;
+                break;
+            }
+            st.nodes += 1;
+            out_visited.insert((b.occ[0], b.occ[1], b.turn));
+            if b.bz_over() || depth >= max_depth {
+                stitch_finish(&path, &amb_path, &b, out_lines);
+                lines_done.fetch_add(1, Ordering::Relaxed);
+                if !backtrack!(stack, path, amb_path, depth, b) {
+                    break;
+                }
+                continue;
+            }
+            if !b.has_moves(b.turn) {
+                stitch_finish(&path, &amb_path, &b, out_lines);
+                lines_done.fetch_add(1, Ordering::Relaxed);
+                st.dead_ends += 1;
+                if !backtrack!(stack, path, amb_path, depth, b) {
+                    break;
+                }
+                continue;
+            }
+            // Expand: legal moves with dataset-attested children, most-travelled first.
+            let mut kids = attested_children(&b, idx);
+            let nb = kids.len().min(7);
+            st.branch_hist[nb] += 1;
+            if kids.is_empty() {
+                st.dead_ends += 1;
+                if !backtrack!(stack, path, amb_path, depth, b) {
+                    break;
+                }
+                continue;
+            }
+            let multi = kids.len() > 1;
+            let (m0, _) = kids[0];
+            stack.push(Frame { board: b, children: kids, next: 1 });
+            b = b.make(m0);
+            path.push(enc_stitch_move(m0));
+            amb_path.push(multi);
+            depth += 1;
+            if lines_done.load(Ordering::Relaxed) as u64 >= max_lines {
+                st.capped += 1;
+                break;
+            }
+        }
+    }
+}
+
+pub fn run_stitch(args: &[String]) -> ExitCode {
+    let Some(tdat) = crate::flag_str(args, "--tdat") else {
+        eprintln!("usage: ti data stitch --tdat X.tdat [--max-lines N] [--max-nodes M] [--max-depth D] [--threads T] [--diag-roots N] [--diag-conv N] [--diag-show N] [--diag-run START]");
+        return ExitCode::FAILURE;
+    };
+    let diag_roots = crate::flag_u64(args, "--diag-roots").unwrap_or(0) as usize;
+    let diag_conv = crate::flag_u64(args, "--diag-conv").unwrap_or(0) as usize;
+    let diag_show = crate::flag_u64(args, "--diag-show").unwrap_or(0) as usize;
+    if crate::flag_u64(args, "--diag-run").is_some() {
+        // Print every row of one chain run as grids: is a run a real game or not?
+        let start = crate::flag_u64(args, "--diag-run").unwrap();
+        let chain_path = format!("{}.chains", tdat.trim_end_matches(".tdat"));
+        let (_, chains) = match read_chains(&chain_path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let ch = match chains.iter().find(|c| c.start as u64 == start) {
+            Some(c) => c,
+            None => {
+                eprintln!("data stitch: no run starts at row {start}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut rs5 = match RowStream::open(&tdat) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if rs5.advance(ch.start as u64, None).is_err() {
+            eprintln!("data stitch: seek failed");
+            return ExitCode::FAILURE;
+        }
+        let rows = match rs5.take(ch.len as usize) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("data stitch diag-run: run@{} len={} conv={}", ch.start, ch.len, ch.conv);
+        for (k, r) in rows.iter().enumerate() {
+            let mut s = format!("row+{k} stm={} stones={}\n", r.stm, (r.occ0 | r.occ1).count_ones());
+            for rr in 0..7 {
+                for cc in 0..7 {
+                    let i = (rr * 7 + cc) as u64;
+                    s.push(if r.occ0 >> i & 1 == 1 { 'x' } else if r.occ1 >> i & 1 == 1 { 'o' } else { '.' });
+                }
+                s.push('\n');
+            }
+            println!("{s}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if diag_show > 0 {
+        // Adjacency truth: sample N random adjacent file-row pairs and test the link
+        // predicate both conventions. ~100% linked = game-ordered file; ~0% = shuffled
+        // (chains stale, lambda targets meaningless).
+        let adj_n = diag_show;
+        let total = std::fs::metadata(&tdat).map(|m| m.len() / REC as u64).unwrap_or(0);
+        let mut rs4 = match RowStream::open(&tdat) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut rng: u64 = 0x12345678 | 1;
+        let mut counts = [0u64; 3];
+        let mut empt: [u64; 3] = [0, 0, 0];
+        for _ in 0..adj_n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let at = (rng % total.saturating_sub(1).max(1)) as u64;
+            if rs4.advance(at, None).is_err() {
+                break;
+            }
+            let rows = match rs4.take(2) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if rows.len() < 2 {
+                break;
+            }
+            let (a, b) = (rows[0], rows[1]);
+            let e = 49 - (a.occ0 | a.occ1).count_ones();
+            let bucket = if e < 10 { 0 } else if e < 25 { 1 } else { 2 };
+            match crate::gamedata::link_conv(&a, &b) {
+                Some(0) => {
+                    counts[0] += 1;
+                    empt[bucket] += 1;
+                }
+                Some(_) => {
+                    counts[1] += 1;
+                    empt[bucket] += 1;
+                }
+                None => {
+                    counts[2] += 1;
+                }
+            }
+        }
+        let tot = (counts[0] + counts[1] + counts[2]).max(1) as f64;
+        println!("data stitch diag-adjacency: {adj_n} random adjacent pairs: conv0={} conv1={} unlinked={} ({:.1}% linked)", counts[0], counts[1], counts[2], 100.0 * (counts[0] + counts[1]) as f64 / tot);
+        return ExitCode::SUCCESS;
+    }
+    let max_lines = crate::flag_u64(args, "--max-lines").unwrap_or(100_000);
+    let max_nodes = crate::flag_u64(args, "--max-nodes").unwrap_or(20_000_000);
+    let max_depth = crate::flag_u64(args, "--max-depth").unwrap_or(400) as usize;
+    let threads = crate::flag_u64(args, "--threads").unwrap_or(8).max(1) as usize;
+    let t0 = std::time::Instant::now();
+    let idx = match build_dataset_index(&tdat) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("data stitch: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("data stitch: index ready in {:.0}s", t0.elapsed().as_secs_f64());
+    // Roots: every chain start is a real game beginning (or post-pass resume) WITH its row
+    // convention flag, so each resolves to an exact engine board. Dedupe identical roots.
+    let chain_path = format!("{}.chains", tdat.trim_end_matches(".tdat"));
+    let (idx_rows, chains) = match read_chains(&chain_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("data stitch: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut rs = match RowStream::open(&tdat) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("data stitch: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut seen_root = std::collections::HashSet::new();
+    let mut units: Vec<(Board, Vec<Move>)> = Vec::new();
+    let mut root_dead = 0u64;
+    for ch in &chains {
+        if rs.advance(ch.start as u64, None).is_err() {
+            eprintln!("data stitch: chain seek failed at row {}", ch.start);
+            return ExitCode::FAILURE;
+        }
+        let rows = match rs.take(1) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let r = rows[0];
+        let (s0, s1) = if ch.conv == 0 {
+            if r.stm == 0 {
+                (r.occ0, r.occ1)
+            } else {
+                (r.occ1, r.occ0)
+            }
+        } else {
+            (r.occ0, r.occ1)
+        };
+        if !seen_root.insert((s0, s1, r.stm)) {
+            continue;
+        }
+        let b = Board::from_occ(s0, s1, 0, r.stm);
+        let kids = attested_children(&b, &idx);
+        if kids.is_empty() {
+            root_dead += 1;
+            continue;
+        }
+        units.push((b, kids.into_iter().map(|(m, _)| m).collect()));
+    }
+    println!("data stitch: {} chains -> {} unique roots with attested children ({} roots dead, {} duplicate)", chains.len(), units.len(), root_dead, seen_root.len().saturating_sub(units.len() + root_dead as usize));
+    if diag_conv > 0 {
+        // Settle the row convention once and for all: for sampled chain-adjacent transitions
+        // (parent row -> TRUE next row in the same run), score 4 reconstruction hypotheses by
+        // whether engine movegen from the reconstructed parent reproduces the true child.
+        // 6 hypotheses, body vs tail separately. A hypothesis scores when engine movegen
+        // from its reconstructed parent reproduces the TRUE next row of the same chain run.
+        // H0 black-absolute, H1 white-absolute, H2 conv-flag, H3 order-insensitive,
+        // H4 turn-flipped raw, H5 turn-flipped swapped (uniform colour-flip of the file).
+        let mut tested = [0u64; 2];
+        let mut hits = [[0u64; 6]; 2];
+        let tail_start = std::fs::metadata(&tdat).map(|m| m.len() / REC as u64).unwrap_or(u64::MAX).saturating_sub(101_830);
+        let mut rs2 = match RowStream::open(&tdat) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("data stitch: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut done = 0usize;
+        for ch in &chains {
+            if done >= diag_conv {
+                break;
+            }
+            if (ch.len as usize) < 3 {
+                continue;
+            }
+            if rs2.advance(ch.start as u64, None).is_err() {
+                break;
+            }
+            let rows = match rs2.take(ch.len as usize) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let i = rows.len() / 2;
+            if i + 1 >= rows.len() {
+                continue;
+            }
+            let (p, n) = (rows[i], rows[i + 1]);
+            let region = if (ch.start as u64 + i as u64) >= tail_start { 1 } else { 0 };
+            let b_black = Board::from_occ(p.occ0, p.occ1, 0, p.stm);
+            let b_white = Board::from_occ(p.occ1, p.occ0, 0, p.stm);
+            let (bm0, bm1) = if ch.conv == 0 {
+                if p.stm == 0 { (p.occ0, p.occ1) } else { (p.occ1, p.occ0) }
+            } else {
+                (p.occ0, p.occ1)
+            };
+            let b_flag = Board::from_occ(bm0, bm1, 0, p.stm);
+            let b_flip = Board::from_occ(p.occ0, p.occ1, 0, 1 - p.stm);
+            tested[region] += 1;
+            done += 1;
+            let mut hb = [false; 6];
+            // H0 black-absolute, H1 white-absolute, H2 conv-flag: exact child match.
+            for (h, b) in [&b_black, &b_white, &b_flag].into_iter().enumerate() {
+                let swap = h == 1;
+                let legal = b.legal_moves();
+                for k in 0..legal.len() {
+                    let c = b.make(legal.move_at(k));
+                    let (e0, e1) = if swap { (c.occ[1], c.occ[0]) } else { (c.occ[0], c.occ[1]) };
+                    if e0 == n.occ0 && e1 == n.occ1 && c.turn == n.stm {
+                        hb[h] = true;
+                        break;
+                    }
+                }
+            }
+            // H3 order-insensitive under the black board.
+            {
+                let legal = b_black.legal_moves();
+                for k in 0..legal.len() {
+                    let c = b_black.make(legal.move_at(k));
+                    if (c.occ[0] == n.occ0 && c.occ[1] == n.occ1 || c.occ[0] == n.occ1 && c.occ[1] == n.occ0) && c.turn == n.stm {
+                        hb[3] = true;
+                        break;
+                    }
+                }
+            }
+            // H4/H5: the file's stm means the opposite colour.
+            {
+                let legal = b_flip.legal_moves();
+                for k in 0..legal.len() {
+                    let c = b_flip.make(legal.move_at(k));
+                    if c.turn != 1 - n.stm {
+                        continue;
+                    }
+                    if c.occ[0] == n.occ0 && c.occ[1] == n.occ1 {
+                        hb[4] = true;
+                    }
+                    if c.occ[1] == n.occ0 && c.occ[0] == n.occ1 {
+                        hb[5] = true;
+                    }
+                    if hb[4] && hb[5] {
+                        break;
+                    }
+                }
+            }
+            for h in 0..6 {
+                if hb[h] {
+                    hits[region][h] += 1;
+                }
+            }
+        }
+        println!("data stitch diag-conv: body tested={} black={} white={} convflag={} order-insens={} flip-raw={} flip-swapped={}", tested[0], hits[0][0], hits[0][1], hits[0][2], hits[0][3], hits[0][4], hits[0][5]);
+        println!("data stitch diag-conv: tail tested={} black={} white={} convflag={} order-insens={} flip-raw={} flip-swapped={}", tested[1], hits[1][0], hits[1][1], hits[1][2], hits[1][3], hits[1][4], hits[1][5]);
+        return ExitCode::SUCCESS;
+    }
+    if diag_roots > 0 {
+        // Diagnose WHY roots are dead: for the first N dead roots, test every key spelling
+        // against the whole index and report which (if any) hits.
+        let mut shown = 0usize;
+        let mut hit_pat = [0u64; 4];
+        let mut checked = 0u64;
+        'outer: for ch in &chains {
+            if shown >= diag_roots {
+                break;
+            }
+            if rs.advance(ch.start as u64, None).is_err() {
+                break;
+            }
+            let rows = match rs.take(1) {
+                Ok(r) => r,
+                _ => break,
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let r = rows[0];
+            let (s0, s1) = if ch.conv == 0 {
+                if r.stm == 0 { (r.occ0, r.occ1) } else { (r.occ1, r.occ0) }
+            } else {
+                (r.occ0, r.occ1)
+            };
+            let b = Board::from_occ(s0, s1, 0, r.stm);
+            let legal = b.legal_moves();
+            let mut any_att = false;
+            for i in 0..legal.len() {
+                let m = legal.move_at(i);
+                let c = b.make(m);
+                let stones = (c.occ[0] | c.occ[1]).count_ones() as usize;
+                if stones >= 50 {
+                    continue;
+                }
+                let (a0, a1) = if c.turn == 0 { (c.occ[0], c.occ[1]) } else { (c.occ[1], c.occ[0]) };
+                // mover-relative rows are stored with stm 0 (D769)
+                if idx.count(a0, a1, 0, stones) + idx.count(c.occ[0], c.occ[1], c.turn, stones) > 0 {
+                    any_att = true;
+                    break;
+                }
+            }
+            if any_att {
+                continue;
+            }
+            // Dead root: try all 4 key spellings of every legal child across ALL buckets.
+            checked += 1;
+            let mut pat = [false; 4];
+            for i in 0..legal.len() {
+                let m = legal.move_at(i);
+                let c = b.make(m);
+                for bb in 0..50 {
+                    if idx.buckets[bb].contains_key(&(c.occ[0], c.occ[1], c.turn)) { pat[0] = true; }
+                    if idx.buckets[bb].contains_key(&(c.occ[1], c.occ[0], c.turn)) { pat[1] = true; }
+                    if idx.buckets[bb].contains_key(&(c.occ[0], c.occ[1], 1 - c.turn)) { pat[2] = true; }
+                    if idx.buckets[bb].contains_key(&(c.occ[1], c.occ[0], 1 - c.turn)) { pat[3] = true; }
+                }
+                for k in 0..4 {
+                    if pat[k] {
+                        hit_pat[k] += 1;
+                    }
+                }
+                if shown < 3 {
+                    eprintln!("diag root stm={} conv={} stones={} legal={} pat={:?}", r.stm, ch.conv, (r.occ0 | r.occ1).count_ones(), legal.len(), pat);
+                    shown += 1;
+                }
+                if shown >= 3 && checked > 50 {
+                    // keep counting patterns cheaply without printing
+                }
+                if checked >= 200 {
+                    break 'outer;
+                }
+            }
+        }
+        println!("data stitch diag: {checked} dead roots probed; key-spelling hits: raw-turn={} swapped-turn={} raw-flipped={} swapped-flipped={}", hit_pat[0], hit_pat[1], hit_pat[2], hit_pat[3]);
+        return ExitCode::SUCCESS;
+    }
+    if units.is_empty() {
+        eprintln!("data stitch: no live roots; nothing to unroll");
+        return ExitCode::FAILURE;
+    }
+    let next_unit = AtomicUsize::new(0);
+    let lines_done = AtomicUsize::new(0);
+    let nodes_done = AtomicU64::new(0);
+    let merged_lines = Mutex::new(Vec::<StLine>::new());
+    let merged_visited = Mutex::new(std::collections::HashSet::new());
+    let merged_stats = Mutex::new(StStats::default());
+    let t1 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut local_lines: Vec<StLine> = Vec::new();
+                let mut local_visited: std::collections::HashSet<(u64, u64, u8)> = std::collections::HashSet::new();
+                let mut local_st = StStats::default();
+                loop {
+                    let r = next_unit.fetch_add(1, Ordering::Relaxed);
+                    if r >= units.len() {
+                        break;
+                    }
+                    let (rt, rm) = &units[r];
+                    stitch_subtree(
+                        *rt,
+                        rm.clone(),
+                        &idx,
+                        max_lines,
+                        max_nodes,
+                        max_depth,
+                        &lines_done,
+                        &nodes_done,
+                        &mut local_lines,
+                        &mut local_visited,
+                        &mut local_st,
+                    );
+                    if lines_done.load(Ordering::Relaxed) as u64 >= max_lines {
+                        break;
+                    }
+                }
+                merged_lines.lock().unwrap().extend(local_lines);
+                let mut mv = merged_visited.lock().unwrap();
+                for k in local_visited {
+                    mv.insert(k);
+                }
+                let mut g = merged_stats.lock().unwrap();
+                g.nodes += local_st.nodes;
+                g.dead_ends += local_st.dead_ends;
+                g.capped += local_st.capped;
+                for i in 0..8 {
+                    g.branch_hist[i] += local_st.branch_hist[i];
+                }
+            });
+        }
+    });
+    let dt = t1.elapsed().as_secs_f64().max(0.001);
+    let lines = merged_lines.lock().unwrap();
+    let visited = merged_visited.lock().unwrap();
+    let g = merged_stats.lock().unwrap();
+    // F3: exact line dedup by path hash.
+    let mut seen = std::collections::HashSet::<u64>::new();
+    let mut uniq_main = 0u64;
+    let mut uniq_purg = 0u64;
+    let mut uniq_eval = 0u64;
+    for l in lines.iter() {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &c in &l.path {
+            h ^= c as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= l.result as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        if !seen.insert(h) {
+            continue;
+        }
+        if l.amb_mid == 0 && l.amb_open == 0 {
+            uniq_main += 1;
+        } else if l.amb_mid == 0 {
+            uniq_eval += 1;
+        } else {
+            uniq_purg += 1;
+        }
+    }
+    println!("data stitch: {} lines completed in {:.1}s ({:.0} lines/s, {:.0} nodes/s)", lines.len(), dt, lines.len() as f64 / dt, g.nodes as f64 / dt);
+    println!("  unique lines: {} (main-clean {} | opening-only {} | purgatory {})", seen.len(), uniq_main, uniq_eval, uniq_purg);
+    println!("  dead ends: {} | capped stops: {} | nodes visited: {} | positions covered: {}", g.dead_ends, g.capped, g.nodes, visited.len());
+    println!("  branching histogram (attested children per node, capped at 7): {:?}", g.branch_hist);
+    ExitCode::SUCCESS
+}
+
+struct BmCfg {
+    checks: Vec<u64>,
+    budget: u64,
+    label_bound: i64,
+    gap_conf: i64,
+    gap_dec: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BmKind {
+    Forced,
+    Terminal,
+    Decisive,
+    Confident,
+    Full,
+    NoResult,
+}
+
+struct BmOutcome {
+    kind: BmKind,
+    early: Option<Move>,
+    full: Option<Move>,
+    nodes: u64,
+    had_options: bool,
+    label_ok: bool,
+    gap_small: bool,
+    /// label-|eval| bin at first checkpoint (0..6) or 255; gap bin at first exclusion (0..4) or 255.
+    d0bin: u8,
+    g0bin: u8,
+}
+
+fn diff_bin(d: i64) -> u8 {
+    let a = d.abs() as u64;
+    if a < 3 { 0 } else if a < 7 { 1 } else if a < 15 { 2 } else if a < 30 { 3 } else if a < 60 { 4 } else if a < 150 { 5 } else { 6 }
+}
+
+fn gap_bin(g: i64) -> u8 {
+    let a = g as u64;
+    if a < 10 { 0 } else if a < 20 { 1 } else if a < 30 { 2 } else if a < 50 { 3 } else { 4 }
+}
+
+#[derive(Default)]
+struct BmStats {
+    n: u64,
+    forced: u64,
+    terminal: u64,
+    no_options: u64,
+    no_result: u64,
+    label_ok: u64,
+    gap_small: u64,
+    decisive: u64,
+    confident: u64,
+    full: u64,
+    agree: u64,
+    nodes: u64,
+    hdiff: [u64; 7],
+    hgap: [u64; 5],
+}
+
+/// Stratum 0..7: empties bucket (0-9, 10-19, 20-29, 30+) x proven; 8 = fresh tail (forced sample).
+fn bm_stratum(rec: &Rec) -> u8 {
+    let empties = 49 - (rec.occ0 | rec.occ1).count_ones();
+    let b = if empties < 10 { 0 } else if empties < 20 { 1 } else if empties < 30 { 2 } else { 3 };
+    let p = if rec.cp.abs() >= 98000.0 { 1 } else { 0 };
+    b * 2 + p
+}
+
+fn bm_process_row(
+    rec: &Rec,
+    searcher: &mut titanium::search::Searcher,
+    idx: &DatasetIndex,
+    cfg: &BmCfg,
+    finish: bool,
+) -> BmOutcome {
+    let b = Board::from_occ(rec.occ0, rec.occ1, 0, rec.stm);
+    let legal = b.legal_moves();
+    if legal.len() == 0 {
+        return BmOutcome { kind: BmKind::Terminal, early: None, full: None, nodes: 0, had_options: false, label_ok: false, gap_small: false, d0bin: 255, g0bin: 255 };
+    }
+    if legal.len() == 1 {
+        let m = legal.move_at(0);
+        return BmOutcome { kind: BmKind::Forced, early: Some(m), full: Some(m), nodes: 0, had_options: false, label_ok: false, gap_small: false, d0bin: 255, g0bin: 255 };
+    }
+    // Dataset-attested: the child position occurs anywhere in the 29M rows (either row convention:
+    // mover-relative occ0 or colour-absolute occ0). One O(1) probe in exactly one stone-count bucket.
+    let attested = |m: Move| {
+        let c = b.make(m);
+        let stones = (c.occ[0] | c.occ[1]).count_ones() as usize;
+        if stones >= 50 {
+            return false;
+        }
+        let (a0, a1) = if c.turn == 0 { (c.occ[0], c.occ[1]) } else { (c.occ[1], c.occ[0]) };
+        // mover-relative rows are stored with stm 0 (D769); probing them with stm = c.turn never matched
+        idx.attested(a0, a1, 0, stones) || idx.attested(c.occ[0], c.occ[1], c.turn, stones)
+    };
+    let mut had_options = false;
+    for i in 0..legal.len() {
+        if attested(legal.move_at(i)) {
+            had_options = true;
+            break;
+        }
+    }
+    // Fast path: nothing in the dataset attests any child, so no gate can ever fire.
+    // One straight budget search, no chunking, no exclusion.
+    if !had_options {
+        let limits = SearchLimits { time: None, max_nodes: Some(cfg.budget), max_depth: 30 };
+        let r = searcher.search_bz(&b, &limits);
+        let nodes = r.nodes as u64;
+        return match r.best {
+            Some(m) => BmOutcome { kind: BmKind::Full, early: None, full: Some(m), nodes, had_options: false, label_ok: false, gap_small: false, d0bin: 255, g0bin: 255 },
+            None => BmOutcome { kind: BmKind::NoResult, early: None, full: None, nodes, had_options: false, label_ok: false, gap_small: false, d0bin: 255, g0bin: 255 },
+        };
+    }
+    let label = rec.cp.round() as i64;
+    let mut nodes = 0u64;
+    let mut early: Option<(BmKind, Move)> = None;
+    let mut full_mv: Option<Move> = None;
+    let mut saw_label = false;
+    let mut saw_small = false;
+    let mut prev: Option<(Move, i32)> = None;
+    let mut d0: u8 = 255;
+    let mut g0: u8 = 255;
+    for (ci, &cp) in cfg.checks.iter().enumerate() {
+        let last = ci + 1 == cfg.checks.len();
+        let limits = SearchLimits { time: None, max_nodes: Some(cp), max_depth: 30 };
+        let r = searcher.search_bz(&b, &limits);
+        nodes += r.nodes as u64;
+        let Some(m1) = r.best else {
+            if last {
+                return BmOutcome { kind: BmKind::NoResult, early: early.map(|(_, m)| m), full: full_mv, nodes, had_options, label_ok: saw_label, gap_small: saw_small, d0bin: d0, g0bin: g0 };
+            }
+            continue;
+        };
+        full_mv = Some(m1);
+        if ci == 0 && had_options {
+            d0 = diff_bin(r.score as i64 - label);
+        }
+        // Stability: the same root move at two consecutive checkpoints. Transient 1k-node
+        // blips never fire; earliest possible fire is the second checkpoint.
+        let stable = match prev {
+            Some((pm, _)) => pm.from == m1.from && pm.to == m1.to,
+            None => false,
+        };
+        prev = Some((m1, r.score));
+        if !last && early.is_none() && had_options && stable && attested(m1) && (r.score as i64 - label).abs() <= cfg.label_bound {
+            saw_label = true;
+            let re = searcher.search_bz_excluding(&b, &limits, &[m1]);
+            nodes += re.nodes as u64;
+            let gap = match re.best {
+                Some(_) => r.score - re.score,
+                None => i32::MAX / 2, // best stands alone: maximally decisive
+            };
+            if g0 == 255 {
+                g0 = gap_bin(gap as i64);
+            }
+            if gap as i64 >= cfg.gap_dec {
+                early = Some((BmKind::Decisive, m1));
+            } else if gap as i64 >= cfg.gap_conf {
+                early = Some((BmKind::Confident, m1));
+            } else {
+                saw_small = true;
+            }
+            if !finish {
+                if let Some((k, m)) = early {
+                    return BmOutcome { kind: k, early: Some(m), full: Some(m), nodes, had_options, label_ok: saw_label, gap_small: saw_small, d0bin: d0, g0bin: g0 };
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    match early {
+        Some((BmKind::Decisive, m)) => BmOutcome { kind: BmKind::Decisive, early: Some(m), full: full_mv, nodes, had_options, label_ok: saw_label, gap_small: saw_small, d0bin: d0, g0bin: g0 },
+        Some((BmKind::Confident, m)) => BmOutcome { kind: BmKind::Confident, early: Some(m), full: full_mv, nodes, had_options, label_ok: saw_label, gap_small: saw_small, d0bin: d0, g0bin: g0 },
+        _ => BmOutcome {
+            kind: if full_mv.is_some() { BmKind::Full } else { BmKind::NoResult },
+            early: None,
+            full: full_mv,
+            nodes,
+            had_options,
+            label_ok: saw_label,
+            gap_small: saw_small,
+            d0bin: d0,
+            g0bin: g0,
+        },
+    }
+}
+
+fn bm_merge(dst: &mut BmStats, s: &BmStats, strat: &mut [[u64; 5]; 9], ls: &[[u64; 5]; 9]) {
+    dst.n += s.n;
+    dst.forced += s.forced;
+    dst.terminal += s.terminal;
+    dst.no_options += s.no_options;
+    dst.no_result += s.no_result;
+    dst.label_ok += s.label_ok;
+    dst.gap_small += s.gap_small;
+    dst.decisive += s.decisive;
+    dst.confident += s.confident;
+    dst.full += s.full;
+    dst.agree += s.agree;
+    dst.nodes += s.nodes;
+    for i in 0..7 {
+        dst.hdiff[i] += s.hdiff[i];
+    }
+    for i in 0..5 {
+        dst.hgap[i] += s.hgap[i];
+    }
+    for i in 0..9 {
+        for j in 0..5 {
+            strat[i][j] += ls[i][j];
+        }
+    }
+}
+
+pub fn run_bestmove(args: &[String]) -> ExitCode {
+    let Some(tdat) = crate::flag_str(args, "--tdat") else {
+        eprintln!("usage: ti data bestmove --tdat X.tdat [--out STEM] [--rows N] [--seed S] [--all] [--threads 4] [--tt-bits 18] [--network bundled] [--label-bound 150] [--gap-conf 30] [--gap-dec 50] [--first-check 1000] [--fresh-rows 101830]");
+        return ExitCode::FAILURE;
+    };
+    let out = crate::flag_str(args, "--out").unwrap_or_else(|| format!("{}.best", tdat.trim_end_matches(".tdat")));
+    let all = crate::has_flag(args, "--all");
+    let want_rows = crate::flag_u64(args, "--rows").unwrap_or(10_000) as usize;
+    let seed = crate::flag_u64(args, "--seed").unwrap_or(7) | 1;
+    let threads = crate::flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
+    let tt_bits = crate::flag_u64(args, "--tt-bits").unwrap_or(18) as usize;
+    let network = crate::flag_str(args, "--network").unwrap_or_else(|| "bundled".into());
+    let label_bound = crate::flag_u64(args, "--label-bound").unwrap_or(150) as i64;
+    let gap_conf = crate::flag_u64(args, "--gap-conf").unwrap_or(30) as i64;
+    let gap_dec = crate::flag_u64(args, "--gap-dec").unwrap_or(50) as i64;
+    let first = crate::flag_u64(args, "--first-check").unwrap_or(1000);
+    let fresh_rows = crate::flag_u64(args, "--fresh-rows").unwrap_or(101_830);
+    let budget = 5000u64;
+    let mut checks = vec![first, 2000, 3000, 4000];
+    checks.retain(|&c| c < budget);
+    checks.push(budget);
+    let flat = crate::has_flag(args, "--flat");
+    if flat {
+        // No chunking, no exclusion: one straight budget search per row. The move recorded IS
+        // the budget-best, so early-vs-full disagreement is zero by construction. Early stop
+        // only pays when fires dominate; at single-digit fire rates chunking costs ~3x.
+        checks = vec![budget];
+    }
+    let cfg = BmCfg { checks, budget, label_bound, gap_conf, gap_dec };
+
+    let owned_net: Option<titanium::nnue::Nnue> = if network == "bundled" || network == "none" {
+        None
+    } else {
+        match titanium::nnue::Nnue::load(&network) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("data bestmove: cannot load network {network}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let net_wrapped: Option<&titanium::nnue::Nnue> = match owned_net.as_ref() {
+        Some(n) => Some(n),
+        None if network == "none" => None,
+        None => Some(titanium::nnue::Nnue::bundled_static()),
+    };
+
+    // Work items: (row index, row, stratum). Smoke samples stratified; --all takes every row.
+    #[derive(Clone, Copy)]
+    struct Item {
+        idx: u64,
+        rec: Rec,
+        stratum: u8,
+    }
+    let corpus_rows = match File::open(&tdat).and_then(|f| f.metadata()) {
+        Ok(m) => m.len() / REC as u64,
+        Err(e) => {
+            eprintln!("data bestmove: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if corpus_rows == 0 {
+        eprintln!("data bestmove: {tdat}: 0 rows");
+        return ExitCode::FAILURE;
+    }
+    // Smoke sample up front (stratified reservoir, one streaming pass); --all streams blocks below.
+    let mut sampled: Option<Vec<Item>> = if all {
+        None
+    } else {
+        // Stratified reservoir sample: 8 body strata + fresh tail, one streaming pass.
+        let f = match File::open(&tdat) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("data bestmove: {tdat}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let total = corpus_rows;
+        let tail_start = total.saturating_sub(fresh_rows);
+        let mut caps = [0usize; 9];
+        let body_each = (want_rows * 92 / 100) / 8;
+        for i in 0..8 {
+            caps[i] = body_each;
+        }
+        caps[8] = want_rows.saturating_sub(body_each * 8);
+        let mut res: [Vec<Item>; 9] = Default::default();
+        let mut seen = [0u64; 9];
+        let mut rng = seed;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut rd = BufReader::with_capacity(1 << 20, f);
+        let mut buf = vec![0u8; REC * 16384];
+        let mut idx = 0u64;
+        let mut left = total;
+        while left > 0 {
+            let n = (left as usize).min(16384);
+            if rd.read_exact(&mut buf[..n * REC]).is_err() {
+                eprintln!("data bestmove: short read at row {idx}");
+                return ExitCode::FAILURE;
+            }
+            for c in buf[..n * REC].chunks_exact(REC) {
+                let r = Rec::from_bytes(c);
+                let s = if idx >= tail_start { 8 } else { bm_stratum(&r) as usize };
+                let it = Item { idx, rec: r, stratum: s as u8 };
+                if res[s].len() < caps[s] {
+                    res[s].push(it);
+                } else if caps[s] > 0 {
+                    let j = (next_u64() % (seen[s] + 1)) as usize;
+                    if j < caps[s] {
+                        res[s][j] = it;
+                    }
+                }
+                seen[s] += 1;
+                idx += 1;
+            }
+            left -= n as u64;
+        }
+        Some(res.into_iter().flatten().collect())
+    };
+    if !all && sampled.as_ref().map_or(true, |v| v.is_empty()) {
+        eprintln!("data bestmove: no work items");
+        return ExitCode::FAILURE;
+    }
+
+    // Piece-count index over the whole corpus: the attestation source for every gate.
+    // Built once (~minutes, ~2-3 GB), shared read-only, never stored.
+    let t0 = std::time::Instant::now();
+    let idx = match build_dataset_index(&tdat) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("data bestmove: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("data bestmove: index ready in {:.0}s", t0.elapsed().as_secs_f64());
+    let next = AtomicUsize::new(0);
+    let merged_stats = Mutex::new(BmStats::default());
+    let merged_strat = Mutex::new([[0u64; 5]; 9]);
+    let codes: Mutex<Vec<(u64, u16)>> = Mutex::new(Vec::new());
+    let finish = !all; // smoke completes to 5k for agreement; --all stops at first verdict
+    let mut sidecar: Option<BufWriter<File>> = None;
+    let mut sidecar_n = 0u64;
+    if all {
+        let path = format!("{}.best", out.trim_end_matches(".best"));
+        match File::create(&path) {
+            Ok(f) => sidecar = Some(BufWriter::with_capacity(1 << 20, f)),
+            Err(e) => {
+                eprintln!("data bestmove: cannot create {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let mut rs_main: Option<RowStream> = None;
+    let mut block_start = 0u64;
+    const BLOCK: u64 = 65536;
+    loop {
+        // One block per iteration (--all, streamed) or the single sample (smoke).
+        let items: Vec<Item> = if all {
+            if rs_main.is_none() {
+                match RowStream::open(&tdat) {
+                    Ok(r) => rs_main = Some(r),
+                    Err(e) => {
+                        eprintln!("data bestmove: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            let rd = match rs_main.as_mut() {
+                Some(r) => r,
+                None => {
+                    eprintln!("data bestmove: reader missing");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let n = (corpus_rows - block_start).min(BLOCK) as usize;
+            if n == 0 {
+                Vec::new()
+            } else {
+                match rd.take(n) {
+                    Ok(rows) => {
+                        let mut v = Vec::with_capacity(n);
+                        for (k, r) in rows.into_iter().enumerate() {
+                            v.push(Item { idx: block_start + k as u64, rec: r, stratum: bm_stratum(&r) });
+                        }
+                        block_start += n as u64;
+                        v
+                    }
+                    Err(e) => {
+                        eprintln!("data bestmove: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        } else {
+            match sampled.take() {
+                Some(v) => v,
+                None => Vec::new(),
+            }
+        };
+        if items.is_empty() {
+            break;
+        }
+        next.store(0, Ordering::Relaxed);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut searcher = titanium::search::Searcher::with_tt_bits_unconfigured(tt_bits);
+                searcher.set_nnue(net_wrapped);
+                let mut ls = BmStats::default();
+                let mut lstrat = [[0u64; 5]; 9];
+                let mut lcodes: Vec<(u64, u16)> = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= items.len() {
+                        break;
+                    }
+                    let it = &items[i];
+                    let o = bm_process_row(&it.rec, &mut searcher, &idx, &cfg, finish);
+                    ls.n += 1;
+                    ls.nodes += o.nodes;
+                    let s = it.stratum as usize;
+                    lstrat[s][0] += 1;
+                    lstrat[s][4] += o.nodes;
+                    let same = |a: Option<Move>, b: Option<Move>| match (a, b) {
+                        (Some(x), Some(y)) => x.from == y.from && x.to == y.to,
+                        _ => false,
+                    };
+                    let mv_code = |m: Option<Move>| -> u16 {
+                        match m {
+                            None => BEST_UNKNOWN,
+                            Some(m) if m.is_pass() => PASS_CODE,
+                            Some(m) => move_code(m),
+                        }
+                    };
+                    match o.kind {
+                        BmKind::Forced => {
+                            ls.forced += 1;
+                            lcodes.push((it.idx, mv_code(o.full)));
+                        }
+                        BmKind::Terminal => {
+                            ls.terminal += 1;
+                            lcodes.push((it.idx, BEST_UNKNOWN));
+                        }
+                        BmKind::Decisive => {
+                            ls.decisive += 1;
+                            lstrat[s][2] += 1;
+                            if same(o.early, o.full) {
+                                ls.agree += 1;
+                                lstrat[s][3] += 1;
+                            }
+                            lcodes.push((it.idx, mv_code(o.full)));
+                        }
+                        BmKind::Confident => {
+                            ls.confident += 1;
+                            lstrat[s][2] += 1;
+                            if same(o.early, o.full) {
+                                ls.agree += 1;
+                                lstrat[s][3] += 1;
+                            }
+                            lcodes.push((it.idx, mv_code(o.full)));
+                        }
+                        BmKind::Full => {
+                            ls.full += 1;
+                            lstrat[s][1] += 1;
+                            lcodes.push((it.idx, mv_code(o.full)));
+                        }
+                        BmKind::NoResult => {
+                            ls.no_result += 1;
+                            lstrat[s][1] += 1;
+                            lcodes.push((it.idx, BEST_UNKNOWN));
+                        }
+                    }
+                    // searched rows with zero dataset options can never fire the gate
+                    if !matches!(o.kind, BmKind::Forced | BmKind::Terminal) && !o.had_options {
+                        ls.no_options += 1;
+                    }
+                    if o.label_ok {
+                        ls.label_ok += 1;
+                    }
+                    if o.d0bin < 7 {
+                        ls.hdiff[o.d0bin as usize] += 1;
+                    }
+                    if o.g0bin < 5 {
+                        ls.hgap[o.g0bin as usize] += 1;
+                    }
+                    if o.gap_small {
+                        ls.gap_small += 1;
+                    }
+                }
+                bm_merge(&mut merged_stats.lock().unwrap(), &ls, &mut merged_strat.lock().unwrap(), &lstrat);
+                codes.lock().unwrap().extend(lcodes);
+            });
+        }
+    });
+        if all {
+            let mut v = codes.lock().unwrap();
+            v.sort_by_key(|&(i, _)| i);
+            let w = match sidecar.as_mut() {
+                Some(w) => w,
+                None => {
+                    eprintln!("data bestmove: sidecar missing");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for &(_, c) in v.iter() {
+                if w.write_all(&c.to_le_bytes()).is_err() {
+                    eprintln!("data bestmove: sidecar write failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+            sidecar_n += v.len() as u64;
+            v.clear();
+        }
+    }
+    let st = merged_stats.lock().unwrap();
+    let sstrat = merged_strat.lock().unwrap();
+    let searched = st.n - st.forced - st.terminal;
+    let fired = st.decisive + st.confident;
+    let burned = st.full + st.no_result;
+    let full_pct = if searched > 0 { 100.0 * burned as f64 / searched as f64 } else { 0.0 };
+    let flips = if fired > 0 { 100.0 * (fired - st.agree) as f64 / fired as f64 } else { 0.0 };
+    println!("data bestmove: {} rows ({} forced 0-node, {} terminal skipped, {} with no dataset options) over {} threads", st.n, st.forced, st.terminal, st.no_options, threads);
+    println!("  funnel: searched={} had-options={} label-ok={} gap-small={}", searched, searched - st.no_options, st.label_ok, st.gap_small);
+    println!("  |e1-label|@1k bins [0-3,3-7,7-15,15-30,30-60,60-150,150+]: {:?}", st.hdiff);
+    println!("  gap bins [0-10,10-20,20-30,30-50,50+]: {:?}", st.hgap);
+    println!("  decisive {} | confident {} | full-budget {} ({:.1}% of searched, incl. {} no-result)", st.decisive, st.confident, burned, full_pct, st.no_result);
+    println!("  early-vs-full agreement: {}/{} ({:.2}% flips)", st.agree, fired, flips);
+    println!("  avg nodes/row incl. forced: {:.0}; excl. forced/terminal: {:.0}", st.nodes as f64 / st.n.max(1) as f64, st.nodes as f64 / searched.max(1) as f64);
+    println!("  stratum (n, burned, fired, agree, nodes):");
+    for i in 0..9 {
+        println!("    s{}: n={} burned={} fired={} agree={} nodes={}", i, sstrat[i][0], sstrat[i][1], sstrat[i][2], sstrat[i][3], sstrat[i][4]);
+    }
+    let avg_all = st.nodes as f64 / st.n.max(1) as f64;
+    let total_f = corpus_rows as f64;
+    println!("  extrapolated full corpus: {:.1}h single-thread, {:.1}h on {} threads", total_f * avg_all / 3.6e9, total_f * avg_all / 3.6e9 / threads as f64, threads);
+    let pass = full_pct < 10.0 && flips < 1.0;
+    println!("  smoke {}: full-budget {:.1}% (target <10%), flips {:.2}% (target <1%)", if pass { "PASS" } else { "FAIL" }, full_pct, flips);
+
+    if all {
+        if sidecar_n != corpus_rows {
+            eprintln!("data bestmove: sidecar holds {sidecar_n} codes, expected {corpus_rows}; refusing manifest");
+            return ExitCode::FAILURE;
+        }
+        let mut ok = true;
+        if let Some(w) = sidecar.as_mut() {
+            if w.flush().is_err() {
+                eprintln!("data bestmove: flush failed");
+                ok = false;
+            }
+        }
+        if ok {
+            let manifest = format!("{{\"src\":\"{tdat} via ti data bestmove\",\"rows\":{sidecar_n},\"rec\":2}}");
+            let mpath = format!("{}.manifest.json", out.trim_end_matches(".best"));
+            if std::fs::write(&mpath, manifest).is_err() {
+                eprintln!("data bestmove: manifest write failed");
+                ok = false;
+            }
+        }
+        if ok {
+            println!("data bestmove: wrote {}.best ({} u16 codes)", out.trim_end_matches(".best"), sidecar_n);
+        } else {
+            return ExitCode::FAILURE;
+        }
     }
     ExitCode::SUCCESS
 }

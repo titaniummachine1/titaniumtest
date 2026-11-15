@@ -15,7 +15,13 @@ use titanium::Board;
 pub struct Rec {
     pub ply: u32,
     pub mover: String,
+    /// the move PLAYED (the game line; replay follows this)
     pub mv: String,
+    /// `ti gen` logs (D790): the engine's own first choice at this position before novelty changed the move played.
+    /// Policy / best-move targets must use this (`label_mv()`), never `mv`.
+    pub best_mv: Option<String>,
+    /// the position's score. When the log has `engine_best_score` (ti gen) it is THAT (the value of the engine's own
+    /// best move), not the score of the move novelty made it play.
     pub score: Option<i32>,
     pub mate: Option<i32>,
     pub depth: Option<u32>,
@@ -76,7 +82,8 @@ pub fn parse_game(line: &str) -> Result<Game, String> {
             ply: num(obj, "ply").ok_or("move without ply")?,
             mover: field(obj, "mover").unwrap_or("").to_string(),
             mv: field(obj, "move").ok_or("move without move")?.to_string(),
-            score: num(obj, "score"),
+            best_mv: field(obj, "engine_best").map(|s| s.to_string()),
+            score: num::<i32>(obj, "engine_best_score").or_else(|| num(obj, "score")),
             mate: num(obj, "mate"),
             depth: num(obj, "depth"),
             nodes: num(obj, "nodes"),
@@ -91,6 +98,13 @@ pub fn parse_game(line: &str) -> Result<Game, String> {
         cand_points: num(head, "candidate_points").ok_or("no points")?,
         moves,
     })
+}
+
+impl Rec {
+    /// The best-move label of this ply: the engine's own first choice when the log has it, else the move played.
+    pub fn label_mv(&self) -> &str {
+        self.best_mv.as_deref().unwrap_or(&self.mv)
+    }
 }
 
 /// Replay a game; returns the position BEFORE every move (same order as `moves`).
@@ -1052,6 +1066,22 @@ mod tests {
         let e = explain(&g);
         assert_eq!(e.turning_point, Some((2, 30, -400)));
         assert_eq!(e.loser_saw_it, Some(2));
+    }
+
+    #[test]
+    fn gen_log_label_is_the_engines_own_choice() {
+        // ti gen (D790): `move` is what was played, `engine_best` / `engine_best_score` the engine's own first choice
+        let line = r#"{"pair":0,"book":0,"start":"x5o/7/7/7/7/7/o5x x 0 1","candidate_seat":"x","candidate_points":1,"final_x":30,"final_o":19,"moves":[{"ply":0,"side":"x","mover":"candidate","move":"g1f2","engine_best":"a7b6","engine_best_score":41,"score":17,"mate":null,"depth":8,"nodes":5000,"ms":30}]}"#;
+        let g = parse_game(line).unwrap();
+        let r = &g.moves[0];
+        assert_eq!(r.mv, "g1f2");
+        assert_eq!(r.label_mv(), "a7b6");
+        assert_eq!(r.score, Some(41));
+        // a log without the fields (gate games, older ti gen runs) keeps the old meaning
+        let old = line.replace(r#""engine_best":"a7b6","engine_best_score":41,"#, "");
+        let r = &parse_game(&old).unwrap().moves[0];
+        assert_eq!(r.label_mv(), "g1f2");
+        assert_eq!(r.score, Some(17));
     }
 
     #[test]

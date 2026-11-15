@@ -27,6 +27,7 @@ mod targets;
 mod gate;
 mod games;
 mod gamedata;
+mod dag;
 mod gen;
 mod sprt;
 mod spsa;
@@ -34,6 +35,7 @@ mod train;
 mod policy;
 mod policy2;
 mod smallnet;
+mod snarch;
 mod bzupload;
 mod botzone;
 
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
         "gen" => gen::run_gen(&args[1..]),
+        "dag" => dag::run_dag(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
         "bookprune" => games::run_bookprune(&args[1..]),
         "pool" => games::run_pool(&args[1..]),
@@ -388,6 +391,7 @@ fn run_train_subcmd(args: &[String]) -> ExitCode {
         Some("split") => return shrink::run_split(&args[1..]),
         Some("remap") => return shrink::run_remap(&args[1..]),
         Some("smallnet") => return smallnet::run_smallnet(&args[1..]),
+        Some("snarch") => return snarch::run_snarch(&args[1..]),
         Some("modal") => return modal::run_modal(&args[1..]),
         #[cfg(feature = "gpu")]
         Some("gpu-parity") => {

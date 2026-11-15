@@ -175,7 +175,7 @@ pub fn run_policy(args: &[String]) -> ExitCode {
                 if r.mv == "FORFEIT" {
                     break;
                 }
-                let pm = match b.parse_uai_move(&r.mv) {
+                let pm = match b.parse_uai_move(r.label_mv()) {
                     Some(m) if !m.is_pass() => m,
                     _ => continue,
                 };

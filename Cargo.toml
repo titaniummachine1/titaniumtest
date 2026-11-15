@@ -17,6 +17,11 @@ titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "
 
 flate2 = "1.1"
 serde_json = "1"
+# Game DAG store (src/dag.rs): Turso, the in-process Rust database (NATIVE storage format, NOT
+# SQLite: no other tool can open the file; MVCC parallel writers). All access via `ti dag`.
+# default-features off: the `fts` feature needs zstd-sys (C build, fails on windows-gnu); `mimalloc` is not needed.
+# Windows build needs llvm-mingw on PATH (C:\gitProjects\toolchains\llvm-mingw-20261006-ucrt-x86_64\bin) for dlltool.
+turso = { version = "=0.8.3", default-features = false }
 # GPU backend (bullet, pinned). `--features gpu` type-checks anywhere; `--features cuda` needs the CUDA toolkit (Modal image).
 bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }
 bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a55a87031cd51c89bdf1ff030", optional = true }

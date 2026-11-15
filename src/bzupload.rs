@@ -178,7 +178,17 @@ fn go(args: &[String]) -> Result<(), String> {
         let form = format!("{}", so_path.display()).replace('\\', "/");
         let r = curl(
             &format!("url = \"{BASE}/userfile/uploadfile\"\nform = \"file=@{form};type=application/octet-stream\"\nform = \"path=\"\nform = \"filename=titanium_v2.so\"\n"),
-            &["-b", &jar_s, "-c", &jar_s, "--max-time", "3000", "-#"],
+            &[
+                "--http1.1",
+                "-H", "Expect:",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "--keepalive-time", "15",
+                "-b", &jar_s,
+                "-c", &jar_s,
+                "--max-time", "3000",
+                "-w", "\n[curl size_up=%{size_upload} speed=%{speed_upload} time=%{time_total} http=%{http_code}]\n",
+                "-#",
+            ],
             true,
         );
         match r {
@@ -186,7 +196,7 @@ fn go(args: &[String]) -> Result<(), String> {
                 ok = true;
                 break;
             }
-            Ok(body) => eprintln!("upload answered: {}", body.chars().take(300).collect::<String>()),
+            Ok(body) => eprintln!("upload answered: {}", body.chars().take(400).collect::<String>()),
             Err(e) => eprintln!("upload attempt failed: {e}"),
         }
     }

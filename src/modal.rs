@@ -83,7 +83,9 @@ pub fn run_modal(args: &[String]) -> ExitCode {
             if crate::has_flag(args, "--detach") {
                 base.push("--detach");
             }
-            base.extend([SCRIPT, "--tag", &tag, "--args", &run_args, "--timeout-min", &tmin_s]);
+            // the launcher has two local entrypoints (main = training, gen_main = generation): name the one we mean
+            let entry = format!("{SCRIPT}::main");
+            base.extend([entry.as_str(), "--tag", &tag, "--args", &run_args, "--timeout-min", &tmin_s]);
             match modal(&base).status() {
                 Ok(s) if s.success() => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
@@ -100,16 +102,37 @@ pub fn run_modal(args: &[String]) -> ExitCode {
         }
         Some("fetch") => {
             let Some(tag) = f("--tag") else {
-                eprintln!("usage: ti train modal fetch --tag T [--out dir]");
+                eprintln!("usage: ti train modal fetch --tag T [--out dir] [--all]");
                 return ExitCode::FAILURE;
             };
             let dir = f("--out").unwrap_or_else(|| format!("runs/{tag}"));
             // `modal volume get --force` creates a FILE when the local dir is missing (AGENTS trap): make it first
             let _ = std::fs::create_dir_all(&dir);
-            match modal(&["volume", "get", "--force", VOLUME, &format!("/runs/{tag}"), &dir]).status() {
-                Ok(s) if s.success() => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
+            if crate::has_flag(args, "--all") {
+                return match modal(&["volume", "get", "--force", VOLUME, &format!("/runs/{tag}"), &dir]).status() {
+                    Ok(s) if s.success() => ExitCode::SUCCESS,
+                    _ => ExitCode::FAILURE,
+                };
             }
+            // D819: a --keep-all run holds hundreds of 29 MB checkpoints (~10 GB); by default fetch only what export and
+            // gating need (the checkpoints stay on the volume; --all downloads everything)
+            let sub = format!("{dir}/{tag}");
+            let _ = std::fs::create_dir_all(&sub);
+            let mut got = 0;
+            for name in ["best.tnn", "RECORD.txt", "EARLY_STOP.txt", "GUARD_TRIPPED.txt", "gpu_state.txt"] {
+                let ok = modal(&["volume", "get", "--force", VOLUME, &format!("/runs/{tag}/{name}"), &format!("{sub}/{name}")])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok {
+                    got += 1;
+                } else if name == "best.tnn" || name == "RECORD.txt" {
+                    eprintln!("fetch: {name} missing for run {tag}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            println!("fetch: {got} files of run {tag} -> {sub} (checkpoints left on the volume; --all fetches them)");
+            ExitCode::SUCCESS
         }
         Some("stop") => {
             let Some(id) = f("--id") else {

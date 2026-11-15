@@ -244,6 +244,27 @@ fn find_clean_worktree_at(root: &Path, full_commit: &str) -> Option<PathBuf> {
     None
 }
 
+fn find_built_exe(target_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for sub in [
+        target_dir.join("release").join(EXE),
+        target_dir.join("x86_64-pc-windows-gnu").join("release").join(EXE),
+        target_dir.join("x86_64-pc-windows-msvc").join("release").join(EXE),
+        target_dir.join("x86_64-unknown-linux-gnu").join("release").join(EXE),
+    ] {
+        if sub.exists() {
+            let mtime = sub
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                best = Some((mtime, sub));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 pub fn ensure_exe(root: &Path, gate_dir: &Path, refname: &str) -> Result<Side, String> {
     let is_main = refname == "main" || refname == "origin/main";
     let full = if is_main {
@@ -259,7 +280,8 @@ pub fn ensure_exe(root: &Path, gate_dir: &Path, refname: &str) -> Result<Side, S
         if let Some(clean_wt) = find_clean_worktree_at(root, &full) {
             println!("gate: building {refname} ({short}) from clean worktree {} ...", fwd(&clean_wt));
             sh("cargo", &["build", "--release", "-p", "titanium-cli"], Some(&clean_wt), &[])?;
-            fs::copy(clean_wt.join("target").join("release").join(EXE), &exe).map_err(|e| e.to_string())?;
+            let src = find_built_exe(&clean_wt.join("target")).ok_or_else(|| "built titanium-cli binary not found under clean worktree target".to_string())?;
+            fs::copy(&src, &exe).map_err(|e| e.to_string())?;
         } else {
             let wt = gate_dir.join(format!("wt-{short}"));
             if wt.exists() {
@@ -269,7 +291,10 @@ pub fn ensure_exe(root: &Path, gate_dir: &Path, refname: &str) -> Result<Side, S
             let target = gate_dir.join("target");
             println!("gate: building {refname} ({short}) from a clean checkout ...");
             let built = sh("cargo", &["build", "--release", "-p", "titanium-cli"], Some(&wt), &[("CARGO_TARGET_DIR", &target)]);
-            let copied = built.and_then(|_| fs::copy(target.join("release").join(EXE), &exe).map(|_| ()).map_err(|e| e.to_string()));
+            let copied = built.and_then(|_| {
+                let src = find_built_exe(&target).ok_or_else(|| "built titanium-cli binary not found under _gate/target".to_string())?;
+                fs::copy(&src, &exe).map(|_| ()).map_err(|e| e.to_string())
+            });
             let _ = git(root, &["worktree", "remove", "--force", &fwd(&wt)]);
             copied?;
         }
@@ -519,7 +544,7 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         "--max-games", "--threads",
     ];
     // D595: --non-main-ab = stacking A/B (base = main + accepted knobs on the same commit); never reported as "vs main"
-    const BOOL_FLAGS: [&str; 2] = ["--allow-busy", "--non-main-ab"];
+    const BOOL_FLAGS: [&str; 3] = ["--allow-busy", "--non-main-ab", "--no-auto-policy"];
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -606,9 +631,36 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         Some(extra) => format!("{} {extra}", test.spec()),
         None => test.spec(),
     };
+    let base_spec = match arg(args, "--base-args") {
+        Some(x) => format!("{} {x}", base.spec()),
+        None => base.spec(),
+    };
+    // D819: the engine switches the bundled policy head OFF for any custom --network unless --policy FILE is given
+    // (crates/titanium/src/config.rs), which silently cost -80..-150 Elo in every net gate of 2026-11-15 (D817). Default:
+    // a side that loads a custom net without --policy gets the engine's bundled policy file; --no-auto-policy keeps the
+    // old behaviour (policy off) on purpose.
+    let auto_policy = !args.iter().any(|a| a == "--no-auto-policy");
+    let pol_file = root.join("data/nnue/policy_main.bin");
+    let fix_policy = |spec: String, who: &str| -> Result<String, String> {
+        let t: Vec<&str> = spec.split_whitespace().collect();
+        let custom = t.windows(2).any(|w| (w[0] == "--network" || w[0] == "--nnue") && w[1] != "bundled" && w[1] != "none");
+        if !custom || t.contains(&"--policy") || !auto_policy {
+            if custom && !t.contains(&"--policy") {
+                println!("  NOTE {who}: custom net WITHOUT --policy and --no-auto-policy given: the policy head is OFF on this side");
+            }
+            return Ok(spec);
+        }
+        if !pol_file.exists() {
+            return Err(format!("{who} loads a custom net without --policy and {} does not exist: pass --policy FILE or --no-auto-policy", fwd(&pol_file)));
+        }
+        println!("  NOTE {who}: custom net without --policy -> adding the bundled policy {} (else the engine turns the policy head off; D819)", fwd(&pol_file));
+        Ok(format!("{spec} --policy {}", fwd(&pol_file)))
+    };
+    let test_spec = fix_policy(test_spec, "test")?;
+    let base_spec = fix_policy(base_spec, "base")?;
     let mut sprt: Vec<String> = vec![
         // D572: --base-args "..." = extra engine flags for the baseline side (e.g. the same --tt-bits as the test side)
-        "--candidate".into(), test_spec, "--baseline".into(), match arg(args, "--base-args") { Some(x) => format!("{} {x}", base.spec()), None => base.spec() },
+        "--candidate".into(), test_spec, "--baseline".into(), base_spec,
         "--book".into(), fwd(&book),
         "--max-games".into(), arg(args, "--max-games").unwrap_or_else(|| "600".into()),
         "--elo0".into(), "0".into(), "--elo1".into(), elo1.clone(),
@@ -702,6 +754,23 @@ fn gate(args: &[String]) -> Result<ExitCode, String> {
         "\nGATE RESULT {verdict}: {} games {}-{}-{}, Elo {:+.1} +- {:.1}, LLR {:+.2} [{:.2}, {:.2}], seat split {:.0}%, identical play in {}/{} pairs  -> recorded in {RECORDS}\n  SPEED test vs base: played games {} ({} vs {} nps) [trust this], fixed workload {} ({} vs {} nps) [noisy]",
         st.games, tally.wins, tally.losses, tally.draws, st.elo, st.elo_ci95, st.llr, st.lower_bound, st.upper_bound, 100.0 * st.seat_split, identical, n_pairs, pct(game_nps(&games, "candidate"), game_nps(&games, "baseline")), game_nps(&games, "candidate"), game_nps(&games, "baseline"), pct(bench_t, bench_b), bench_t, bench_b
     );
+    // D830: the gate's games join the dataset like generated games (binary .tgam/.tbst + sequence DAG). One DAG writer at a
+    // time: while a generator runs, its loop imports them before its next batch instead.
+    let gen_running = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("\"ti_gen.exe\""))
+        .unwrap_or(false);
+    let dag_db = std::env::var("TI_SEQ_DAG").unwrap_or_else(|_| "C:/gitProjects/titanium-ataxx/data/dag/seq_dag.db".into());
+    if gen_running {
+        println!("  games -> dataset: a generator is running; its loop imports this gate's games before its next batch (D830)");
+    } else if std::path::Path::new(&dag_db).exists() {
+        let dir = log.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        match crate::dag::import_gate_logs(&dag_db, &[dir]) {
+            Ok((f, g, n)) => println!("  games -> dataset: {f} log(s), {g} games written as .tgam/.tbst, {n} new sequences in {dag_db} (D830)"),
+            Err(e) => eprintln!("gate: WARNING games not imported into the dataset ({e}); run `ti dag gate-import` later"),
+        }
+    }
     Ok(if verdict == "PASS" { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 

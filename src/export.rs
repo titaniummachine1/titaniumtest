@@ -235,8 +235,14 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
         println!("[export] Texel calibration of {net_path} on ~{cr} rows (per-bucket scale+shift of y, folded into out/psqt)");
         calibrate(&mut net, &mut train, cr, rw)?;
     }
-    println!("[export] refitting disagreement head of {net_path} on ~{rows} rows, ridge l2 {l2}");
-    refit_dis(&mut net, &mut train, rows, l2)?;
+    // D816: today's refit loses ~130 Elo against the champion's own head (re-exported 46FCB5A4: only the dis bytes
+    // differ). `--keep-dis` keeps the head the trainer carried over from its init.
+    if args.iter().any(|a| a == "--keep-dis") && net.has_dis {
+        println!("[export] --keep-dis: disagreement head kept as trained (no refit)");
+    } else {
+        println!("[export] refitting disagreement head of {net_path} on ~{rows} rows, ridge l2 {l2}");
+        refit_dis(&mut net, &mut train, rows, l2)?;
+    }
 
     let m = |v: &Vec<f32>| v.iter().fold(0f32, |a, &x| a.max(x.abs()));
     let (mft, mftb) = (m(&net.ft), m(&net.ftb));

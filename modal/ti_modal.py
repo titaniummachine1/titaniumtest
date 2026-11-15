@@ -24,6 +24,10 @@ PATCH = '[patch."https://github.com/titaniummachine1/titanium-ataxx"]\ntitanium 
 CPU = float(os.environ.get("TI_CPU", "4"))  # vCPUs of the container (loader threads); the loader may be the cap, see REVIEW_NOTES N4
 RUSTFLAGS = "-C target-cpu=x86-64-v3 -L /usr/local/cuda/lib64/stubs"
 BUILD = "cd /src/hub && CUDA_PATH=/usr/local/cuda RUSTFLAGS='%s' $HOME/.cargo/bin/cargo build --release --features cuda" % RUSTFLAGS
+# CPU-only build: the CUDA binary links libcuda.so.1 and cannot even start on a CPU
+# container, so game generation uses a second, CUDA-free binary. A separate target
+# dir keeps both builds cached in the image layer.
+BUILD_CPU = "cd /src/hub && CARGO_TARGET_DIR=/src/hub/target-cpu RUSTFLAGS='%s' $HOME/.cargo/bin/cargo build --release" % RUSTFLAGS
 
 
 def _snapshot():
@@ -58,6 +62,9 @@ image = (
     .add_local_dir(ENGINE + r"\crates\titanium", "/src/engine/crates/titanium", copy=True, ignore=["target"])
     .add_local_file(ENGINE + r"\data\nnue\nnue_main.tnn", "/src/engine/data/nnue/nnue_main.tnn", copy=True)
     .add_local_file(ENGINE + r"\data\nnue\fut_small.tsn", "/src/engine/data/nnue/fut_small.tsn", copy=True)
+    # the current engine also include_bytes!s these two (config.rs pin test, policy.rs head)
+    .add_local_file(ENGINE + r"\data\nnue\BUNDLE.txt", "/src/engine/data/nnue/BUNDLE.txt", copy=True)
+    .add_local_file(ENGINE + r"\data\nnue\policy_main.bin", "/src/engine/data/nnue/policy_main.bin", copy=True)
     # dependency layer: only the manifest + a dummy main, so bullet/CUDA/flate2 are compiled once and cached
     .add_local_file(HUB + r"\Cargo.toml", "/src/hub/Cargo.toml", copy=True)
     .add_local_file(HUB + r"\Cargo.lock", "/src/hub/Cargo.lock", copy=True)
@@ -68,7 +75,7 @@ image = (
         "rm -rf /src/hub/src /src/hub/target/release/ti /src/hub/target/release/deps/ti-* /src/hub/target/release/.fingerprint/titanium-hub-*",
     )
     .add_local_dir(HUB + r"\src", "/src/hub/src", copy=True)
-    .run_commands(BUILD + " && cp target/release/ti /usr/local/bin/ti")
+    .run_commands(BUILD + " && cp target/release/ti /usr/local/bin/ti-cuda" + " && " + BUILD_CPU + " && cp target-cpu/release/ti /usr/local/bin/ti")
 )
 vol = modal.Volume.from_name("ti-data", create_if_missing=True)
 app = modal.App("ti-train", image=image)
@@ -92,7 +99,8 @@ def run(tag: str, args: str, timeout_min: int = 30) -> int:
     """Run `ti <args>` under a hard `timeout`; outputs belong in /vol/runs/<tag> (the caller puts --out there)."""
     sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; nproc")
     os.makedirs("/vol/runs/%s" % tag, exist_ok=True)
-    rc = sh("timeout %dm ti %s" % (timeout_min, args))
+    # GPU function: the CUDA build (the image keeps `ti` = CPU-only build for the gen containers)
+    rc = sh("timeout %dm ti-cuda %s" % (timeout_min, args))
     if rc == 124:
         print("TIMEOUT: killed after %d min (cost cap)" % timeout_min)
     vol.commit()
@@ -110,7 +118,7 @@ def main(tag: str, args: str, timeout_min: int = 30):
 # CPU-only: game generation needs no GPU, and the GPU function above would bill an
 # L4/T4/A10G for pure CPU work. Measured locally: ~8.2 core-s per 100 ms game plus
 # ~2.3 core-s to relabel it at 5k, i.e. ~7.3k games per dollar at Modal CPU rates.
-GEN_CPU = float(os.environ.get("TI_GEN_CPU", "2"))
+GEN_CPU = float(os.environ.get("TI_GEN_CPU", "1"))
 GEN_MEM = int(os.environ.get("TI_GEN_MEM_MB", "2048"))
 
 
@@ -139,5 +147,7 @@ def gen_main(tag: str, games: int = 250, shards: int = 20, time_ms: int = 100, t
     bad = [r for r in rcs if r != 0]
     print("gen: %d shards, %d games each, exit codes %s" % (shards, games, rcs))
     raise SystemExit(0 if not bad else 1)
+
+
 
 
