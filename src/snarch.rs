@@ -54,6 +54,77 @@ struct Sample {
     /// head 380F609C exactly as the engine's move ordering calls it) and its policy rank (0 = the policy's best move)
     lp: i16,
     rank: u8,
+    /// D851 P2: the parent's big-net disagreement value (cp, exactly the engine's node_dis), the parent's policy entropy
+    /// and top-1 log-prob (x1000), and the parent's big-net hidden layers h1||h2 (x127, first HMAX values)
+    dis: i16,
+    ent: i16,
+    top1: i16,
+    h: [i8; HMAX],
+}
+
+/// D851 P2 input groups, added after the arch's rows (suffixes +pol +dis +mv +ent +h1); every new weight starts at 0
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Ext {
+    pol: bool,
+    dis: bool,
+    mv: bool,
+    ent: bool,
+    h1: bool,
+}
+
+const HMAX: usize = 48;
+const DIS_BINS: usize = 16;
+const MV_ROWS: usize = 18;
+const ENT_BINS: usize = 16;
+
+impl Ext {
+    fn parse(s: &str) -> Result<(String, Ext), String> {
+        let mut parts = s.split('+');
+        let base = parts.next().unwrap_or("").to_string();
+        let mut e = Ext::default();
+        for p in parts {
+            match p {
+                "pol" => e.pol = true,
+                "dis" => e.dis = true,
+                "mv" => e.mv = true,
+                "ent" => e.ent = true,
+                "h1" => e.h1 = true,
+                _ => return Err(format!("unknown input group +{p} in {s}")),
+            }
+        }
+        Ok((base, e))
+    }
+    fn suffix(self) -> String {
+        let mut s = String::new();
+        for (on, n) in [(self.pol, "+pol"), (self.dis, "+dis"), (self.mv, "+mv"), (self.ent, "+ent"), (self.h1, "+h1")] {
+            if on {
+                s.push_str(n);
+            }
+        }
+        s
+    }
+    /// extra accumulator rows (both perspectives)
+    fn nf(self) -> usize {
+        (if self.pol { POL_NF } else { 0 }) + (if self.dis { 2 * DIS_BINS } else { 0 }) + (if self.mv { 2 * MV_ROWS } else { 0 }) + (if self.ent { 4 * ENT_BINS } else { 0 })
+    }
+    /// extra row updates per child per perspective in the engine (h1 is per node: 0 per child)
+    fn touched(self) -> usize {
+        2 * self.pol as usize + self.dis as usize + self.mv as usize + 2 * self.ent as usize
+    }
+}
+
+fn dis_bin(d: i16) -> usize {
+    ((d.max(0) as usize) / 50).min(DIS_BINS - 1)
+}
+fn ent_bin(x: i16) -> usize {
+    // 0.25-nat bins of an entropy (x1000) or of -log p (x1000)
+    ((x.unsigned_abs() as usize) / 250).min(ENT_BINS - 1)
+}
+/// move features from the bits alone: clone/jump x flips (0..8): the mover is the child's OPPONENT (it just moved)
+fn mv_row(s: &Sample) -> usize {
+    let jump = (s.popp & !s.opp) != 0;
+    let flips = ((s.pown & s.opp).count_ones() as usize).min(8);
+    jump as usize * 9 + flips
 }
 
 const POL_RANKS: usize = 16;
@@ -214,10 +285,13 @@ fn feats(arch: Arch, us: u64, them: u64, blk: u64, pus: u64, pthem: u64, out: &m
 
 struct Model {
     arch: Arch,
-    /// D847: policy input on (rank + log-prob rows after the arch's rows, third per-bucket skip on the log-prob)
-    pol: bool,
-    /// first feature index of the policy rows (= arch.nf())
-    pol_off: usize,
+    /// D847/D851: extra input groups (rows after the arch's rows in the order pol, dis, mv, ent; h1 = dense projection)
+    ext: Ext,
+    /// first feature index of each extra row group
+    o_pol: usize,
+    o_dis: usize,
+    o_mv: usize,
+    o_ent: usize,
     nb: usize,
     p: Vec<f32>,
     o_ftb: usize,
@@ -225,7 +299,10 @@ struct Model {
     o_l1b: usize,
     o_ow: usize,
     o_ob: usize,
+    /// per-bucket skips: [parent, hand, policy log-prob, disagreement] x nb
     o_sk: usize,
+    /// h1: dense [2 halves][HMAX][W] projection of the parent's big-net hidden layers into the accumulator
+    o_wh: usize,
     np: usize,
 }
 
@@ -253,16 +330,22 @@ impl Rng {
 }
 
 impl Model {
-    fn new(arch: Arch, nb: usize, seed: u64, pol: bool) -> Model {
+    fn new(arch: Arch, nb: usize, seed: u64, ext: Ext) -> Model {
         let pol_off = arch.nf();
-        let nf = pol_off + if pol { POL_NF } else { 0 };
+        let o_pol = pol_off;
+        let o_dis = o_pol + if ext.pol { POL_NF } else { 0 };
+        let o_mv = o_dis + if ext.dis { 2 * DIS_BINS } else { 0 };
+        let o_ent = o_mv + if ext.mv { 2 * MV_ROWS } else { 0 };
+        let nf = pol_off + ext.nf();
+        debug_assert_eq!(o_ent + if ext.ent { 4 * ENT_BINS } else { 0 }, nf);
         let o_ftb = nf * W;
         let o_l1w = o_ftb + W;
         let o_l1b = o_l1w + nb * H * D2;
         let o_ow = o_l1b + nb * H;
         let o_ob = o_ow + nb * H;
         let o_sk = o_ob + nb;
-        let np = o_sk + 3 * nb;
+        let o_wh = o_sk + 4 * nb;
+        let np = o_wh + if ext.h1 { 2 * HMAX * W } else { 0 };
         let mut r = Rng(seed | 1);
         let mut p = vec![0f32; np];
         // a feature's rows start small: the window designs have more rows per feature family than sq, scale by expected
@@ -288,11 +371,11 @@ impl Model {
         for k in 0..nb {
             p[o_sk + k] = 0.8;
         }
-        Model { arch, pol, pol_off, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, np }
+        Model { arch, ext, o_pol, o_dis, o_mv, o_ent, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, o_wh, np }
     }
 
     fn name(&self) -> String {
-        format!("{}{}", self.arch.name(), if self.pol { "+pol" } else { "" })
+        format!("{}{}", self.arch.name(), self.ext.suffix())
     }
 
     fn bucket(&self, s: &Sample) -> usize {
@@ -306,18 +389,51 @@ impl Model {
         let mut ft = Vec::with_capacity(64);
         feats(self.arch, s.own, s.opp, s.blk, s.pown, s.popp, &mut fu);
         feats(self.arch, s.opp, s.own, s.blk, s.popp, s.pown, &mut ft);
-        if self.pol {
+        let e = self.ext;
+        if e.pol {
             // D847: the move's policy rank + log-prob bin, one row each per perspective (separate tables per half)
             let (r, l) = ((s.rank as usize).min(POL_RANKS - 1), pol_bin(s.lp));
-            let o = self.pol_off;
+            let o = self.o_pol;
             fu.push((o + r) as u32);
             fu.push((o + POL_RANKS + l) as u32);
             ft.push((o + POL_RANKS + POL_BINS + r) as u32);
             ft.push((o + 2 * POL_RANKS + POL_BINS + l) as u32);
         }
+        if e.dis {
+            let d = dis_bin(s.dis);
+            fu.push((self.o_dis + d) as u32);
+            ft.push((self.o_dis + DIS_BINS + d) as u32);
+        }
+        if e.mv {
+            let r = mv_row(s);
+            fu.push((self.o_mv + r) as u32);
+            ft.push((self.o_mv + MV_ROWS + r) as u32);
+        }
+        if e.ent {
+            let (en, t1) = (ent_bin(s.ent), ent_bin(s.top1));
+            fu.push((self.o_ent + en) as u32);
+            fu.push((self.o_ent + ENT_BINS + t1) as u32);
+            ft.push((self.o_ent + 2 * ENT_BINS + en) as u32);
+            ft.push((self.o_ent + 3 * ENT_BINS + t1) as u32);
+        }
         let mut a = [0f32; D2];
         a[..W].copy_from_slice(&p[self.o_ftb..self.o_ftb + W]);
         a[W..].copy_from_slice(&p[self.o_ftb..self.o_ftb + W]);
+        if e.h1 {
+            // D851 I5: the parent's big-net hidden layers, projected densely into both halves (per node in the engine)
+            for (k, &hv) in s.h.iter().enumerate() {
+                if hv == 0 {
+                    continue;
+                }
+                let hk = hv as f32 / 127.0;
+                let ru = &p[self.o_wh + k * W..self.o_wh + (k + 1) * W];
+                let rt = &p[self.o_wh + (HMAX + k) * W..self.o_wh + (HMAX + k + 1) * W];
+                for j in 0..W {
+                    a[j] += ru[j] * hk;
+                    a[W + j] += rt[j] * hk;
+                }
+            }
+        }
         for &f in &fu {
             let r = &p[f as usize * W..(f as usize + 1) * W];
             for j in 0..W {
@@ -338,8 +454,11 @@ impl Model {
         let mut hpre = [0f32; H];
         let mut h = [0f32; H];
         let mut y = p[self.o_ob + bk] + p[self.o_sk + bk] * (s.parent as f32 / 400.0) + p[self.o_sk + self.nb + bk] * (s.hand as f32 / 400.0);
-        if self.pol {
+        if e.pol {
             y += p[self.o_sk + 2 * self.nb + bk] * (s.lp as f32 / 4000.0);
+        }
+        if e.dis {
+            y += p[self.o_sk + 3 * self.nb + bk] * (s.dis as f32 / 400.0);
         }
         for i in 0..H {
             let w = &p[self.o_l1w + (bk * H + i) * D2..self.o_l1w + (bk * H + i + 1) * D2];
@@ -360,8 +479,11 @@ impl Model {
         g[self.o_ob + bk] += dy;
         g[self.o_sk + bk] += dy * (s.parent as f32 / 400.0);
         g[self.o_sk + self.nb + bk] += dy * (s.hand as f32 / 400.0);
-        if self.pol {
+        if self.ext.pol {
             g[self.o_sk + 2 * self.nb + bk] += dy * (s.lp as f32 / 4000.0);
+        }
+        if self.ext.dis {
+            g[self.o_sk + 3 * self.nb + bk] += dy * (s.dis as f32 / 400.0);
         }
         let mut dx = [0f32; D2];
         for i in 0..H {
@@ -397,6 +519,19 @@ impl Model {
                 g[b + j] += da[W + j];
             }
         }
+        if self.ext.h1 {
+            for (k, &hv) in s.h.iter().enumerate() {
+                if hv == 0 {
+                    continue;
+                }
+                let hk = hv as f32 / 127.0;
+                let (bu, bt) = (self.o_wh + k * W, self.o_wh + (HMAX + k) * W);
+                for j in 0..W {
+                    g[bu + j] += da[j] * hk;
+                    g[bt + j] += da[W + j] * hk;
+                }
+            }
+        }
     }
 }
 
@@ -420,7 +555,21 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
                         if b.game_over() {
                             continue;
                         }
-                        let parent = (400.0 * big.forward_y(&b)).round().clamp(-30000.0, 30000.0) as i16;
+                        // D851: one big-net forward of the parent gives its eval, disagreement value and hidden layers
+                        let pf = big.forward_full(&b);
+                        let parent = (400.0 * pf.y).round().clamp(-30000.0, 30000.0) as i16;
+                        let dis = if big.has_dis {
+                            let dim = big.l1 + big.l2;
+                            let row = &big.dis_w[pf.bucket * dim..(pf.bucket + 1) * dim];
+                            let d: f32 = row.iter().zip(pf.h1.iter().chain(pf.h2.iter())).map(|(a, b)| a * b).sum::<f32>() + big.dis_b[pf.bucket];
+                            ((400.0 * d.max(0.0)).round() as i32).clamp(0, 30000) as i16
+                        } else {
+                            0
+                        };
+                        let mut hq = [0i8; HMAX];
+                        for (k, v) in pf.h1.iter().chain(pf.h2.iter()).take(HMAX).enumerate() {
+                            hq[k] = (v.clamp(0.0, 1.0) * 127.0).round() as i8;
+                        }
                         let mut list = MoveList::new();
                         b.legal_moves_dedup_into(&mut list);
                         // D847: policy log-softmax + rank over the legal moves (engine call: logit_k(b, m, &[], kc))
@@ -440,6 +589,10 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
                         for (r, &i) in ord.iter().enumerate() {
                             rk[i] = r.min(255) as u8;
                         }
+                        // parent policy shape (D851 I7): entropy and top-1 log-prob, x1000
+                        let ent = if n > 0 { -lg.iter().map(|&x| { let lp = x - lse; lp.exp() * lp }).sum::<f32>() } else { 0.0 };
+                        let ent = (ent * 1000.0).round().clamp(0.0, 30000.0) as i16;
+                        let top1 = if n > 0 { ((mx - lse) * 1000.0).round().clamp(-30000.0, 0.0) as i16 } else { 0 };
                         for i in 0..list.len() {
                             let c = b.make(list.move_at(i));
                             if c.game_over() || c.hash % every != 0 {
@@ -449,7 +602,7 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
                             let hand = titanium::search::evaluate(&c, None, false).clamp(-30000, 30000) as i16;
                             let target = (400.0 * big.forward_y(&c)).round().clamp(-30000.0, 30000.0) as i16;
                             let lp = ((lg[i] - lse) * 1000.0).round().clamp(-30000.0, 0.0) as i16;
-                            out.push(Sample { own: c.occ[ct], opp: c.occ[1 - ct], blk: c.blockers, pown: b.occ[ct], popp: b.occ[1 - ct], parent, hand, target, lp, rank: rk[i] });
+                            out.push(Sample { own: c.occ[ct], opp: c.occ[1 - ct], blk: c.blockers, pown: b.occ[ct], popp: b.occ[1 - ct], parent, hand, target, lp, rank: rk[i], dis, ent, top1, h: hq });
                         }
                     }
                     out
@@ -544,7 +697,7 @@ fn report(m: &Model, a: &[Sample], b: &[Sample], tau: f64) -> Report {
         let mut fu = Vec::new();
         feats(m.arch, s.own, s.opp, s.blk, s.pown, s.popp, &mut fu);
         rows += fu.len() as f64;
-        tch += (touched(m.arch, s) + if m.pol { 2 } else { 0 }) as f64;
+        tch += (touched(m.arch, s) + m.ext.touched()) as f64;
     }
     sl.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let q = |p: f64| sl[((p * nb) as usize).min(sl.len().saturating_sub(1))];
@@ -579,7 +732,7 @@ fn checksum(set: &[Sample]) -> u64 {
         eat(s.pown);
         eat(s.popp);
         eat((s.parent as u16 as u64) | (s.hand as u16 as u64) << 16 | (s.target as u16 as u64) << 32 | (s.rank as u64) << 56);
-        eat(s.lp as u16 as u64);
+        eat(s.lp as u16 as u64 | (s.dis as u16 as u64) << 16 | (s.ent as u16 as u64) << 32 | (s.top1 as u16 as u64) << 48);
     }
     h
 }
@@ -771,7 +924,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let train_stem = need("--train")?;
     let val_stem = need("--val")?;
     // D847: "w2+pol" = the arch plus the policy input
-    let archs: Vec<(Arch, bool)> = flag("--arch").unwrap_or_else(|| "sq,w2,w2sq,delta".into()).split(',').map(|s| { let s = s.trim(); let (a, pol) = match s.strip_suffix("+pol") { Some(a) => (a, true), None => (s, false) }; Arch::parse(a).map(|x| (x, pol)).ok_or(format!("unknown arch {s}")) }).collect::<Result<_, _>>()?;
+    let archs: Vec<(Arch, Ext)> = flag("--arch").unwrap_or_else(|| "sq,w2,w2sq,delta".into()).split(',').map(|s| { let s = s.trim(); let (a, e) = Ext::parse(s)?; Arch::parse(&a).map(|x| (x, e)).ok_or(format!("unknown arch {s}")) }).collect::<Result<_, _>>()?;
     let nb = num("--buckets", 8.0) as usize;
     let rows = num("--rows", 1_200_000.0) as usize;
     let val_rows = num("--val-rows", 60_000.0) as usize;
@@ -838,14 +991,41 @@ fn run(args: &[String]) -> Result<(), String> {
         checksum(&val_b),
         t0.elapsed().as_secs_f64()
     );
+    // D851: verify (not assume) the stored big-net inputs: layer sizes, h range, disagreement range
+    {
+        let (mut hmin, mut hmax, mut hsum, mut nz) = (i8::MAX, i8::MIN, 0f64, 0usize);
+        let (mut dsum, mut dmax) = (0f64, 0i16);
+        for s in train.iter().step_by(97) {
+            for &v in &s.h {
+                hmin = hmin.min(v);
+                hmax = hmax.max(v);
+                hsum += v as f64;
+                nz += (v != 0) as usize;
+            }
+            dsum += s.dis as f64;
+            dmax = dmax.max(s.dis);
+        }
+        let ns = train.iter().step_by(97).count().max(1) as f64;
+        println!(
+            "[snarch] big net l1 {} l2 {} (h stored {} of {}), has_dis {}; h q127 min {hmin} max {hmax} mean {:.1} nonzero {:.1}/sample; parent dis mean {:.1} max {dmax} cp",
+            big.l1,
+            big.l2,
+            (big.l1 + big.l2).min(HMAX),
+            big.l1 + big.l2,
+            big.has_dis,
+            hsum / (ns * HMAX as f64),
+            nz as f64 / ns,
+            dsum / ns
+        );
+    }
     println!("[snarch] buckets {nb}, tau {tau}, lrs {lrs:?}, seeds {seeds:?}, threads {threads}, epochs {e_mse} MSE warm start + {pin_txt}");
     let mut summary = Vec::new();
-    for (arch, pol) in archs {
+    for (arch, ext) in archs {
         for &lr in &lrs {
             for &seed in &seeds {
                 let lr = lr as f32;
-                let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), if pol { "+pol" } else { "" }, trows.len());
-                let mut m = Model::new(arch, nb, seed, pol);
+                let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), ext.suffix(), trows.len());
+                let mut m = Model::new(arch, nb, seed, ext);
                 println!("[snarch] {tag} : {} features, {} params", arch.nf(), m.np);
                 let ta = Instant::now();
                 fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None);
@@ -889,24 +1069,28 @@ mod tests {
     use super::*;
 
     fn samp(own: u64, opp: u64, pown: u64, popp: u64) -> Sample {
-        Sample { own, opp, blk: 0, pown, popp, parent: 0, hand: 0, target: 0, lp: 0, rank: 0 }
+        Sample { own, opp, blk: 0, pown, popp, parent: 0, hand: 0, target: 0, lp: 0, rank: 0, dis: 0, ent: 0, top1: 0, h: [0; HMAX] }
     }
 
     // D847: a +pol model must be EXACTLY its control at step 0 (zero policy rows + zero policy skip, same RNG stream)
     #[test]
     fn pol_model_equals_control_at_init() {
         for arch in [Arch::Sq, Arch::W2, Arch::DW2Sq] {
-            let a = Model::new(arch, 8, 3, false);
-            let b = Model::new(arch, 8, 3, true);
+            let a = Model::new(arch, 8, 3, Ext::default());
+            let b = Model::new(arch, 8, 3, Ext { pol: true, dis: true, mv: true, ent: true, h1: true });
             for (i, s) in [samp(0, 1 | 1 << 8, 1, 0), samp(1 << 20 | 1 << 21, 1 << 30, 1 << 20, 1 << 30 | 1 << 21)].iter().enumerate() {
                 let mut s = *s;
                 s.parent = 123;
                 s.hand = -45;
                 s.lp = -2345;
                 s.rank = 7 + i as u8;
+                s.dis = 160;
+                s.ent = 1900;
+                s.top1 = -700;
+                s.h = [37; HMAX];
                 assert_eq!(a.forward(&s).y.to_bits(), b.forward(&s).y.to_bits(), "{arch:?} sample {i}");
             }
-            assert_eq!(b.np - a.np, POL_NF * W);
+            assert_eq!(b.np - a.np, (POL_NF + 2 * DIS_BINS + 2 * MV_ROWS + 4 * ENT_BINS) * W + 2 * HMAX * W);
         }
     }
 
