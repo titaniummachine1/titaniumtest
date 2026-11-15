@@ -21,8 +21,8 @@
 //!   ti train snarch --net nnue_main.tnn --train data/nnue/packed/train_v10 --val data/nnue/packed/val_v9_clean \
 //!       --arch sq,w2,w2sq,delta [--buckets 8] [--rows 1200000] [--val-rows 60000] [--child-every 3] [--epochs-mse 4]
 //!       [--tau 0.02] [--lr 0.002] [--threads 8] [--seed 1] [--save-dir DIR]
-//!       pinball phase: to SATURATION by default (D839: --patience 4 --max-decays 3 --decay 0.3 --min-rel 2e-4 --max-epochs 400,
-//!       best epoch restored and saved as DIR/snarch_<arch>_b<buckets>.snar); --fixed --epochs-pin 16 = old screen, never a result
+//!       pinball phase: ALWAYS to SATURATION, NO epoch limit (LAWS C15, user D868; --patience 4 --max-decays 3 --decay 0.3
+//!       --min-rel 2e-4), best epoch restored and saved as DIR/snarch_<arch>_b<buckets>.snar; --max-epochs/--fixed are refused
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -963,7 +963,6 @@ struct Sat {
     max_decays: usize,
     decay: f32,
     min_rel: f64,
-    max_epochs: usize,
     /// D844: watch slack@tau (the compared number) instead of the val pinball loss
     on_slack: bool,
 }
@@ -975,8 +974,10 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
     let mut mm = vec![0f32; np];
     let mut vv = vec![0f32; np];
     let mut step = 0usize;
-    let epochs = sat.map(|s| s.max_epochs).unwrap_or(epochs);
-    let steps_total = epochs * (train.len() / batch).max(1);
+    // LAWS C15 (user D868): a saturation run has NO epoch limit; it stops only by the saturation rule below. The fixed
+    // count `epochs` applies only to the MSE warm start (sat = None), which initialises the pinball phase.
+    let epochs = if sat.is_some() { usize::MAX } else { epochs };
+    let steps_total = if sat.is_some() { 1 } else { epochs * (train.len() / batch).max(1) };
     let mut lr_cur = lr0;
     let (mut best, mut best_ep, mut since, mut decays) = (f64::INFINITY, 0usize, 0usize, 0usize);
     let mut best_p: Vec<f32> = Vec::new();
@@ -1057,7 +1058,7 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
             "[snarch] {} {tag} epoch {}/{} train {:.5} lr {:.2e} | A: slack@tau {:.2} pin {:.6} | B (A's shift {:+.1}): slack {:.2} viol {:.2}% (raw {:.2}%) RMSE {:.1} | {:.0}s",
             m.name(),
             ep + 1,
-            epochs,
+            if sat.is_some() { "sat".to_string() } else { epochs.to_string() },
             loss_sum / train.len() as f64,
             if sat.is_some() { lr_cur } else { lr0 },
             r.a_slack,
@@ -1096,9 +1097,6 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
                 since = 0;
                 println!("[snarch] {} {tag} plateau: lr -> {lr_cur:.2e} (decay {decays}/{})", m.name(), s.max_decays);
             }
-            if ep + 1 == epochs {
-                println!("[snarch] {} {tag} WARNING: hit --max-epochs {epochs} before saturation (not saturated)", m.name());
-            }
         }
     }
     if sat.is_some() && !best_p.is_empty() {
@@ -1106,15 +1104,17 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
     }
 }
 
-/// Binary dump of a trained research model (no JSON, D806): "SNAR" v1, arch name (16 B, zero-padded), buckets u32, params u32,
+/// Binary dump of a trained research model (no JSON, D806): "SNAR" v2, arch name (u32 length + bytes), buckets u32, params u32,
 /// then the f32 params little-endian in the Model layout (ft rows, ft bias, l1 w, l1 b, out w, out b, skips).
 fn save_model(m: &Model, path: &str) -> Result<(), String> {
     let mut b = Vec::with_capacity(32 + 4 * m.np);
     b.extend_from_slice(b"SNAR");
-    b.extend_from_slice(&1u32.to_le_bytes());
-    let mut name = [0u8; 16];
-    name[..m.name().len()].copy_from_slice(m.name().as_bytes());
-    b.extend_from_slice(&name);
+    // v2 (D870): the arch name is stored as u32 length + bytes (v1's fixed 16 bytes panicked on longer names such as
+    // w2+pol+dis+mv+ent+h1 after a full saturated run)
+    b.extend_from_slice(&2u32.to_le_bytes());
+    let name = m.name();
+    b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
     b.extend_from_slice(&(m.nb as u32).to_le_bytes());
     b.extend_from_slice(&(m.np as u32).to_le_bytes());
     for v in &m.p {
@@ -1147,7 +1147,11 @@ fn run(args: &[String]) -> Result<(), String> {
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
     let e_mse = num("--epochs-mse", 4.0) as usize;
-    let e_pin = num("--epochs-pin", 16.0) as usize;
+    for banned in ["--max-epochs", "--epochs-pin", "--fixed"] {
+        if args.iter().any(|a| a == banned) {
+            return Err(format!("{banned} is forbidden (LAWS C15, user D868: no epoch limit; every run trains to saturation)"));
+        }
+    }
     let tau = num("--tau", 0.02) as f32;
     // D845: lists, one model per (arch, lr, seed): --lr 1e-3,2e-3,4e-3 --seed 1,2
     let list = |n: &str, d: &str| -> Result<Vec<f64>, String> {
@@ -1158,18 +1162,13 @@ fn run(args: &[String]) -> Result<(), String> {
     let threads = num("--threads", 8.0) as usize;
     // samples always come from seed 1 (D845: model seeds vary the init + shuffle only, never the data)
     let data_seed = num("--data-seed", 1.0) as u64;
-    // D839 (user): the pinball phase trains to SATURATION by default; --fixed keeps the old fixed-epoch screen (never a result)
-    let sat = if args.iter().any(|a| a == "--fixed") {
-        None
-    } else {
-        Some(Sat {
-            patience: num("--patience", 4.0) as usize,
-            max_decays: num("--max-decays", 3.0) as usize,
-            decay: num("--decay", 0.3) as f32,
-            min_rel: num("--min-rel", 2e-4),
-            max_epochs: num("--max-epochs", 400.0) as usize,
-            on_slack: flag("--sat-metric").map(|v| v != "pin").unwrap_or(true),
-        })
+    // LAWS C15 (user D868): the pinball phase ALWAYS trains to saturation; there is no epoch limit and no fixed mode
+    let sat = Sat {
+        patience: num("--patience", 4.0) as usize,
+        max_decays: num("--max-decays", 3.0) as usize,
+        decay: num("--decay", 0.3) as f32,
+        min_rel: num("--min-rel", 2e-4),
+        on_slack: flag("--sat-metric").map(|v| v != "pin").unwrap_or(true),
     };
     let save_dir = flag("--save-dir");
     if let Some(d) = &save_dir {
@@ -1191,10 +1190,7 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let val_a = build_samples(&ra, &big, (every / 2).max(1), threads, data_seed ^ 0x5555);
     let val_b = build_samples(&rb, &big, (every / 2).max(1), threads, data_seed ^ 0xAAAA);
-    let pin_txt = match sat {
-        Some(s) => format!("pinball to SATURATION on {} of val half A (patience {}, {} lr decays x{}, min gain {:.3}%, max {} epochs)", if s.on_slack { "slack@tau" } else { "val_pin" }, s.patience, s.max_decays, s.decay, 100.0 * s.min_rel, s.max_epochs),
-        None => format!("{e_pin} pinball (FIXED screen, not a result)"),
-    };
+    let pin_txt = format!("pinball to SATURATION on {} of val half A (patience {}, {} lr decays x{}, min gain {:.3}%, NO epoch limit)", if sat.on_slack { "slack@tau" } else { "val_pin" }, sat.patience, sat.max_decays, sat.decay, 100.0 * sat.min_rel);
     println!(
         "[snarch] big net {net_path}; rows {} -> train {} children (checksum {:016x}); val rows {} + {} -> A {} children ({:016x}), B {} children ({:016x}); {:.0}s",
         trows.len(),
@@ -1246,7 +1242,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("[snarch] {tag} : {} features, {} params", arch.nf(), m.np);
                 let ta = Instant::now();
                 fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None);
-                fit(&mut m, &train, &val_a, &val_b, e_pin, Some(tau), lr, threads, seed ^ 7, "pinball", tau as f64, sat);
+                fit(&mut m, &train, &val_a, &val_b, 0, Some(tau), lr, threads, seed ^ 7, "pinball", tau as f64, Some(sat));
                 let r = report(&m, &val_a, &val_b, tau as f64);
                 if let Some(d) = &save_dir {
                     let path = format!("{d}/snarch_{tag}_b{nb}.snar");
