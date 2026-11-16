@@ -43,17 +43,22 @@ fn class(sq: usize) -> usize {
 const NCL: usize = 10;
 
 // ---------------------------------------------------------------- position model
-const HAND: [&str; 19] = [
+const HAND: [&str; 21] = [
     "clone_targets", "landings", "contested_landings", "endangered", "multicap", "my_best_capture", "opp_best_capture",
     "move_count", "frontier", "threat3", "threat5", "holes_private", "holes_shared", "me_no_moves", "opp_no_moves",
-    "parity", "see2_me", "see2_opp", "components",
+    "parity", "see2_me", "see2_opp", "components", "weak_clone", "weak_jump_only",
 ];
 const NH: usize = HAND.len();
 // per phase block: bias, material, own class counts, enemy class counts, DYNAMIC PST (user D949: stone value by square
 // class x its 3x3 neighbourhood: own stone x own neighbours 0..8, own stone x enemy neighbours, enemy stone x enemy
 // neighbours, enemy stone x my neighbours), hand terms
 const DYN: usize = 4 * NCL * 9;
-const PB: usize = 2 + 2 * NCL + DYN + NH;
+// WEAKNESS PST (user D951): square class x number of weaknesses 0..8 (empty squares of the stone's 3x3 the other side
+// can land on: clone or jump), for own stones and for enemy stones
+const WK: usize = 2 * NCL * 9;
+// weakness count only (no square): own stones with w weaknesses, enemy stones with w weaknesses (D951 test)
+const WC: usize = 18;
+const PB: usize = 2 + 2 * NCL + DYN + WK + WC + NH;
 const DYN_NAME: [&str; 4] = ["OWN stone x OWN neighbours", "OWN stone x ENEMY neighbours", "ENEMY stone x ENEMY neighbours", "ENEMY stone x OWN neighbours"];
 
 fn edge_mask() -> u64 {
@@ -228,7 +233,41 @@ fn pos_feats(b: &Board, ring: &[u64; 49], ml: &mut MoveList, out: &mut Vec<(u16,
     let (s_op, n_op) = see2(&Board::from_occ(op, me, 0, 0), ring, ml);
     h[17] = s_op;
     h[7] = n_me - n_op;
-    let hb = base + 2 + 2 * NCL + DYN;
+    // weakness PST + summed weaknesses (clone-reachable / jump-only)
+    let (lo, lm) = (box2(op) & e, box2(me) & e);
+    let (co, cm) = (box1(op) & e, box1(me) & e);
+    let mut wk = [0f32; WK];
+    let (mut wc_me, mut wj_me, mut wc_op, mut wj_op) = (0f32, 0f32, 0f32, 0f32);
+    for sq in 0..49 {
+        let r = ring[sq];
+        if (me >> sq) & 1 == 1 {
+            wk[class(sq) * 9 + (r & lo).count_ones() as usize] += 1.0;
+            wc_me += (r & co).count_ones() as f32;
+            wj_me += (r & lo & !co).count_ones() as f32;
+        } else if (op >> sq) & 1 == 1 {
+            wk[NCL * 9 + class(sq) * 9 + (r & lm).count_ones() as usize] += 1.0;
+            wc_op += (r & cm).count_ones() as f32;
+            wj_op += (r & lm & !cm).count_ones() as f32;
+        }
+    }
+    let wb = base + 2 + 2 * NCL + DYN;
+    for (i, v) in wk.iter().enumerate() {
+        if *v != 0.0 {
+            out.push(((wb + i) as u16, *v));
+        }
+    }
+    let cb = wb + WK;
+    for t in 0..2 {
+        for k in 0..9 {
+            let v: f32 = (0..NCL).map(|cl| wk[t * NCL * 9 + cl * 9 + k]).sum();
+            if v != 0.0 {
+                out.push(((cb + t * 9 + k) as u16, v));
+            }
+        }
+    }
+    h[19] = wc_me - wc_op;
+    h[20] = wj_me - wj_op;
+    let hb = base + 2 + 2 * NCL + DYN + WK + WC;
     for (i, v) in h.iter().enumerate() {
         if *v != 0.0 {
             out.push(((hb + i) as u16, *v));
@@ -432,17 +471,21 @@ pub fn run(args: &[String]) -> ExitCode {
             1 => 1,
             2..=21 => 2,
             _ if k < 2 + 2 * NCL + DYN => 3,
-            _ => 4 + (k - 2 - 2 * NCL - DYN),
+            _ if k < 2 + 2 * NCL + DYN + WK => 4,
+            _ if k < 2 + 2 * NCL + DYN + WK + WC => 5,
+            _ => 6 + (k - 2 - 2 * NCL - DYN - WK - WC),
         }
-    }; // 0 bias, 1 material, 2 static pst, 3 dynamic pst, 4.. hand terms
-    let ngrp = 4 + NH;
+    }; // 0 bias, 1 material, 2 static pst, 3 dynamic pst, 4 weakness pst, 5 weakness count, 6.. hand terms
+    let ngrp = 6 + NH;
     let gname = |g: usize| -> String {
         match g {
             0 => "bias".into(),
             1 => "material".into(),
             2 => "static PST".into(),
             3 => "dynamic PST (3x3)".into(),
-            _ => HAND[g - 4].into(),
+            4 => "weakness PST".into(),
+            5 => "weakness count (no sq)".into(),
+            _ => HAND[g - 6].into(),
         }
     };
     let lam = 1.0;
@@ -492,7 +535,13 @@ pub fn run(args: &[String]) -> ExitCode {
     row("bias + material + static PST", only(&[0, 1, 2]));
     row("bias + material + dynamic PST", only(&[0, 1, 3]));
     row("bias + material + both PST", only(&[0, 1, 2, 3]));
-    row("bias + material + hand terms", (0..PD).map(|i| grp(i) != 2 && grp(i) != 3).collect());
+    row("bias + material + weakness count", only(&[0, 1, 5]));
+    row("bias + material + static + w.count", only(&[0, 1, 2, 5]));
+    row("bias + material + weakness PST", only(&[0, 1, 4]));
+    row("bias + material + static + weakness", only(&[0, 1, 2, 4]));
+    row("bias + material + dynamic + weakness", only(&[0, 1, 3, 4]));
+    row("bias + material + hand terms", (0..PD).map(|i| grp(i) < 2 || grp(i) > 5).collect());
+    row("ALL minus weakness PST", (0..PD).map(|i| grp(i) != 4).collect());
     row("ALL minus dynamic PST", (0..PD).map(|i| grp(i) != 3).collect());
     let (r2_all, ag_all) = row("ALL", vec![true; PD]);
     say(String::new());
@@ -516,7 +565,7 @@ pub fn run(args: &[String]) -> ExitCode {
         let b = ph * PB;
         let mut s = format!("  {:<14} material {:>6.1} |", PH_NAME[ph], w_all[b + 1]);
         for (i, n) in HAND.iter().enumerate() {
-            s.push_str(&format!(" {n} {:.1}", w_all[b + 2 + 2 * NCL + DYN + i]));
+            s.push_str(&format!(" {n} {:.1}", w_all[b + 2 + 2 * NCL + DYN + WK + WC + i]));
         }
         say(s);
     }
@@ -552,6 +601,46 @@ pub fn run(args: &[String]) -> ExitCode {
                 say(format!("   cls {cl} {}", cells.join("")));
             }
         }
+    }
+
+    say(String::new());
+    say("WEAKNESS PST (ALL model, cp per stone; rows = square class, cols = weaknesses 0..8 = empty squares of its 3x3 the other side can land on):".into());
+    for ph in 0..NPH {
+        for t in 0..2 {
+            say(format!("  {} {}", PH_NAME[ph], if t == 0 { "OWN stone x weaknesses (enemy can land)" } else { "ENEMY stone x weaknesses (we can land)" }));
+            for cl in 0..NCL {
+                let off = ph * PB + 2 + 2 * NCL + DYN + t * NCL * 9 + cl * 9;
+                let cells: Vec<String> = (0..9)
+                    .map(|k| if pos_r.xtx[(off + k) * PD + off + k] > 0.0 { format!("{:>7.1}", w_all[off + k]) } else { "      .".into() })
+                    .collect();
+                say(format!("   cls {cl} {}", cells.join("")));
+            }
+        }
+    }
+    // the same table from a model WITHOUT the dynamic PST, so the weakness effect is not split with it
+    let w_wk = pos_r.solve(&(0..PD).map(|i| grp(i) != 3).collect::<Vec<bool>>(), lam);
+    say("WEAKNESS PST from the model WITHOUT dynamic PST, empties 25-36 (own stone):".into());
+    for cl in 0..NCL {
+        let off = 2 * PB + 2 + 2 * NCL + DYN + cl * 9;
+        let cells: Vec<String> = (0..9)
+            .map(|k| if pos_r.xtx[(off + k) * PD + off + k] > 0.0 { format!("{:>7.1}", w_wk[off + k]) } else { "      .".into() })
+            .collect();
+        say(format!("   cls {cl} {}", cells.join("")));
+    }
+    say("STATIC PST own stone, empties 25-36: material+static vs material+static+weakness COUNT (no square): does the edge bonus vanish?".into());
+    let w_st = pos_r.solve(&only(&[0, 1, 2]), lam);
+    let w_sw = pos_r.solve(&only(&[0, 1, 2, 5]), lam);
+    for cl in 0..NCL {
+        let off = 2 * PB + 2 + cl;
+        say(format!("   cls {cl}  static {:>7.1}   with weakness {:>7.1}", w_st[off], w_sw[off]));
+    }
+    let w_c = pos_r.solve(&only(&[0, 1, 5]), lam);
+    say("WEAKNESS COUNT value (model material + weakness count only), cp per stone with w weaknesses, w = 0..8:".into());
+    for ph in 0..NPH {
+        let off = ph * PB + 2 + 2 * NCL + DYN + WK;
+        let f = |t: usize| (0..9).map(|k| format!("{:>7.1}", w_c[off + t * 9 + k])).collect::<Vec<_>>().join("");
+        say(format!("  {:<14} own   {}", PH_NAME[ph], f(0)));
+        say(format!("  {:<14} enemy {}", "", f(1)));
     }
 
     // ---------------- move model
