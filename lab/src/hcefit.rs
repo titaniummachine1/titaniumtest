@@ -18,10 +18,10 @@ use std::process::ExitCode;
 use titanium::nnue::Nnue;
 use titanium::{Board, MoveList};
 
-const NPH: usize = 4;
-const CLAMP: f64 = 2000.0;
+pub(crate) const NPH: usize = 4;
+pub(crate) const CLAMP: f64 = 2000.0;
 
-fn phase(empty: u64) -> usize {
+pub(crate) fn phase(empty: u64) -> usize {
     match empty.count_ones() {
         0..=12 => 0,
         13..=24 => 1,
@@ -29,29 +29,31 @@ fn phase(empty: u64) -> usize {
         _ => 3,
     }
 }
-const PH_NAME: [&str; NPH] = ["empties 0-12", "empties 13-24", "empties 25-36", "empties 37-49"];
+pub(crate) const PH_NAME: [&str; NPH] = ["empties 0-12", "empties 13-24", "empties 25-36", "empties 37-49"];
 
-fn class(sq: usize) -> usize {
+pub(crate) fn class(sq: usize) -> usize {
     let (r, c) = (sq / 7, sq % 7);
     let (a, b) = (r.min(6 - r), c.min(6 - c));
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
     // pairs (a<=b) of 0..3: 0:(0,0) 1:(0,1) 2:(0,2) 3:(0,3) 4:(1,1) 5:(1,2) 6:(1,3) 7:(2,2) 8:(2,3) 9:(3,3)
     [[0, 1, 2, 3], [1, 4, 5, 6], [2, 5, 7, 8], [3, 6, 8, 9]][a][b]
 }
-const NCL: usize = 10;
+pub(crate) const NCL: usize = 10;
 
 // ---------------------------------------------------------------- position model
-const HAND: [&str; 28] = [
+pub(crate) const HAND: [&str; 29] = [
     "clone_targets", "landings", "contested_landings", "endangered", "multicap", "my_best_capture", "opp_best_capture",
     "move_count", "frontier", "threat3", "threat5", "holes_private", "holes_shared", "me_no_moves", "opp_no_moves",
     "parity", "see2_me", "see2_opp", "components", "weak_clone", "weak_jump_only",
     // D953 pressure (attackers with halving value 1-0.5^a): weakness pairs x pressure, weakness x stones converted^2
     // x pressure, per stone 1-0.5^weaknesses; then PASS 2 = best gain of the fitted pass-1 eval over legal moves
     "press_pairs", "press_conv2", "press_stone", "p2_my_best", "p2_my_best_jump", "p2_opp_best", "p2_improving",
+    // D959 soft weaknesses: enemy neighbours that can jump out (opening the square for another enemy stone)
+    "soft_weak",
 ];
 const P1_HAND: [usize; 3] = [21, 22, 23];
 const P2_HAND: [usize; 4] = [24, 25, 26, 27];
-const NH: usize = HAND.len();
+pub(crate) const NH: usize = HAND.len();
 // per phase block: bias, material, own class counts, enemy class counts, DYNAMIC PST (user D949: stone value by square
 // class x its 3x3 neighbourhood: own stone x own neighbours 0..8, own stone x enemy neighbours, enemy stone x enemy
 // neighbours, enemy stone x my neighbours), hand terms
@@ -61,7 +63,7 @@ const DYN: usize = 4 * NCL * 9;
 const WK: usize = 2 * NCL * 9;
 // weakness count only (no square): own stones with w weaknesses, enemy stones with w weaknesses (D951 test)
 const WC: usize = 18;
-const PB: usize = 2 + 2 * NCL + DYN + WK + WC + NH;
+pub(crate) const PB: usize = 2 + 2 * NCL + DYN + WK + WC + NH;
 const DYN_NAME: [&str; 4] = ["OWN stone x OWN neighbours", "OWN stone x ENEMY neighbours", "ENEMY stone x ENEMY neighbours", "ENEMY stone x OWN neighbours"];
 
 fn edge_mask() -> u64 {
@@ -79,10 +81,10 @@ fn edge_mask() -> u64 {
 fn cnt_at(p: &[u64; 4], sq: usize) -> usize {
     (((p[0] >> sq) & 1) | (((p[1] >> sq) & 1) << 1) | (((p[2] >> sq) & 1) << 2) | (((p[3] >> sq) & 1) << 3)) as usize
 }
-const PD: usize = NPH * PB;
+pub(crate) const PD: usize = NPH * PB;
 
 #[inline]
-fn box2(x: u64) -> u64 {
+pub(crate) fn box2(x: u64) -> u64 {
     box1(box1(x))
 }
 
@@ -173,7 +175,7 @@ fn best_capture(s: u64, o: u64, e: u64) -> f32 {
 
 /// group of a position-model index: 0 bias, 1 material, 2 static pst, 3 dynamic pst, 4 weakness pst, 5 weakness count,
 /// 6.. hand terms
-fn pgroup(i: usize) -> usize {
+pub(crate) fn pgroup(i: usize) -> usize {
     let k = i % PB;
     match k {
         0 => 0,
@@ -191,7 +193,7 @@ fn is_p1(g: usize) -> bool {
 }
 
 static BOX2T: std::sync::OnceLock<[u64; 49]> = std::sync::OnceLock::new();
-fn box2t() -> &'static [u64; 49] {
+pub(crate) fn box2t() -> &'static [u64; 49] {
     BOX2T.get_or_init(|| {
         let mut t = [0u64; 49];
         for (s, v) in t.iter_mut().enumerate() {
@@ -199,6 +201,36 @@ fn box2t() -> &'static [u64; 49] {
         }
         t
     })
+}
+
+/// D959 soft weaknesses of the stone on `sq` (owner `s`, enemy `o`): enemy neighbours q that can jump out (an empty
+/// square at distance exactly 2 from q) with another enemy stone able to land on q afterwards
+pub(crate) fn soft_at(sq: usize, o: u64, e: u64, ring: &[u64; 49]) -> usize {
+    let b2 = box2t();
+    let mut n = 0;
+    let mut qs = ring[sq] & o;
+    while qs != 0 {
+        let q = qs.trailing_zeros() as usize;
+        qs &= qs - 1;
+        let qb = 1u64 << q;
+        let jump_out = b2[q] & !ring[q] & !qb & e != 0;
+        let refill = b2[q] & o & !qb != 0;
+        if jump_out && refill {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn soft_sum(s: u64, o: u64, e: u64, ring: &[u64; 49]) -> f32 {
+    let mut t = 0usize;
+    let mut ss = s & box1(o);
+    while ss != 0 {
+        let q = ss.trailing_zeros() as usize;
+        ss &= ss - 1;
+        t += soft_at(q, o, e, ring);
+    }
+    t as f32
 }
 
 /// pressure: value of being attacked by `a` landings / attackers, halving per extra one
@@ -325,7 +357,7 @@ fn p2_side(b: &Board, ring: &[u64; 49], w: &[f64], ml: &mut MoveList, sc: &mut V
 }
 
 /// sparse position features (index, value); `w1` = fitted pass-1 weights (enables the pass-2 terms)
-fn pos_feats(b: &Board, ring: &[u64; 49], ml: &mut MoveList, out: &mut Vec<(u16, f32)>, w1: Option<&[f64]>, sc: &mut Vec<(u16, f32)>) {
+pub(crate) fn pos_feats(b: &Board, ring: &[u64; 49], ml: &mut MoveList, out: &mut Vec<(u16, f32)>, w1: Option<&[f64]>, sc: &mut Vec<(u16, f32)>) {
     out.clear();
     let (me, op, e) = (b.me(), b.opp(), b.empty());
     let base = phase(e) * PB;
@@ -377,6 +409,7 @@ fn pos_feats(b: &Board, ring: &[u64; 49], ml: &mut MoveList, out: &mut Vec<(u16,
     h[7] = n_me - n_op;
     h[19] = wcd;
     h[20] = wjd;
+    h[28] = soft_sum(me, op, e, ring) - soft_sum(op, me, e, ring);
     if let Some(w) = w1 {
         let (mb, mj, mi) = p2_side(b, ring, w, ml, sc);
         let (ob, _, _) = p2_side(&Board::from_occ(op, me, 0, 0), ring, w, ml, sc);
@@ -414,7 +447,7 @@ fn move_feats(ph: usize, clone: bool, caps: usize, from: u8, to: u8, opp_state: 
 }
 
 // ---------------------------------------------------------------- ridge
-struct Ridge {
+pub(crate) struct Ridge {
     d: usize,
     xtx: Vec<f64>,
     xty: Vec<f64>,
@@ -422,10 +455,10 @@ struct Ridge {
 }
 
 impl Ridge {
-    fn new(d: usize) -> Ridge {
+    pub(crate) fn new(d: usize) -> Ridge {
         Ridge { d, xtx: vec![0.0; d * d], xty: vec![0.0; d], n: 0 }
     }
-    fn add(&mut self, x: &[(u16, f32)], y: f64) {
+    pub(crate) fn add(&mut self, x: &[(u16, f32)], y: f64) {
         for &(i, vi) in x {
             let i = i as usize;
             self.xty[i] += vi as f64 * y;
@@ -436,7 +469,7 @@ impl Ridge {
         self.n += 1;
     }
     /// solve on the index subset `keep` (others weight 0)
-    fn solve(&self, keep: &[bool], lam: f64) -> Vec<f64> {
+    pub(crate) fn solve(&self, keep: &[bool], lam: f64) -> Vec<f64> {
         let idx: Vec<usize> = (0..self.d).filter(|&i| keep[i] && self.xtx[i * self.d + i] > 0.0).collect();
         let k = idx.len();
         let mut a = vec![0f64; k * k];
@@ -485,7 +518,7 @@ impl Ridge {
     }
 }
 
-fn dot(w: &[f64], x: &[(u16, f32)]) -> f64 {
+pub(crate) fn dot(w: &[f64], x: &[(u16, f32)]) -> f64 {
     x.iter().map(|&(i, v)| w[i as usize] * v as f64).sum()
 }
 
@@ -530,7 +563,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut w1: Option<Vec<f64>> = None;
     // PASS A collects the data without pass-2 terms and fits the pass-1 eval; PASS B recollects the same positions with
     // the pass-2 terms computed from that fitted pass-1 eval
-    for pass in 0..2 {
+    let npass = if args.iter().any(|a| a == "--no-pass2") { 1 } else { 2 };
+    for pass in 0..npass {
     seed = seed0;
     pos_r = Ridge::new(PD);
     mov_r = Ridge::new(MD);
@@ -584,7 +618,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         done += 1;
     }
-    if pass == 0 {
+    if pass == 0 && npass == 2 {
         let keep: Vec<bool> = (0..PD).map(|i| is_p1(pgroup(i))).collect();
         w1 = Some(pos_r.solve(&keep, 1.0));
         eprintln!("hce-fit: pass 1 fitted ({:.1}s), recollecting with pass-2 terms", t0.elapsed().as_secs_f64());
@@ -789,6 +823,7 @@ pub fn run(args: &[String]) -> ExitCode {
         en: usize,
         r2o: usize,
         r2e: usize,
+        sw: usize,
         m1: usize,
         m2: usize,
         bc: usize,
@@ -843,6 +878,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 en: (ring[sq] & o).count_ones() as usize,
                 r2o: (r2 & s).count_ones() as usize,
                 r2e: (r2 & o).count_ones() as usize,
+                sw: soft_at(sq, o, e, &ring),
                 m1: d1.count_ones() as usize,
                 m2: d2.count_ones() as usize,
                 bc: bc.clamp(0, 17) as usize,
@@ -965,6 +1001,24 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
     say(cs);
+    // D959: per-stone value by hard weaknesses (0, 1, 2+) x soft weaknesses (0, 1, 2, 3+), empties 25-36 and 13-24
+    for ph in [2usize, 1] {
+        for t in 0..2 {
+            say(format!("  {} stones, {}: mean flip value [n], rows = hard weaknesses 0 / 1 / 2+, cols = SOFT weaknesses 0 / 1 / 2 / 3+:", if t == 0 { "OWN" } else { "ENEMY" }, PH_NAME[ph]));
+            for hw in 0..3 {
+                let mut line = format!("    hard {}{}:", hw, if hw == 2 { "+" } else { " " });
+                for sw in 0..4 {
+                    let v: Vec<f64> = occ.iter().filter(|o| o.side == t && o.ph == ph && o.wk.min(2) == hw && o.sw.min(3) == sw).map(|o| o.df).collect();
+                    if v.len() >= 20 {
+                        line.push_str(&format!(" {:>7.0}[{:>4}]", v.iter().sum::<f64>() / v.len() as f64, v.len()));
+                    } else {
+                        line.push_str("          .  ");
+                    }
+                }
+                say(line);
+            }
+        }
+    }
     // user's mobility curve (D956): u(0)=0, linear to u(12)=1 (half of the 24 moves of a free centre stone), then each
     // further move adds half of the previous gain, approaching 1.5: u(m) = 1 + 0.5 * (1 - 0.5^(m-12))
     let u = |m: usize| -> f64 { if m <= 12 { m as f64 / 12.0 } else { 1.0 + 0.5 * (1.0 - 0.5f64.powi(m as i32 - 12)) } };
