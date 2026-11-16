@@ -1,4 +1,4 @@
-//! `lab hce-compare` (D974): how much of the champion's eval do OTHER engines' hand-crafted term sets capture?
+﻿//! `lab hce-compare` (D974): how much of the champion's eval do OTHER engines' hand-crafted term sets capture?
 //! Each set's terms are refitted closed-form to the champion eval (so this compares the TERMS, not their weights), per 4
 //! phases, on train_v10 positions + all children; scored on held-out positions by R2 and sibling best-move agreement.
 //!
@@ -24,12 +24,12 @@ use titanium::{Board, MoveList};
 
 const SETS: [&str; 5] = ["gataxx", "funes", "autaxx", "ours", "ours+gataxx"];
 // per-phase block sizes
-const G_N: usize = 6; // bias, material, safe, edge, reach, cohesion
+pub(crate) const G_N: usize = 6; // bias, material, safe, edge, reach, cohesion
 const F_N: usize = 2 + 2 + 5 + 8 + 9 + 2; // bias, material, corner, edge, pocket 0..4, centre 0..7, holes 0..8, weak, safe
 const A_N: usize = 2 + 49 + 9 + 1; // bias, material, pst, holes 0..8, surrounded
-const O_N: usize = 7 + 2 * 10 * 9 + 18; // as hce-fast
+pub(crate) const O_N: usize = 7 + 2 * 10 * 9 + 18; // as hce-fast
 
-fn block(set: usize) -> usize {
+pub(crate) fn block(set: usize) -> usize {
     match set {
         0 => G_N,
         1 => F_N,
@@ -74,13 +74,13 @@ fn gataxx_terms(me: u64, op: u64, e: u64, ring: &[u64; 49], edge: u64) -> [f32; 
     [safe, ed, reach, coh]
 }
 
-struct Masks {
+pub(crate) struct Masks {
     edge: u64,
     pockets: [u64; 4],
     centre: [u64; 4],
 }
 
-fn masks() -> Masks {
+pub(crate) fn masks() -> Masks {
     // corner 2x2 pockets and the 4 central cross arms (Funes layout, folded to our indexing)
     let pk = |r0: u64, c0: u64| sq_mask(|r, c| (r == r0 || r == r0 + 1) && (c == c0 || c == c0 + 1));
     let cen = |k: u64| sq_mask(|r, c| match k { 0 => c == 3 && r <= 3, 1 => r == 3 && c >= 3, 2 => c == 3 && r >= 3, _ => r == 3 && c <= 3 });
@@ -93,7 +93,7 @@ fn push(out: &mut Vec<(u16, f32)>, i: usize, v: f32) {
     }
 }
 
-fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mut Vec<(u16, f32)>) {
+pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mut Vec<(u16, f32)>) {
     out.clear();
     let (me, op, e) = (b.me(), b.opp(), b.empty());
     let ph = phase(e);

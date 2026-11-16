@@ -8,6 +8,9 @@ pub struct Rec {
     pub occ0: u64,
     pub occ1: u64,
     pub stm: u8,
+    pub outcome: f32,
+    pub cp: f32,
+    pub wsum: f32,
 }
 
 impl Rec {
@@ -16,6 +19,9 @@ impl Rec {
             occ0: u64::from_le_bytes(b[0..8].try_into().unwrap()),
             occ1: u64::from_le_bytes(b[8..16].try_into().unwrap()),
             stm: b[40],
+            outcome: f32::from_le_bytes(b[16..20].try_into().unwrap()),
+            cp: f32::from_le_bytes(b[20..24].try_into().unwrap()),
+            wsum: f32::from_le_bytes(b[24..28].try_into().unwrap()),
         }
     }
 }

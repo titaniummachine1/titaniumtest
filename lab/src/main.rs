@@ -5,6 +5,7 @@ mod deepsee;
 mod radius;
 mod hcecmp;
 mod hcefast;
+mod hcetrain;
 mod hcefit;
 mod seescreen;
 mod util;
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
         Some("radius") => radius::run(&args[1..]),
         Some("hce-fast") => hcefast::run(&args[1..]),
         Some("hce-compare") => hcecmp::run(&args[1..]),
+        Some("hce-train") => hcetrain::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
