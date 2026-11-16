@@ -42,17 +42,23 @@ fn sample(path: &str, n: usize, seed: &mut u64) -> Vec<Board> {
     out
 }
 
-/// search scores (side to move) of every board at `nodes`, in parallel; a fresh tree per board
-fn search_all(boards: &[Board], nodes: u64, threads: usize) -> Vec<f64> {
+/// search scores (side to move) of every board at a budget (> 0 = nodes, < 0 = fixed depth -n), in parallel, fresh tree
+fn search_all(boards: &[Board], budget: i64, threads: usize) -> Vec<f64> {
+    let lim = if budget > 0 {
+        SearchLimits { time: None, max_nodes: Some(budget as u64), max_depth: 64 }
+    } else {
+        SearchLimits { time: None, max_nodes: None, max_depth: (-budget) as u8 }
+    };
     let mut out = vec![0f64; boards.len()];
     let chunk = boards.len().div_ceil(threads).max(1);
     std::thread::scope(|sc| {
         for (bs, os) in boards.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            let lim = &lim;
             sc.spawn(move || {
                 let mut se = Searcher::with_tt_bits(20);
                 for (b, o) in bs.iter().zip(os.iter_mut()) {
                     se.reset_for_new_game();
-                    let r = se.search(b, &SearchLimits { time: None, max_nodes: Some(nodes), max_depth: 64 });
+                    let r = se.search(b, &lim);
                     *o = (r.score as f64).clamp(-CLAMP, CLAMP);
                 }
             });
@@ -84,11 +90,14 @@ fn show(b: &Board, mark: usize) -> Vec<String> {
 
 pub fn run(args: &[String]) -> ExitCode {
     let Some(path) = arg(args, "--tdat") else {
-        eprintln!("usage: lab deep-see --tdat X.tdat [--pos 3000] [--n1 5000] [--n2 30000] [--stones 150] [--threads 7] [--out FILE]");
+        eprintln!("usage: lab deep-see --tdat X.tdat [--pos 3000] [--nodes 100,500,1000,5000] [--stone-nodes 1000] [--stones 150] [--threads 7] [--out FILE]");
         return ExitCode::from(2);
     };
     let g = |k: &str, d: u64| arg(args, k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
-    let (npos, n1, n2, nst, threads) = (g("--pos", 3000) as usize, g("--n1", 5000), g("--n2", 30000), g("--stones", 150) as usize, g("--threads", 7) as usize);
+    let (npos, nst, threads, ns) = (g("--pos", 3000) as usize, g("--stones", 150) as usize, g("--threads", 7) as usize, g("--stone-nodes", 1000));
+    // budgets: plain number = nodes, dN = fixed depth N (user D962)
+    let lv_txt: Vec<String> = arg(args, "--nodes").unwrap_or_else(|| "d1,d2,d3,d4,100,1000,5000".into()).split(',').map(|v| v.trim().to_string()).collect();
+    let levels: Vec<i64> = lv_txt.iter().map(|v| if let Some(d) = v.strip_prefix('d') { -(d.parse::<i64>().unwrap_or(1)) } else { v.parse().unwrap_or(1000) }).collect();
     let mut seed = g("--seed", 11) | 1;
     let out_path = arg(args, "--out");
     let net = Nnue::bundled();
@@ -101,22 +110,22 @@ pub fn run(args: &[String]) -> ExitCode {
         rep.push('\n');
     };
 
-    // ---------------- 1) position level
+    // ---------------- 1) position level: what does a SHALLOW search change?
     let boards = sample(&path, npos, &mut seed);
     let stat: Vec<f64> = boards.iter().map(|b| (net.eval(b, 0) as f64).clamp(-CLAMP, CLAMP)).collect();
-    let s1 = search_all(&boards, n1, threads);
-    let s2 = search_all(&boards, n2, threads);
-    say(format!("deep-see: {npos} positions, static eval vs main search {n1} / {n2} nodes ({:.0}s)", t0.elapsed().as_secs_f64()));
-    say("1) SEARCH CORRECTION per phase: mean |search - static| cp, corr(static, search), share of positions where the sign flips".into());
+    let sl: Vec<Vec<f64>> = levels.iter().map(|&n| search_all(&boards, n, threads)).collect();
+    say(format!("deep-see: {npos} positions, static eval vs main search at {:?} (dN = depth N, else nodes) ({:.0}s)", lv_txt, t0.elapsed().as_secs_f64()));
+    say("1) SEARCH CORRECTION per phase and budget: mean |search - static| cp / corr(static, search) / sign flips (|score| > 50)".into());
     for ph in 0..NPH {
         let idx: Vec<usize> = (0..npos).filter(|&i| phase(boards[i].empty()) == ph).collect();
         if idx.len() < 20 {
             continue;
         }
-        let m = |s: &[f64]| idx.iter().map(|&i| (s[i] - stat[i]).abs()).sum::<f64>() / idx.len() as f64;
-        let flip = |s: &[f64]| 100.0 * idx.iter().filter(|&&i| s[i].signum() != stat[i].signum() && s[i].abs() > 50.0).count() as f64 / idx.len() as f64;
-        let corr = |s: &[f64]| {
-            let n = idx.len() as f64;
+        let n = idx.len() as f64;
+        let mut line = format!("  {:<14} n {:>5} |", PH_NAME[ph], idx.len());
+        for (li, s) in sl.iter().enumerate() {
+            let md = idx.iter().map(|&i| (s[i] - stat[i]).abs()).sum::<f64>() / n;
+            let fl = 100.0 * idx.iter().filter(|&&i| s[i].signum() != stat[i].signum() && s[i].abs() > 50.0).count() as f64 / n;
             let (ma, mb) = (idx.iter().map(|&i| stat[i]).sum::<f64>() / n, idx.iter().map(|&i| s[i]).sum::<f64>() / n);
             let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
             for &i in &idx {
@@ -124,15 +133,11 @@ pub fn run(args: &[String]) -> ExitCode {
                 saa += (stat[i] - ma).powi(2);
                 sbb += (s[i] - mb).powi(2);
             }
-            sab / (saa * sbb).sqrt()
-        };
-        say(format!(
-            "  {:<14} n {:>5} | {n1}: |d| {:>6.1} corr {:.3} sign flips {:>4.1}% | {n2}: |d| {:>6.1} corr {:.3} sign flips {:>4.1}% | {n1}->{n2} |d| {:>6.1}",
-            PH_NAME[ph], idx.len(), m(&s1), corr(&s1), flip(&s1), m(&s2), corr(&s2), flip(&s2),
-            idx.iter().map(|&i| (s2[i] - s1[i]).abs()).sum::<f64>() / idx.len() as f64
-        ));
+            line.push_str(&format!(" {}: {:>5.1} / {:.3} / {:>4.1}% |", lv_txt[li], md, sab / (saa * sbb).sqrt(), fl));
+        }
+        say(line);
     }
-    // fit the correction (n2 search - static) with compact terms: material, weakness count, hand terms (no PST tables)
+    // fit each budget's correction with the compact hand terms (material, weakness count, hand terms; no PST tables)
     let keep: Vec<bool> = (0..PD).map(|i| { let gp = pgroup(i); gp == 0 || gp == 1 || gp == 5 || gp >= 6 }).collect();
     let mut ml = MoveList::new();
     let mut sc = Vec::new();
@@ -154,37 +159,48 @@ pub fn run(args: &[String]) -> ExitCode {
             r.add(&x, target[i]);
         }
         let w = r.solve(&k, 30.0);
-        let ys: Vec<f64> = (ntr..npos).map(|i| target[i]).collect();
-        let my = ys.iter().sum::<f64>() / ys.len() as f64;
+        let my = (ntr..npos).map(|i| target[i]).sum::<f64>() / (npos - ntr) as f64;
         let (mut se, mut st) = (0.0, 0.0);
         for i in ntr..npos {
             let x: Vec<(u16, f32)> = feats[i].iter().copied().filter(|&(j, _)| k[j as usize]).collect();
-            let p = dot(&w, &x);
-            se += (target[i] - p).powi(2);
+            se += (target[i] - dot(&w, &x)).powi(2);
             st += (target[i] - my).powi(2);
         }
         (1.0 - se / st, w)
     };
-    let corr2: Vec<f64> = (0..npos).map(|i| s2[i] - stat[i]).collect();
-    let (r2_all, w_all) = fit(None, &corr2);
-    say(format!("  correction ({n2}-node search - static eval) explained by compact hand terms: held-out R2 {:.4}", r2_all));
-    let mut abl: Vec<(usize, f64)> = (6..6 + NH).chain([1usize, 5]).map(|gp| (gp, r2_all - fit(Some(gp), &corr2).0)).collect();
-    abl.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    say("  terms the search corrects the eval on (drop-one held-out dR2, top 10):".into());
-    for (gp, d) in abl.iter().take(10) {
-        let name = match gp { 1 => "material".to_string(), 5 => "weakness count".to_string(), _ => HAND[gp - 6].to_string() };
-        let ws: Vec<String> = (0..NPH)
-            .map(|ph| {
-                let base = ph * crate::hcefit::PB;
-                let ix = (0..crate::hcefit::PB).map(|k| base + k).find(|&i| pgroup(i) == *gp).unwrap_or(base);
-                format!("{:.1}", w_all[ix])
-            })
-            .collect();
-        say(format!("   {:<20} dR2 {:>7.4}   correction cp per unit by phase (late..open) {}", name, d, ws.join(" / ")));
+    let gname = |gp: usize| match gp { 1 => "material".to_string(), 5 => "weakness count".to_string(), _ => HAND[gp - 6].to_string() };
+    for (li, s) in sl.iter().enumerate() {
+        // undecided positions only (|static| and |search| < 600): the part a pattern could explain
+        let corr: Vec<f64> = (0..npos).map(|i| if stat[i].abs() < 600.0 && s[i].abs() < 600.0 { s[i] - stat[i] } else { 0.0 }).collect();
+        let (r2_all, w_all) = fit(None, &corr);
+        let mut abl: Vec<(usize, f64)> = (6..6 + NH).chain([1usize, 5]).map(|gp| (gp, r2_all - fit(Some(gp), &corr).0)).collect();
+        abl.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        say(format!("  {} correction (undecided positions) explained by hand terms: held-out R2 {:.4}; top terms (dR2, cp per unit by phase late..open):", lv_txt[li], r2_all));
+        for (gp, d) in abl.iter().take(5) {
+            let ws: Vec<String> = (0..NPH)
+                .map(|ph| {
+                    let base = ph * crate::hcefit::PB;
+                    let ix = (0..crate::hcefit::PB).map(|k| base + k).find(|&i| pgroup(i) == *gp).unwrap_or(base);
+                    format!("{:.1}", w_all[ix])
+                })
+                .collect();
+            say(format!("     {:<20} {:>7.4}   {}", gname(*gp), d, ws.join(" / ")));
+        }
     }
 
-    // ---------------- 2) stone level
-    let sb = &boards[..nst.min(npos)];
+    // stone level on UNDECIDED positions only, at --stone-nodes
+    let sel: Vec<usize> = (0..npos).filter(|&i| stat[i].abs() < 300.0).take(nst).collect();
+    let sbv: Vec<Board> = sel.iter().map(|&i| boards[i].clone()).collect();
+    let stat: Vec<f64> = sel.iter().map(|&i| stat[i]).collect();
+    if nst == 0 {
+        if let Some(p) = &out_path {
+            let _ = File::create(p).and_then(|mut f| f.write_all(rep.as_bytes()));
+        }
+        return ExitCode::SUCCESS;
+    }
+    let ps: Vec<f64> = search_all(&sbv, ns as i64, threads);
+    let n1 = ns;
+    let sb = &sbv[..];    // ---------------- 2) stone level
     struct St {
         pos: usize,
         sq: usize,
@@ -239,8 +255,7 @@ pub fn run(args: &[String]) -> ExitCode {
             });
         }
     }
-    let fs = search_all(&flips, n1, threads);
-    let ps = &s1[..sb.len()];
+    let fs = search_all(&flips, n1 as i64, threads);
     for (k, st) in meta.iter_mut().enumerate() {
         let sg = if st.side == 0 { 1.0 } else { -1.0 };
         st.sv = sg * (stat[st.pos] - (net.eval(&flips[k], 0) as f64).clamp(-CLAMP, CLAMP));
