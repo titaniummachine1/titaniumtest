@@ -14,7 +14,7 @@
 //!   ours    : material, frontier, holes private / shared, no-move flags, square-class x weakness table, soft weaknesses
 //!                                                               [lab hce-fast, D963]
 //!   ours+gataxx : both
-use crate::hcefit::{box2, class, dot, phase, Ridge, CLAMP, NPH};
+use crate::hcefit::{box2, class, dot, phase, Ridge, CLAMP};
 use crate::util::{arg, box1, ring1, victim_planes, Rec, REC};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,6 +22,18 @@ use std::process::ExitCode;
 use titanium::nnue::Nnue;
 use titanium::{Board, MoveList};
 
+/// D980: bucket count (4 = the old hce phases, 16 = the NNUE's buckets: min(empties * 16 / 50, 15))
+static NBK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+pub(crate) fn set_nbk(n: usize) {
+    NBK.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn nbk() -> usize {
+    NBK.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn bk(e: u64) -> usize {
+    let n = nbk();
+    if n == 4 { phase(e) } else { (e.count_ones() as usize * n / 50).min(n - 1) }
+}
 const SETS: [&str; 5] = ["gataxx", "funes", "autaxx", "ours", "ours+gataxx"];
 // per-phase block sizes
 pub(crate) const G_N: usize = 6; // bias, material, safe, edge, reach, cohesion
@@ -96,7 +108,7 @@ fn push(out: &mut Vec<(u16, f32)>, i: usize, v: f32) {
 pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mut Vec<(u16, f32)>) {
     out.clear();
     let (me, op, e) = (b.me(), b.opp(), b.empty());
-    let ph = phase(e);
+    let ph = bk(e);
     let base = ph * block(set);
     let mat = me.count_ones() as f32 - op.count_ones() as f32;
     match set {
@@ -214,6 +226,7 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("usage: lab hce-compare --tdat X.tdat [--train 20000] [--val 2000] [--seed 7] [--out FILE]");
         return ExitCode::from(2);
     };
+    set_nbk(arg(args, "--buckets").and_then(|v| v.parse().ok()).unwrap_or(4));
     let ntr: usize = arg(args, "--train").and_then(|v| v.parse().ok()).unwrap_or(20_000);
     let nva: usize = arg(args, "--val").and_then(|v| v.parse().ok()).unwrap_or(2_000);
     let mut seed: u64 = arg(args, "--seed").and_then(|v| v.parse::<u64>().ok()).unwrap_or(7) | 1;
@@ -224,7 +237,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let total = f.metadata().map(|x| x.len() as usize / REC).unwrap_or(0) as u64;
     let mut buf = [0u8; REC];
     let mut ml = MoveList::new();
-    let mut ridges: Vec<Ridge> = (0..SETS.len()).map(|s| Ridge::new(NPH * block(s))).collect();
+    let mut ridges: Vec<Ridge> = (0..SETS.len()).map(|s| Ridge::new(nbk() * block(s))).collect();
     let mut val: Vec<(Vec<Board>, Vec<f64>)> = Vec::new();
     let mut x = Vec::new();
     let t0 = std::time::Instant::now();
@@ -260,10 +273,10 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         done += 1;
     }
-    let mut rep = format!("hce-compare: {ntr} train + {nva} val parents (+ children), champion eval target, {:.0}s\n", t0.elapsed().as_secs_f64());
+    let mut rep = format!("hce-compare: {ntr} train + {nva} val parents (+ children), {} buckets, champion eval target, {:.0}s\n", nbk(), t0.elapsed().as_secs_f64());
     rep.push_str(&format!("{:<12} {:>6} {:>8} {:>11} {:>10}\n", "term set", "dims", "R2", "best-move%", "regret cp"));
     for s in 0..SETS.len() {
-        let d = NPH * block(s);
+        let d = nbk() * block(s);
         let w = ridges[s].solve(&vec![true; d], 1.0);
         let (mut se, mut st, mut n, mut ag, mut rg) = (0f64, 0f64, 0f64, 0f64, 0f64);
         let mean: f64 = val.iter().flat_map(|v| v.1.iter()).sum::<f64>() / val.iter().map(|v| v.1.len()).sum::<usize>() as f64;
@@ -293,7 +306,7 @@ pub fn run(args: &[String]) -> ExitCode {
         if s == 0 {
             rep.push_str("  gataxx terms refitted to our net, per phase (cp per unit; late..open): ");
             for (k, nm) in ["material", "safe", "edge", "reach", "cohesion"].iter().enumerate() {
-                let v: Vec<String> = (0..NPH).map(|ph| format!("{:.1}", w[ph * G_N + 1 + k])).collect();
+                let v: Vec<String> = (0..nbk()).map(|ph| format!("{:.1}", w[ph * G_N + 1 + k])).collect();
                 rep.push_str(&format!("{nm} {} | ", v.join("/")));
             }
             rep.push('\n');

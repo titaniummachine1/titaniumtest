@@ -1,4 +1,4 @@
-//! `lab hce-train` (D977): train the hand-crafted eval EXACTLY like the NNUE: same dataset, same target, same loss, same
+﻿//! `lab hce-train` (D977): train the hand-crafted eval EXACTLY like the NNUE: same dataset, same target, same loss, same
 //! validation, stop only at saturation (LAWS C15), initialised from the closed-form fit to the champion (LAWS C14).
 //!
 //!   lab hce-train --data train_v10.tdat --val val_v9_clean.tdat [--set 4] [--threads 7] [--bs 16384] [--lr 2.0]
@@ -10,8 +10,8 @@
 //! Loss: wsum * |sigmoid(y) - target|^2.5 (hub train.rs). Validation: target_of = 0.75 * sigmoid + 0.25 * outcome on val rows,
 //! the same metric printed for the bundled NNUE on the same rows. Saturation: stop when 4 epochs in a row do not improve the
 //! best validation loss by >= 1e-7 (lr halves after each non-improving epoch).
-use crate::hcecmp::{block, feats, masks};
-use crate::hcefit::{dot, phase, Ridge, CLAMP, NPH};
+use crate::hcecmp::{block, feats, masks, nbk, set_nbk};
+use crate::hcefit::{dot, phase, Ridge, CLAMP};
 use crate::util::{arg, ring1, Rec, REC};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -76,7 +76,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut lr = g("--lr", 2.0) as f32;
     let max_rows = g("--max-rows", 1e12) as usize;
     let out = arg(args, "--out").unwrap_or_else(|| "C:/gitProjects/titanium-ataxx/logs/hce/d977_hcetrain".into());
-    let d = NPH * block(set);
+    set_nbk(g("--buckets", 16.0) as usize);
+    let d = nbk() * block(set);
     let ring = ring1();
     let m = masks();
     let net = Nnue::bundled();
@@ -91,7 +92,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let train = read_rows(&data, max_rows);
     let val = read_rows(&valp, 600_000);
-    say(format!("hce-train: set {set} ({d} weights), {} train rows, {} val rows, {threads} threads, bs {bs} ({:.0}s)", train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
+    say(format!("hce-train: set {set}, {} buckets ({d} weights), {} train rows, {} val rows, {threads} threads, bs {bs} ({:.0}s)", nbk(), train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
 
     // init (C14): closed-form ridge fit to the champion eval on the first 20k train positions + their children
     let mut ridge = Ridge::new(d);
