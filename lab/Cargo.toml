@@ -1,0 +1,24 @@
+﻿[package]
+name = "titanium-lab"
+version = "0.1.0"
+edition = "2021"
+description = "Research lab binary (studies of the champion eval: hce-fit, see-screen). Kept OUT of the hub so an edit recompiles one small crate, not the whole hub (D957)."
+
+[[bin]]
+name = "lab"
+path = "src/main.rs"
+
+[dependencies]
+titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "0120fd12" }
+
+# rapid-development loop (D957): the lab itself builds in dev mode (incremental, opt-level 1, seconds per edit);
+# dependencies (the engine) are optimised once and cached, so evals still run at full speed.
+[profile.dev]
+opt-level = 1
+debug = false
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace]

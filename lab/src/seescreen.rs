@@ -1,7 +1,7 @@
-﻿//! `ti see-screen` (D944): how well do CHEAP approximations of the 2-ply exchange (my capture gain, the opponent's best
+﻿//! `lab see-screen` (D944): how well do CHEAP approximations of the 2-ply exchange (my capture gain, the opponent's best
 //! reply gain) match the exact value, and what do they cost per move? Research tool, read-only, no engine change.
 //!
-//!   ti see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]
+//!   lab see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]
 //!
 //! Ground truth = brute force: play the move, enumerate the opponent's legal moves, best gain = clone + 2 * victims.
 //! State index as the TPOL5 head uses it: 0 = opponent has no move, else 1 + best gain.
@@ -11,9 +11,7 @@
 //!   parent  as noflip but landings from the parent position (no box1 per move)
 //!   levels  per node: the top two count levels of the landing squares; per move 3-4 mask tests, no planes at all
 //!   node    one constant per node (the opponent's best reply if we passed): no per-move work
-use crate::data::{Rec, REC};
-use crate::policy::{arg, ring1};
-use crate::policy2::{box1, opp_state, planes_add, planes_max, planes_sub, victim_planes};
+use crate::util::{arg, box1, opp_state, planes_add, planes_max, planes_sub, ring1, victim_planes, Rec, REC};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::process::ExitCode;
@@ -221,7 +219,7 @@ fn coarse(s: usize) -> usize {
 
 pub fn run(args: &[String]) -> ExitCode {
     let Some(path) = arg(args, "--tdat") else {
-        eprintln!("usage: ti see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]");
+        eprintln!("usage: lab see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]");
         return ExitCode::from(2);
     };
     let rows: usize = arg(args, "--rows").and_then(|v| v.parse().ok()).unwrap_or(50_000);

@@ -88,13 +88,13 @@ const FILE_G: u64 = file_mask(6);
 pub(crate) const NSEE_BASE: usize = 18 * 19; // my_diff (0..17) x opp_state (0=stalemate, 1..18=1+max_opp_diff)
 
 #[inline(always)]
-pub(crate) fn box1(x: u64) -> u64 {
+fn box1(x: u64) -> u64 {
     let h = x | ((x & !FILE_A) >> 1) | ((x & !FILE_G) << 1);
     (h | (h >> 7) | (h << 7)) & FULL49
 }
 
 #[inline(always)]
-pub(crate) fn victim_planes(v: u64) -> [u64; 4] {
+fn victim_planes(v: u64) -> [u64; 4] {
     let s0 = (v >> 1) & !FILE_G;
     let s1 = (v << 1) & !FILE_A;
     let s2 = v >> 7;
@@ -117,7 +117,7 @@ pub(crate) fn victim_planes(v: u64) -> [u64; 4] {
 }
 
 #[inline(always)]
-pub(crate) fn planes_add(p: &mut [u64; 4], m: u64) {
+fn planes_add(p: &mut [u64; 4], m: u64) {
     let c0 = p[0] & m;
     p[0] ^= m;
     let c1 = p[1] & c0;
@@ -128,7 +128,7 @@ pub(crate) fn planes_add(p: &mut [u64; 4], m: u64) {
 }
 
 #[inline(always)]
-pub(crate) fn planes_sub(p: &mut [u64; 4], m: u64) {
+fn planes_sub(p: &mut [u64; 4], m: u64) {
     let b0 = !p[0] & m;
     p[0] ^= m;
     let b1 = !p[1] & b0;
@@ -139,7 +139,7 @@ pub(crate) fn planes_sub(p: &mut [u64; 4], m: u64) {
 }
 
 #[inline(always)]
-pub(crate) fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
+fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
     let mut m = cand;
     let mut best = 0u32;
     for k in (0..4).rev() {
@@ -155,7 +155,7 @@ pub(crate) fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
 /// Exact 1-ply opponent reply differential state after our move:
 /// 0 = opponent has no legal moves; 1..=18 = 1 + max_opp_diff (0..=17).
 #[inline(always)]
-pub(crate) fn opp_state(b1_empty: u64, b2_empty: u64, p: &[u64; 4]) -> usize {
+fn opp_state(b1_empty: u64, b2_empty: u64, p: &[u64; 4]) -> usize {
     if b2_empty == 0 {
         return 0;
     }
