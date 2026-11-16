@@ -107,7 +107,7 @@ fn after3(v: &Lv3, ring: &[u64; 49], win: u64, newv: u64, tbit: u64) -> u32 {
     }
     best
 }
-struct Node {
+pub(crate) struct Node {
     me: u64,
     opp: u64,
     empty: u64,
@@ -123,7 +123,7 @@ struct Node {
     w2: Lv3,
 }
 
-fn node_ctx(b: &Board) -> Node {
+pub(crate) fn node_ctx(b: &Board) -> Node {
     let (me, opp, empty) = (b.me(), b.opp(), b.empty());
     let pm = victim_planes(me);
     let b1 = box1(opp);
@@ -132,7 +132,7 @@ fn node_ctx(b: &Board) -> Node {
     Node { me, opp, empty, pm, b1, b2, l1, l2, v1: lv(l1, &pm), v2: lv(l2, &pm), node_state: opp_state(l1, l2, &pm), w1: lv3(l1, &pm), w2: lv3(l2, &pm) }
 }
 
-fn est(n: &Node, ring: &[u64; 49], from: u8, to: u8, clone: bool, which: usize) -> usize {
+pub(crate) fn est(n: &Node, ring: &[u64; 49], from: u8, to: u8, clone: bool, which: usize) -> usize {
     let tu = to as usize;
     let tbit = 1u64 << tu;
     match which {
