@@ -29,6 +29,7 @@ mod games;
 mod gamedata;
 mod dag;
 mod gen;
+mod genguard;
 mod sprt;
 mod spsa;
 mod train;
@@ -116,15 +117,58 @@ fn print_help() {
 }
 
 fn run_relabel_local(args: &[String]) -> ExitCode {
-    if let Some(pol) = flag_str(args, "--policy") {
+    // LAWS A12 (D927): STANDARD = labels only from the current main engine (behavioural check), its own net / policy /
+    // SmallNet, TT 2^22, >= 5,000 nodes; --net / --policy / --tt-bits / --force are refused. EXPERIMENT (D931): only
+    // with --experiment NAME; the overrides are allowed and the output must be under experiments/.
+    let exp = genguard::experiment(args);
+    genguard::announce("relabel", &exp);
+    if exp.is_none() {
+        if let Err(e) = genguard::refuse_weakening_flags("relabel", args, &["--net", "--policy", "--tt-bits", "--force"]) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let nodes = flag_u64(args, "--nodes").unwrap_or(genguard::STD_NODES);
+    if exp.is_none() {
+        if let Err(e) = genguard::check_nodes("relabel", nodes) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    for (flag, is_out) in [("--tdat", false), ("--tdat-out", true), ("--out", true), ("--in", false)] {
+        if let Some(p) = flag_str(args, flag) {
+            let r = if is_out { genguard::check_output("relabel", &exp, &p) } else { genguard::check_inputs("relabel", &exp, [p.as_str()]) };
+            if let Err(e) = r {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let (Some(_), Some(pol)) = (&exp, flag_str(args, "--policy")) {
         titanium::policy::configure(&pol);
     }
-    let nodes = flag_u64(args, "--nodes").unwrap_or(5000);
+    match (genguard::require_main_engine("relabel"), &exp) {
+        (Ok(id), _) => eprintln!("relabel: engine = current main {} (identity check: {} positions, {} nodes equal)", id.main_commit, id.positions, id.nodes),
+        (Err(e), None) => {
+            if let Err(e2) = genguard::rebuild_and_rerun("relabel", &e) {
+                eprintln!("{e}
+{e2}");
+            }
+            return ExitCode::FAILURE;
+        }
+        (Err(e), Some(_)) => eprintln!("relabel: EXPERIMENT engine differs from main (allowed in an experiment): {e}"),
+    }
     let threads = resolve_threads(args);
     let bz_rules = has_flag(args, "--bz");
-    let tt_bits = flag_u64(args, "--tt-bits").unwrap_or(18) as usize;
-    let net_spec = flag_str(args, "--net").unwrap_or_else(|| "bundled".into());
-    let force = has_flag(args, "--force");
+    let tt_bits = match &exp {
+        Some(_) => flag_u64(args, "--tt-bits").map_or(genguard::PROD_TT_BITS, |v| v as usize),
+        None => genguard::PROD_TT_BITS,
+    };
+    let net_spec = match &exp {
+        Some(_) => flag_str(args, "--net").unwrap_or_else(|| "bundled".into()),
+        None => "bundled".to_string(),
+    };
+    let force = exp.is_some() && has_flag(args, "--force");
 
     if let Some(tdat_in) = flag_str(args, "--tdat") {
         let Some(tdat_out) = flag_str(args, "--tdat-out") else {
@@ -133,7 +177,7 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
         };
         let out_file = format!("{tdat_out}.tdat");
         if !force && Path::new(&out_file).exists() {
-            eprintln!("relabel: {out_file} exists (pass --force to overwrite)");
+            eprintln!("relabel: {out_file} exists; refusing to overwrite (pick a new --tdat-out)");
             return ExitCode::FAILURE;
         }
         let owned_net = if net_spec == "bundled" {

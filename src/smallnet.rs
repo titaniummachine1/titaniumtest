@@ -14,8 +14,9 @@
 //!   5. export TSN1 and verify it against the ENGINE's own `SmallNet::parse` + `bound` (max |diff| must be <= 1 cp).
 //!
 //!   ti train smallnet --net nnue_main.tnn --train data/nnue/packed/train_v9 --val data/nnue/packed/val_v9_clean \
-//!       --out sn_new.tsn [--init data/nnue/fut_small.tsn] [--rows 1200000] [--val-rows 60000] [--child-every 3] \
-//!       [--epochs-mse 4] [--epochs-pin 8] [--tau 0.02] [--lr 0.002] [--threads 7] [--seed 1]
+//!       --out sn_new.tsn --init data/nnue/fut_small.tsn [--rows 1200000] [--val-rows 60000] [--child-every 3] \
+//!       [--patience 4] [--tau 0.02] [--lr 0.002] [--threads 7] [--seed 1]
+//!   (D898: trains the pinball bound until --patience epochs bring no val gain; no epoch counts exist, LAWS C15)
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -301,19 +302,40 @@ fn print_report(tag: &str, r: &Report) {
     );
 }
 
+/// Val objective of the phase: MSE (tau None) or pinball loss at tau, in (cp/400) units, lower is better.
+fn val_objective(net: &Net, val: &[Sample], tau: Option<f32>) -> f64 {
+    let mut l = 0f64;
+    for s in val {
+        let d = (s.target as f32 / 400.0 - net.forward(s).y) as f64;
+        l += match tau {
+            None => d * d,
+            Some(q) => {
+                let q = q as f64;
+                if d > 0.0 { q * d } else { (q - 1.0) * d }
+            }
+        };
+    }
+    l / val.len().max(1) as f64
+}
+
+/// LAWS C15 (D868): no epoch limit. Trains until `patience` consecutive epochs bring no val gain (relative 1e-4), lr
+/// lr0 * 0.85^epoch (floor 2% of lr0); the best epoch's weights are kept.
 #[allow(clippy::too_many_arguments)]
-fn fit(net: &mut Net, train: &[Sample], val: &[Sample], epochs: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str) {
+fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str) {
     let batch = 16384usize;
     let mut m = vec![0f32; NP];
     let mut v = vec![0f32; NP];
     let mut step = 0usize;
-    let steps_total = epochs * (train.len() / batch).max(1);
     let mut idx: Vec<u32> = (0..train.len() as u32).collect();
     let mut rng = Rng(seed | 1);
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; NP]).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    for ep in 0..epochs {
+    let mut best = (val_objective(net, val, tau), net.p.clone(), 0usize);
+    println!("[smallnet] {tag} start: val objective {:.6}", best.0);
+    let mut bad = 0usize;
+    for ep in 0.. {
         let t0 = Instant::now();
+        let lr = lr0 * 0.85f32.powi(ep as i32).max(0.02);
         for i in (1..idx.len()).rev() {
             let j = (rng.next() % (i as u64 + 1)) as usize;
             idx.swap(i, j);
@@ -324,7 +346,6 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], epochs: usize, tau: Opti
                 break;
             }
             step += 1;
-            let lr = lr0 * (0.05 + 0.95 * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / steps_total as f32).cos()));
             let per = (chunk.len() + threads - 1) / threads;
             let netr = &*net;
             let ls: Vec<f64> = std::thread::scope(|sc| {
@@ -378,18 +399,33 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], epochs: usize, tau: Opti
             }
         }
         let r = report(net, val);
+        let obj = val_objective(net, val, tau);
+        let gain = obj < best.0 * (1.0 - 1e-4);
         println!(
-            "[smallnet] {tag} epoch {}/{} loss {:.5} | val RMSE {:.1} cp, P(bound>truth) {:.2}% (end {:.2}%), slack {:.1} cp | {:.0}s",
+            "[smallnet] {tag} epoch {} lr {:.5} loss {:.5} | val objective {:.6}{} | val RMSE {:.1} cp, P(bound>truth) {:.2}% (end {:.2}%), slack {:.1} cp | {:.0}s",
             ep + 1,
-            epochs,
+            lr,
             loss_sum / (train.len() as f64),
+            obj,
+            if gain { " (best)" } else { "" },
             r.rmse_cp,
             100.0 * r.viol,
             100.0 * r.viol_end,
             r.slack_mean,
             t0.elapsed().as_secs_f64()
         );
+        if gain {
+            best = (obj, net.p.clone(), ep + 1);
+            bad = 0;
+        } else {
+            bad += 1;
+            if bad >= patience {
+                println!("[smallnet] {tag} saturated: {patience} epochs without a val gain, best epoch {}", best.2);
+                break;
+            }
+        }
     }
+    net.p = best.1;
 }
 
 /// Max |hub forward - engine SmallNet::bound| in cp over the samples.
@@ -425,8 +461,11 @@ fn run(args: &[String]) -> Result<(), String> {
     let rows = num("--rows", 1_200_000.0) as usize;
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
-    let e_mse = num("--epochs-mse", 4.0) as usize;
-    let e_pin = num("--epochs-pin", 8.0) as usize;
+    // LAWS C15 (D868): no epoch limit of any size; every phase stops only by saturation (--patience epochs, default 4)
+    if args.iter().any(|a| a == "--epochs-mse" || a == "--epochs-pin" || a == "--max-epochs") {
+        return Err("--epochs-mse / --epochs-pin / --max-epochs are forbidden (LAWS C15: train to saturation)".into());
+    }
+    let patience = (num("--patience", 4.0) as usize).max(1);
     let tau = num("--tau", 0.02) as f32;
     let lr = num("--lr", 0.002) as f32;
     let threads = num("--threads", 4.0) as usize;
@@ -448,16 +487,14 @@ fn run(args: &[String]) -> Result<(), String> {
     let val = build_samples(&va_rows, &big, (every / 2).max(1), threads, seed ^ 0x5555);
     println!("[smallnet] samples: train {} ({:.0} MB), val {} in {:.0}s", train.len(), (train.len() * std::mem::size_of::<Sample>()) as f64 / 1e6, val.len(), t0.elapsed().as_secs_f64());
 
-    let mut net = match flag("--init") {
-        Some(p) => {
-            let n = Net::parse(&std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?)?;
-            print_report(&format!("BEFORE (init {p}, fitted to an older big net)"), &report(&n, &val));
-            n
-        }
-        None => Net::random(seed),
+    // LAWS C14: never from random weights; warm start from the shipped (or a previous) SmallNet, straight into the
+    // lower-bound objective (an MSE phase would first pull the bound to the mean and throw the init's tail away)
+    let Some(p) = flag("--init") else {
+        return Err("--init SMALLNET.tsn is required (LAWS C14: no random init)".into());
     };
-    fit(&mut net, &train, &val, e_mse, None, lr, threads, seed, "MSE");
-    fit(&mut net, &train, &val, e_pin, Some(tau), lr * 0.5, threads, seed ^ 0xAAAA, "pinball");
+    let mut net = Net::parse(&std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?)?;
+    print_report(&format!("BEFORE (init {p})"), &report(&net, &val));
+    fit(&mut net, &train, &val, patience, Some(tau), lr * 0.5, threads, seed ^ 0xAAAA, "pinball");
     print_report("AFTER", &report(&net, &val));
 
     let blob = net.to_bytes();

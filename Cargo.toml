@@ -10,10 +10,12 @@ name = "ti"
 path = "src/main.rs"
 
 [dependencies]
-# Published engine, pinned (origin/main 2c40ae5). For local engine work add a gitignored .cargo/config.toml with
+# Published engine, pinned to the CURRENT champion (origin/main 0120fd12, D929). LAWS A12: bump this rev in the same turn as
+# every promotion; `ti gen` / `ti relabel` refuse to run when the linked engine differs from main anyway. Local work uses
+# the gitignored .cargo/config.toml with
 #   [patch."https://github.com/titaniummachine1/titanium-ataxx"]
 #   titanium = { path = "C:/gitProjects/mainpromo-ataxx/crates/titanium" }
-titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "2c40ae56" }
+titanium = { git = "https://github.com/titaniummachine1/titanium-ataxx", rev = "0120fd12" }
 
 flate2 = "1.1"
 serde_json = "1"

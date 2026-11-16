@@ -785,13 +785,16 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
                         }
                         let mut list = MoveList::new();
                         b.legal_moves_dedup_into(&mut list);
-                        // D847: policy log-softmax + rank over the legal moves (engine call: logit_k(b, m, &[], kc))
+                        // D847/D892: policy log-softmax + rank over the legal moves. D892 FIX: the logit the SEARCH's move
+                        // ordering computes (on main since 0120fd12 the SEE path is deleted, so logit_k IS the ordering logit, search.rs:2918; main runs pol_see_min 99 = SEE off since D751, policy
+                        // dim 0, big net not pairwise -> no xin). D847-D891 used logit_k WITH the SEE term = an input the
+                        // engine never computes (MISTAKES 2026-11-15).
                         let n = list.len();
                         let mut lg = vec![0f32; n];
                         if let Some(pol) = titanium::policy::global() {
                             let mut kc = titanium::policy::KCache::new();
                             for (i, l) in lg.iter_mut().enumerate() {
-                                *l = pol.logit_k(&b, list.move_at(i), &[], &mut kc);
+                                *l = pol.logit_k(&b, list.move_at(i), &mut kc);
                             }
                         }
                         let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -1106,6 +1109,32 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
 
 /// Binary dump of a trained research model (no JSON, D806): "SNAR" v2, arch name (u32 length + bytes), buckets u32, params u32,
 /// then the f32 params little-endian in the Model layout (ft rows, ft bias, l1 w, l1 b, out w, out b, skips).
+/// D892: load a SNAR v1 (16-byte name) or v2 (length + name) file into `m`; the design name, bucket count and parameter
+/// count must match exactly.
+fn load_model(m: &mut Model, path: &str) -> Result<(), String> {
+    let d = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if d.len() < 24 || &d[..4] != b"SNAR" {
+        return Err(format!("{path}: not a SNAR file"));
+    }
+    let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+    let (name, hdr) = match u(4) {
+        1 => (String::from_utf8_lossy(&d[8..24]).trim_end_matches('\0').to_string(), 24),
+        2 => {
+            let nl = u(8);
+            (String::from_utf8_lossy(&d[12..12 + nl]).to_string(), 12 + nl)
+        }
+        v => return Err(format!("{path}: SNAR version {v}")),
+    };
+    let (nb, np) = (u(hdr), u(hdr + 4));
+    if name != m.name() || nb != m.nb || np != m.np || d.len() != hdr + 8 + 4 * np {
+        return Err(format!("{path}: is {name} nb {nb} np {np}, the run is {} nb {} np {}", m.name(), m.nb, m.np));
+    }
+    for (i, c) in d[hdr + 8..].chunks_exact(4).enumerate() {
+        m.p[i] = f32::from_le_bytes(c.try_into().unwrap());
+    }
+    Ok(())
+}
+
 fn save_model(m: &Model, path: &str) -> Result<(), String> {
     let mut b = Vec::with_capacity(32 + 4 * m.np);
     b.extend_from_slice(b"SNAR");
@@ -1171,6 +1200,7 @@ fn run(args: &[String]) -> Result<(), String> {
         on_slack: flag("--sat-metric").map(|v| v != "pin").unwrap_or(true),
     };
     let save_dir = flag("--save-dir");
+    let init = flag("--init");
     if let Some(d) = &save_dir {
         std::fs::create_dir_all(d).map_err(|e| format!("{d}: {e}"))?;
     }
@@ -1240,8 +1270,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), ext.suffix(), trows.len());
                 let mut m = Model::new(arch, nb, seed, ext);
                 println!("[snarch] {tag} : {} features, {} params", arch.nf(), m.np);
+                // D892 (C14: never from random weights): --init FILE.snar starts from a trained model of the SAME design
+                if let Some(ip) = &init {
+                    load_model(&mut m, ip)?;
+                    println!("[snarch] {tag} initialised from {ip}");
+                }
                 let ta = Instant::now();
-                fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None);
+                if e_mse > 0 {
+                    fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None);
+                }
                 fit(&mut m, &train, &val_a, &val_b, 0, Some(tau), lr, threads, seed ^ 7, "pinball", tau as f64, Some(sat));
                 let r = report(&m, &val_a, &val_b, tau as f64);
                 if let Some(d) = &save_dir {

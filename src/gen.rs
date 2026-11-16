@@ -8,9 +8,12 @@
 //! Rules: Botzone. The game ends the moment either side is stuck and the mobile side absorbs the empties
 //! (`bz_over` / `bz_counts`), so no pass is ever emitted.
 //!
-//!   ti gen --out FILE [--games 500] [--nodes 5000 | --time-ms N] [--threads auto]
-//!          [--seq-dag DB (default data/dag/seq_dag.db)] [--src NAME]
-//!          [--book FILE] [--book0 N] [--tt-bits 18] [--network FILE|bundled]
+//!   ti gen --out STEM [--games 500] [--nodes 5000 (minimum)] [--threads auto]
+//!          [--seq-dag DB (default data/dag/seq_dag.db)] [--src NAME] [--book FILE] [--book0 N]
+//!
+//! LAWS A12 (D927): the engine is ALWAYS the current main, proved before the first game by `genguard::require_main_engine`
+//! (node-for-node equal to the main gate exe); --network / --policy / --tt-bits / --time-ms are refused, TT = 2^22,
+//! nodes >= 5,000; STEM.engine.json records which main made the files; an existing STEM is never overwritten.
 //!
 //! THE ONE RULE (user order, D787; D804: the database is the sequence DAG = PGN-like game sequences): the game record
 //! is the chain of moves from the start. At every ply take the legal moves, ask the sequence DAG which of them continue
@@ -22,15 +25,15 @@
 //! Each finished game is written to the sequence DAG (numeric game id `gid`). A game whose complete sequence is already
 //! in the DAG is NOT written to the files again (counted as a duplicate in the log); a stored game's `gid` is in the .tbst.
 //!
-//! Defaults: 5,000 nodes per move, up to 6 threads. `--time-ms` and `--book` (start positions) are explicit overrides.
+//! Defaults: 5,000 nodes per move, up to 6 threads. `--book` gives start positions (the engine is never changed by it).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+
 
 use titanium::nnue::Nnue;
 use titanium::{Board, Move, MoveList, SearchLimits, Searcher};
@@ -127,47 +130,82 @@ struct Counters {
 
 pub fn run_gen(args: &[String]) -> ExitCode {
     let Some(out) = crate::flag_str(args, "--out") else {
-        eprintln!("usage: ti gen --out FILE [--games 500] [--nodes 5000 | --time-ms N] [--threads auto] [--seq-dag DB] [--src NAME] [--book FILE] [--book0 N] [--tt-bits 18] [--network FILE|bundled]");
+        eprintln!("usage: ti gen --out STEM [--games 500] [--nodes 5000 (minimum)] [--threads auto] [--seq-dag DB] [--src NAME] [--book FILE] [--book0 N]");
         return ExitCode::FAILURE;
     };
-    let games = crate::flag_u64(args, "--games").unwrap_or(500) as u32;
-    let time_ms_flag = crate::flag_u64(args, "--time-ms");
-    let node_flag = crate::flag_u64(args, "--nodes").filter(|&n| n > 0);
-    if time_ms_flag.is_some() && node_flag.is_some() {
-        eprintln!("gen: give --nodes OR --time-ms, not both");
-        return ExitCode::FAILURE;
+    // LAWS A12 (D927): one idiot-proof generator. STANDARD (default): the engine is the current main (behavioural check
+    // below) with its own net / policy / SmallNet, TT 2^22, >= 5,000 nodes per move; the weakening flags are refused.
+    // EXPERIMENT (D931): only with --experiment NAME; overrides allowed; outputs AND the DAG must be under experiments/.
+    let exp = crate::genguard::experiment(args);
+    crate::genguard::announce("gen", &exp);
+    if exp.is_none() {
+        if let Err(e) = crate::genguard::refuse_weakening_flags("gen", args, &["--network", "--policy", "--tt-bits", "--time-ms"]) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     }
-    let node_limit = match (node_flag, time_ms_flag) {
-        (Some(n), _) => Some(n),
-        (None, Some(_)) => None,
-        (None, None) => Some(5000),
+    let games = crate::flag_u64(args, "--games").unwrap_or(500) as u32;
+    let nodes = crate::flag_u64(args, "--nodes").unwrap_or(crate::genguard::STD_NODES);
+    if exp.is_none() {
+        if let Err(e) = crate::genguard::check_nodes("gen", nodes) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let dag_path = crate::flag_str(args, "--seq-dag").unwrap_or_else(|| match &exp {
+        None => "data/dag/seq_dag.db".into(),
+        Some(_) => format!("{}/seq_dag.db", std::path::Path::new(&out).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into())),
+    });
+    for p in [&out, &dag_path] {
+        if let Err(e) = crate::genguard::check_output("gen", &exp, p) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let (Some(_), Some(pol)) = (&exp, crate::flag_str(args, "--policy")) {
+        titanium::policy::configure(&pol);
+    }
+    let identity = crate::genguard::require_main_engine("gen");
+    let engine_id = match (identity, &exp) {
+        (Ok(id), _) => {
+            eprintln!("gen: engine = current main {} (identity check: {} positions, {} nodes equal to the main exe)", id.main_commit, id.positions, id.nodes);
+            Some(id)
+        }
+        (Err(e), None) => {
+            if let Err(e2) = crate::genguard::rebuild_and_rerun("gen", &e) {
+                eprintln!("{e}
+{e2}");
+            }
+            return ExitCode::FAILURE;
+        }
+        (Err(e), Some(_)) => {
+            eprintln!("gen: EXPERIMENT engine differs from main (allowed in an experiment): {e}");
+            None
+        }
     };
-    let time_ms = time_ms_flag.unwrap_or(100);
+    let node_limit = Some(nodes);
     let default_threads = std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(2).clamp(1, 6) as u64;
     let threads = crate::flag_u64(args, "--threads").unwrap_or(default_threads).max(1) as usize;
     let book0 = crate::flag_u64(args, "--book0").unwrap_or(0) as usize;
-    let tt_bits = crate::flag_u64(args, "--tt-bits").unwrap_or(18) as usize;
-    let network = crate::flag_str(args, "--network").unwrap_or_else(|| "bundled".into());
+    let tt_bits = match &exp {
+        Some(_) => crate::flag_u64(args, "--tt-bits").map_or(crate::genguard::PROD_TT_BITS, |v| v as usize),
+        None => crate::genguard::PROD_TT_BITS,
+    };
     let src = crate::flag_str(args, "--src").unwrap_or_else(|| {
         std::path::Path::new(&out).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| out.clone())
     });
 
-    let owned_net: Option<Nnue> = if network == "bundled" || network == "none" {
-        None
-    } else {
-        match Nnue::load(&network) {
+    let owned_net: Option<Nnue> = match (&exp, crate::flag_str(args, "--network")) {
+        (Some(_), Some(p)) if p != "bundled" => match Nnue::load(&p) {
             Ok(n) => Some(n),
             Err(e) => {
-                eprintln!("gen: cannot load network {network}: {e}");
+                eprintln!("gen: cannot load network {p}: {e}");
                 return ExitCode::FAILURE;
             }
-        }
+        },
+        _ => None,
     };
-    let net: Option<&Nnue> = match owned_net.as_ref() {
-        Some(n) => Some(n),
-        None if network == "none" => None,
-        None => Some(Nnue::bundled_static()),
-    };
+    let net: Option<&Nnue> = Some(owned_net.as_ref().unwrap_or_else(|| Nnue::bundled_static()));
 
     let book: Option<Vec<String>> = match crate::flag_str(args, "--book") {
         Some(p) => match std::fs::read_to_string(&p) {
@@ -181,7 +219,6 @@ pub fn run_gen(args: &[String]) -> ExitCode {
     };
     let book = book.filter(|l| !l.is_empty());
 
-    let dag_path = crate::flag_str(args, "--seq-dag").unwrap_or_else(|| "data/dag/seq_dag.db".into());
     if let Some(parent) = std::path::Path::new(&dag_path).parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -201,6 +238,25 @@ pub fn run_gen(args: &[String]) -> ExitCode {
 
     // --out is the file STEM (a trailing .tgam / .jsonl is stripped): STEM.tgam + STEM.tbst, binary only (D806)
     let stem = out.trim_end_matches(".jsonl").trim_end_matches(".tgam").to_string();
+    for ext in ["tgam", "tbst", "engine.json"] {
+        if std::path::Path::new(&format!("{stem}.{ext}")).exists() {
+            eprintln!("gen: {stem}.{ext} already exists; refusing to overwrite (pick a new --out)");
+            return ExitCode::FAILURE;
+        }
+    }
+    let mut id = match &engine_id {
+        Some(e) => e.json(),
+        None => serde_json::json!({ "identity_check": "FAILED: the engine is NOT the current main (experiment)" }),
+    };
+    id["mode"] = serde_json::json!(match &exp { Some(n) => format!("EXPERIMENTAL: {n}"), None => "STANDARD (LAWS A12)".to_string() });
+    id["tt_bits"] = serde_json::json!(tt_bits);
+    id["network"] = serde_json::json!(crate::flag_str(args, "--network").filter(|_| exp.is_some()).unwrap_or_else(|| "bundled".into()));
+    id["nodes_per_move"] = serde_json::json!(nodes);
+    id["started"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    if let Err(e) = std::fs::write(format!("{stem}.engine.json"), serde_json::to_string_pretty(&id).unwrap_or_default()) {
+        eprintln!("gen: cannot write {stem}.engine.json: {e}");
+        return ExitCode::FAILURE;
+    }
     let w = match BinOut::create(&stem) {
         Ok(f) => Mutex::new(f),
         Err(e) => {
@@ -254,7 +310,7 @@ pub fn run_gen(args: &[String]) -> ExitCode {
                         let mut ml = MoveList::new();
                         while !b.bz_over() && ply < 400 && b.has_moves(b.turn) {
                             let limits = SearchLimits {
-                                time: if node_limit.is_some() { None } else { Some(Duration::from_millis(time_ms)) },
+                                time: None,
                                 max_nodes: node_limit,
                                 max_depth: 30,
                             };
@@ -350,7 +406,7 @@ pub fn run_gen(args: &[String]) -> ExitCode {
                                     occ: start.occ,
                                     blockers: start.blockers,
                                     turn: start.turn,
-                                    cand_seat: 0,
+                                    cand_seat: 2, // self-play: no gate candidate (D930; 0 before)
                                     forfeit: false,
                                     final_cnt: [bx.min(254) as u8, bo.min(254) as u8],
                                     result: res,

@@ -7,7 +7,7 @@
 //! Epochs run until the validation loss stops improving (early stop), the best epoch is exported.
 //!
 //!   ti policy2 --net NET.tnn --games a.jsonl,.. --kata DIR[,DIR] --pat k3c --init POL.bin --out-bin OUT.bin
-//!              [--max-epochs 30] [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 1]
+//!              [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 4]
 //!              [--adv-lambda L [--adv-scale 0.10] [--adv-clip 1]]
 //!
 //! `--adv-lambda L` (D765, off by default): weight every game move by exp(clip(advantage / scale, +-clip)), where
@@ -569,7 +569,7 @@ fn ckpt_read(path: &str) -> Option<((u32, i32, f64, u32, u32), Vec<Vec<f32>>)> {
 
 pub fn run(args: &[String]) -> ExitCode {
     let Some(net_path) = arg(args, "--net") else {
-        eprintln!("usage: ti policy2 --net NET.tnn --games a.jsonl[,..] [--kata DIR[,DIR]] --pat k3c|k3 [--init POL.bin] --out-bin OUT.bin [--max-epochs 30] [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 1] [--max-samples N]");
+        eprintln!("usage: ti policy2 --net NET.tnn --games a.tgam|a.jsonl[,..] [--kata DIR[,DIR]] --pat k3c [--init POL.bin] --out-bin OUT.bin [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 4] [--max-samples N]");
         return ExitCode::from(2);
     };
     let _ = net_path; // dim 0: the head reads no accumulator (the net only fixes which head the file belongs to)
@@ -579,18 +579,40 @@ pub fn run(args: &[String]) -> ExitCode {
     let use_pat = pat_kind == "k3" || pat_kind == "k3c";
     let k3c = pat_kind == "k3c";
     let (nd_slots, no_slots) = if k3c { (18usize, 9usize) } else { (SLOTS, 49usize) };
-    let max_epochs: usize = arg(args, "--max-epochs").and_then(|v| v.parse().ok()).unwrap_or(30);
+    // LAWS C15 (user D868): no epoch limit of any size; the run stops only by saturation (--patience epochs without a gain)
+    if args.iter().any(|a| a == "--max-epochs") {
+        eprintln!("--max-epochs is forbidden (LAWS C15, user D868: no epoch limit; every run trains to saturation)");
+        return ExitCode::from(2);
+    }
     let lr0: f32 = arg(args, "--lr").and_then(|v| v.parse().ok()).unwrap_or(0.003);
     let pat_lr: f32 = arg(args, "--pat-lr").and_then(|v| v.parse().ok()).unwrap_or(0.01);
     let kata_w: f32 = arg(args, "--kata-w").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let games_w: f32 = arg(args, "--games-w").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let patience: usize = arg(args, "--patience").and_then(|v| v.parse().ok()).unwrap_or(1);
+    // C15 saturation: stop after `patience` consecutive epochs without a val gain (default 4 = "4 more epochs change nothing")
+    let patience: usize = arg(args, "--patience").and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
     let max_samples: usize = arg(args, "--max-samples").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // D528: default 6 of the 8 hardware threads (the PC stays usable); Kata TRAIN files are streamed, never all in RAM
     let threads: usize = arg(args, "--threads").and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
     // D537: --ring adds the jump-ring tables (TPOL4 = TPOL3 + ring [49][2][4][81]); needs --pat k3c
     let use_ring = args.iter().any(|a| a == "--ring");
     let see_arg = arg(args, "--see").unwrap_or_else(|| "none".into());
+    // LAWS A12 (D930): only train a head main can load AND plays as trained: TPOL3 = --pat k3c, no ring, no SEE input
+    // (main 0120fd12 reads TPOL3/TPOL5 only and has no SEE term at all; a SEE / ring / k3 / table-less head is either
+    // refused on load or played with an input it never trained on, D891).
+    let exp = crate::genguard::experiment(args);
+    crate::genguard::announce("policy2", &exp);
+    let out_bin_path = arg(args, "--out-bin").unwrap_or_default();
+    if let Err(e) = crate::genguard::check_inputs("policy2", &exp, files.iter().map(String::as_str))
+        .and_then(|_| crate::genguard::check_output("policy2", &exp, &out_bin_path))
+    {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    if exp.is_none() && (pat_kind != "k3c" || use_ring || see_arg != "none") {
+        eprintln!("policy2: refused (LAWS A12, D930): main plays only TPOL3 heads (--pat k3c, no --ring, --see none; anything else needs --experiment NAME, D931); got --pat {pat_kind}{}{}",
+            if use_ring { " --ring" } else { "" }, if see_arg != "none" { format!(" --see {see_arg}") } else { String::new() });
+        return ExitCode::from(2);
+    }
     let see_mode: u8 = match see_arg.as_str() {
         "none" => 0,
         "2d" => 1,
@@ -623,6 +645,55 @@ pub fn run(args: &[String]) -> ExitCode {
     // games: every played move is a hard label; val = game pair % 10 == 0
     let mut ml = MoveList::new();
     for f in &files {
+        // D930: binary self-play / gate games (.tgam + .tbst, what ti gen and ti gate write). The label is the engine's
+        // BEST move of each position (.tbst), never a novelty move that was only played to explore; the game goes on
+        // with the move that was played. A .tgam without its .tbst is refused. Validation = DAG game id % 10 == 0.
+        if f.ends_with(".tgam") {
+            let tb_path = format!("{}.tbst", f.trim_end_matches(".tgam"));
+            if !std::path::Path::new(&tb_path).exists() {
+                eprintln!("policy2: {f}: no {tb_path}: best-move labels missing, refusing (D925/D930)");
+                return ExitCode::from(2);
+            }
+            let (mut rd, mut tb) = match (crate::gamedata::GameReader::open(f), crate::gamedata::TbstReader::open(f)) {
+                (Ok(r), Ok(t)) => (r, t),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("policy2: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let mut got = 0usize;
+            for (gi, g) in rd.by_ref().enumerate() {
+                let Ok(g) = g else {
+                    eprintln!("policy2: {f}: unreadable game {gi}, refusing");
+                    return ExitCode::from(2);
+                };
+                let Ok((gid, labels)) = tb.next_game(g.plies.len()) else {
+                    eprintln!("policy2: {tb_path}: labels end early at game {gi}, refusing");
+                    return ExitCode::from(2);
+                };
+                let val = gid % 10 == 0;
+                let mut b = g.start();
+                for (pi, ply) in g.plies.iter().enumerate() {
+                    let code = ply.0 & 0x3ff;
+                    if code == titanium::ttcodec::PASS_CODE {
+                        b = b.make_uai(Move::PASS);
+                        continue;
+                    }
+                    let Some(played) = titanium::ttcodec::decode_move(&b, code) else { break };
+                    let best = labels.get(pi).and_then(|&(lc, _)| titanium::ttcodec::decode_move(&b, lc & 0x3ff));
+                    b.legal_moves_dedup_into(&mut ml);
+                    if let Some(bm) = best.filter(|m| !m.is_pass()) {
+                        if ml.len() >= 2 {
+                            ss.push(S { own: b.me(), opp: b.opp(), from: bm.from, to: bm.to, kind: 0, sel: 255, kn: 0, val, ko: 0, aw: 1.0, up: 0 });
+                            got += 1;
+                        }
+                    }
+                    b = b.make(played);
+                }
+            }
+            eprintln!("{f}: {got} positions (label = engine best move from {tb_path})");
+            continue;
+        }
         let Ok(fh) = fs::File::open(f) else {
             eprintln!("{f}: cannot open");
             continue;
@@ -760,16 +831,23 @@ pub fn run(args: &[String]) -> ExitCode {
         let v5 = &d[0..5] == b"TPOL5";
         let v4 = &d[0..5] == b"TPOL4";
         let (v2, v3) = (&d[0..5] == b"TPOL2", &d[0..5] == b"TPOL3" || v4 || v5);
-        let in_see = if v5 { nsee } else { 0 };
-        let n1 = SLOTS + NSCAL + in_see + SLOTS * idim;
         let ntab = if v4 { 27 * P3 + RING_N } else if v3 { 27 * P3 } else if v2 { (SLOTS + 49) * P3 } else { 0 };
-        if !(&d[0..5] == b"TPOL1" || v2 || v3) || d.len() != 12 + 4 * (n1 + ntab) || ((v2 || v3) && v3 != k3c) || (v4 && !use_ring) {
+        // D892: the FILE's SEE block size comes from the file (a TPOL5 init into a --see none run drops it: step-0 parity
+        // with how the engine plays that file since D751, SEE off); a --see run needs the same block size as the file
+        let total = (d.len().saturating_sub(12)) / 4;
+        let file_see = if v5 { total.saturating_sub(SLOTS + NSCAL + SLOTS * idim + ntab) } else { 0 };
+        let n1 = SLOTS + NSCAL + file_see + SLOTS * idim;
+        if !(&d[0..5] == b"TPOL1" || v2 || v3) || d.len() != 12 + 4 * (n1 + ntab) || ((v2 || v3) && v3 != k3c) || (v4 && !use_ring) || (nsee > 0 && file_see != nsee) {
             eprintln!("--init {ip}: bad file or table kind does not match --pat/--see");
             return ExitCode::from(2);
         }
         let f: Vec<f32> = d[12..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         bias.copy_from_slice(&f[..SLOTS]);
+        let in_see = file_see.min(nsee);
         g[..NSCAL + in_see].copy_from_slice(&f[SLOTS..SLOTS + NSCAL + in_see]);
+        if file_see > in_see {
+            println!("init: dropped the file's SEE block ({file_see} floats; this run is --see {see_arg})");
+        }
         if (v2 || v3) && use_pat {
             td.copy_from_slice(&f[n1..n1 + nd_slots * P3]);
             let rest = &f[n1 + nd_slots * P3..];
@@ -930,7 +1008,7 @@ pub fn run(args: &[String]) -> ExitCode {
             _ => println!("--resume: no usable checkpoint, starting fresh"),
         }
     }
-    for ep in ep0..max_epochs {
+    for ep in ep0.. {
         let lr = lr0 * (0.85f32).powi(ep as i32);
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ (ep as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         for i in (1..tr.len()).rev() {
@@ -1115,7 +1193,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         } else {
             bad_epochs += 1;
-            if bad_epochs > patience {
+            if bad_epochs >= patience {
                 println!("early stop: no val improvement for {} epochs (best epoch {})", bad_epochs, best.5);
                 stop = true;
             }

@@ -34,10 +34,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use titanium::board::Move;
+use titanium::search::SearchLimits;
 use titanium::search::MATE;
 use titanium::ttcodec::{dec_score, decode_move, enc_score, move_code, PASS_CODE};
 use titanium::Board;
-use titanium::search::{SearchLimits, Searcher};
 
 use crate::data::{Rec, REC};
 
@@ -468,28 +468,32 @@ pub fn run_append(args: &[String]) -> ExitCode {
 
 /// `ti data games-tdat`: replay a `.tgam` and write trainer rows. This is the
 /// missing link for the data flywheel: gate/self-play games (`.tgam`) could be
-/// packed and analysed but never trained on. Every position is relabelled with
-/// the CURRENT engine at `--nodes` (default 5000), the row outcome is the game
-/// result from the mover's view, and one chain per game is written so
-/// `ti data lambda` works on the result.
+/// packed and analysed but never trained on. Each row's cp is the engine's best-move
+/// score logged while the game was played (D925; no second search, LAWS A12), the row
+/// outcome is the game result from the mover's view, and one chain per game is written
+/// so `ti data lambda` works on the result.
 pub fn run_games_tdat(args: &[String]) -> ExitCode {
     let tgam = crate::flag_str(args, "--tgam").unwrap_or_default();
     let (true, Some(out)) = (!tgam.is_empty() || crate::flag_str(args, "--tgam-roots").is_some(), crate::flag_str(args, "--out")) else {
-        eprintln!("usage: ti data games-tdat (--tgam F.tgam[,G.tgam] | --tgam-roots DIR,DIR) --out STEM [--best-scores] [--min-cand-elo -50] [--nodes 5000] [--limit-games N] [--relabel-src 0] [--net FILE]");
+        eprintln!("usage: ti data games-tdat (--tgam F.tgam[,G.tgam] | --tgam-roots DIR,DIR) --out STEM [--min-cand-elo -50] [--limit-games N] [--relabel-src 0]");
         return ExitCode::FAILURE;
     };
-    let nodes = crate::flag_u64(args, "--nodes").unwrap_or(5000);
+    // LAWS A12 (D927): rows come only from the scores the generating engine logged (best-move score, D925). The old
+    // re-search path (--scores search, --nodes, --net) labelled with a small-TT engine nobody checked: deleted.
+    if let Err(e) = crate::genguard::refuse_weakening_flags("games-tdat", args, &["--scores", "--nodes", "--net"]) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let limit = crate::flag_u64(args, "--limit-games").map(|v| v as usize).unwrap_or(usize::MAX);
     // 200 = in-game eval, no separate relabel ran (see DATASET_GUIDE.md: 0/1/2 are
     // real relabel passes, so reusing one of them would mislabel the provenance).
     let src: u8 = crate::flag_u64(args, "--relabel-src").unwrap_or(200) as u8;
     // Labels come from the game itself by default (both engines evaluated every
     // position while playing); `--scores search` re-labels with a fresh search.
-    let use_game_scores = crate::flag_str(args, "--scores").as_deref() != Some("search");
+    let use_game_scores = true;
     let out_tdat = format!("{}.tdat", out.trim_end_matches(".tdat"));
     let t0 = std::time::Instant::now();
-    // D809: several game files (comma list); `--best-scores` = cp is the score of the ENGINE'S BEST move from the sibling .tbst
-    // (the value of the position), not the score of the move that was played (novelty can play a worse one);
+    // D809: several game files (comma list); cp is always the score of the ENGINE'S BEST move (D925, see below);
     // `--dedup-against X.tdat` / `--dedup` = write each position once (against X.tdat and against what this run wrote);
     // a skipped position ends the chain exactly like a pass does.
     let mut tgams: Vec<String> = tgam.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
@@ -511,8 +515,25 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
         found.sort();
         tgams.extend(found);
     }
+    // D931: rows for the STANDARD dataset never come from experiment games, and an experiment writes only under experiments/
+    let exp = crate::genguard::experiment(args);
+    crate::genguard::announce("games-tdat", &exp);
+    if let Err(e) = crate::genguard::check_inputs("games-tdat", &exp, tgams.iter().map(String::as_str))
+        .and_then(|_| crate::genguard::check_output("games-tdat", &exp, &out))
+    {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let min_cand_elo = crate::flag_str(args, "--min-cand-elo").and_then(|v| v.parse::<f64>().ok());
-    let use_best = args.iter().any(|a| a == "--best-scores");
+    // D925 (user 2026-11-16): the value of a position IS the score of its best move. Every row's cp is the engine's
+    // best-move score, never the score of the move that was played (a novelty move is worse by design). The played
+    // move only decides the next position and the game result (outcome / lambda / WDL follow the played line).
+    // Self-play files therefore REQUIRE their .tbst; gate games play the engine's own best move, so for them the
+    // played score is the best score and a missing .tbst is fine. `--best-scores` was the opt-in; it is now the only
+    // behaviour (the old flag is accepted and does nothing; there is no way to ask for played-move scores).
+    if args.iter().any(|a| a == "--best-scores") {
+        eprintln!("data games-tdat: note: --best-scores is the only behaviour now (D925); the flag is not needed");
+    }
     let against = crate::flag_str(args, "--dedup-against");
     let want_dedup = against.is_some() || args.iter().any(|a| a == "--dedup");
     let work = || -> Result<(u64, u64, u64, Vec<Chain>, u64, u64, u64, u64), String> {
@@ -544,13 +565,6 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
         }
         let (mut dups, mut n_best) = (0u64, 0u64);
         let mut w = BufWriter::with_capacity(1 << 22, File::create(&out_tdat).map_err(|e| format!("{out_tdat}: {e}"))?);
-        let mut se = Searcher::with_tt_bits_unconfigured(18);
-        let nn = match crate::flag_str(args, "--net") {
-            Some(p) => Some(titanium::nnue::Nnue::load(&p).map_err(|e| format!("net {p}: {e}"))?),
-            None => None,
-        };
-        se.set_nnue(nn.as_ref().or_else(|| Some(titanium::nnue::Nnue::bundled_static())));
-        let limits = SearchLimits { time: None, max_nodes: Some(nodes), max_depth: 30 };
         let mut chains: Vec<Chain> = Vec::new();
         let mut row: u64 = 0;
         let mut games_out = 0u64;
@@ -577,7 +591,8 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
             }
         }
         let mut rd = GameReader::open(tpath)?;
-        let mut tb = if use_best { Some(TbstReader::open(tpath)?) } else { None };
+        let tbst_path = format!("{}.tbst", tpath.trim_end_matches(".tgam"));
+        let mut tb = if use_game_scores && std::path::Path::new(&tbst_path).exists() { Some(TbstReader::open(tpath)?) } else { None };
         for (gi, g) in rd.by_ref().enumerate() {
             if gi >= limit {
                 break;
@@ -591,6 +606,11 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
                 Some(t) => t.next_game(g.plies.len())?.1,
                 None => Vec::new(),
             };
+            // D930: EVERY game file needs its .tbst (ti gen, ti gate's import and pack-games all write one). The seat field
+            // cannot tell self-play from gate games (ti gen wrote cand_seat 0 before D930), so there is no exception.
+            if use_game_scores && tb.is_none() {
+                return Err(format!("{tpath}: no {tbst_path}: the best-move labels are missing, refusing (D925/D930; re-pack the source with ti data pack-games)"));
+            }
             if g.forfeit || g.result == 3 {
                 n_unknown += 1; // no trustworthy outcome -> not a training game
                 continue;
@@ -607,13 +627,15 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
                 n_out += 1;
             }
             let mut b = g.start();
-            se.reset_for_new_game();
             for (pi, ply) in g.plies.iter().enumerate() {
                 let code = ply.0 & 0x3ff;
                 // A pass, or a ply without a logged score, gives no row. The run is closed there, so inside
                 // one chain consecutive rows are always exactly one ply apart (`ti data lambda` relies on it).
                 // The game itself goes on: before 2026-11-13 it was cut at its first pass.
-                let no_row = code == PASS_CODE || (use_game_scores && ply.1 == NO_SCORE);
+                // the row needs the best-move label from the .tbst (gate files: best = played, written by the import)
+                let tbst_label = labels.get(pi).filter(|&&(lc, ls)| lc & 0x3ff != 0 && ls != NO_SCORE).map(|&(_, ls)| ls);
+                let best_label: Option<i16> = tbst_label;
+                let no_row = code == PASS_CODE || (use_game_scores && best_label.is_none());
                 if no_row {
                     if row > start_row {
                         chains.push(Chain { start: start_row as u32, len: (row - start_row).min(u16::MAX as u64) as u16, conv: 0 });
@@ -644,17 +666,8 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
                     b = b.make(mv);
                     continue;
                 }
-                let cp: i32 = if use_game_scores {
-                    match labels.get(pi) {
-                        Some(&(lc, ls)) if lc & 0x3ff != 0 && ls != NO_SCORE => {
-                            n_best += 1;
-                            dec_score(ls)
-                        }
-                        _ => dec_score(ply.1),
-                    }
-                } else {
-                    se.search(&b, &limits).score
-                };
+                n_best += 1;
+                let cp: i32 = dec_score(best_label.expect("no_row covers a missing label"));
                 let outcome = if b.turn == 0 { o0 } else { 1.0 - o0 };
                 let rec = crate::data::Rec {
                     occ0: b.occ[0],
@@ -697,7 +710,7 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
     };
     match work() {
         Ok((rows, games, decided, chains, unknown, dups, n_best, _base_rows)) => {
-            if want_dedup || use_best {
+            if want_dedup || use_game_scores {
                 println!("data games-tdat: positions skipped as duplicates {dups}; rows whose cp is the engine's best-move score {n_best} of {rows}");
             }
             let idx = format!("{}.chains", out.trim_end_matches(".tdat"));
@@ -705,11 +718,7 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
                 eprintln!("data games-tdat: chains: {e}");
                 return ExitCode::FAILURE;
             }
-            let labels = if use_game_scores {
-                "cp = the score the playing engine logged for that ply (no second search; plies without a logged score give no row)".to_string()
-            } else {
-                format!("cp = fresh search at {nodes} nodes by the linked engine (--scores search)")
-            };
+            let labels = "cp = the engine's BEST-move score for the position (self-play: from the .tbst; gate games: the played move = the engine's best; no second search; a ply without that label gives no row); the played move only leads to the next row and the outcome (D925)".to_string();
             let desc = format!("{tgam} replayed; {labels}; outcome = game result from the mover's view; a pass or an unscored ply gives no row and ends the chain; {games} games; ti data games-tdat");
             if let Err(e) = crate::data::write_tdat_manifest(out.trim_end_matches(".tdat"), &desc, rows as usize) {
                 eprintln!("data games-tdat: manifest: {e}");
@@ -1170,7 +1179,7 @@ fn walk_games(dir: &std::path::Path, out: &mut Vec<String>) {
         let p = e.path();
         if p.is_dir() {
             walk_games(&p, out);
-        } else if p.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.ends_with(".games.jsonl")) {
+        } else if p.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.ends_with(".games.jsonl") || n.ends_with(".tgam")) {
             out.push(p.to_string_lossy().replace('\\', "/"));
         }
     }
@@ -1183,107 +1192,159 @@ fn game_key(g: &PackedGame) -> u64 {
 }
 
 pub fn run_pack_games(args: &[String]) -> ExitCode {
+    // D926 (user order 2026-11-16 "fix this immediately"): pack-games used to read JSON only, so the binary .tgam/.tbst
+    // that `ti gen` writes (D806) failed with "stream did not contain valid UTF-8" and gave an EMPTY output. Now every
+    // game source is read directly, no conversion step:
+    //   *.tgam (+ sibling .tbst)   binary games from ti gen or a gate; the .tbst best-move labels travel with each game
+    //   *.games.jsonl              old gate logs (JSON); the engine played its own best move, so label = played move
+    // Output: STEM.tgam + STEM.tbst (same layout as ti gen) + STEM.tgam.json. A self-play .tgam without its .tbst is
+    // refused, gate or not (D930: the seat field cannot tell them apart; its novelty moves would lose their values, D925). Binary games are never dropped as duplicates
+    // (D809: repeated games keep their own outcome); identical JSON records (the same gate log read twice) still are.
+    // When a gate run has both <log>.games.jsonl and <log>.tgam among the inputs, only the .tgam is read.
     let Some(stem) = crate::flag_str(args, "--out") else {
-        eprintln!("usage: ti data pack-games --out STEM [--roots DIR,DIR] [--inputs a.games.jsonl,b.games.jsonl]");
+        eprintln!("usage: ti data pack-games --out STEM [--roots DIR,DIR] [--inputs a.tgam,b.games.jsonl,...]");
         return ExitCode::FAILURE;
     };
-    let mut files: Vec<String> = crate::flag_str(args, "--inputs").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+    let stem = stem.trim_end_matches(".tgam").to_string();
+    let mut files: Vec<String> =
+        crate::flag_str(args, "--inputs").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(|s| s.replace('\\', "/")).collect();
     for root in crate::flag_str(args, "--roots").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
         walk_games(std::path::Path::new(root), &mut files);
     }
     files.sort();
     files.dedup();
+    let tgam_set: HashSet<String> = files.iter().filter(|f| f.ends_with(".tgam")).map(|f| f.trim_end_matches(".tgam").to_string()).collect();
+    let mut shadowed = 0u64;
+    files.retain(|f| {
+        let keep = !(f.ends_with(".games.jsonl") && tgam_set.contains(f.trim_end_matches(".games.jsonl")));
+        if !keep {
+            shadowed += 1;
+        }
+        keep
+    });
     if files.is_empty() || files.len() > u16::MAX as usize {
         eprintln!("data pack-games: {} input files (need 1..65535)", files.len());
         return ExitCode::FAILURE;
     }
-    let out_path = format!("{stem}.tgam");
-    let t = std::time::Instant::now();
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut games: Vec<PackedGame> = Vec::new();
-    let (mut dups, mut skipped, mut plies) = (0u64, 0u64, 0u64);
-    let mut reasons: Vec<String> = Vec::new();
-    let mut sources = Vec::new();
-    for (si, path) in files.iter().enumerate() {
-        let text = match fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("data pack-games: {path}: {e} (file skipped)");
-                continue;
-            }
-        };
-        let mut kept = 0u64;
-        for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-            let packed = crate::games::parse_game(line).and_then(|g| pack_game(&g, line, si as u16));
-            match packed {
-                Ok(pg) => {
-                    if seen.insert(game_key(&pg)) {
-                        plies += pg.plies.len() as u64;
-                        games.push(pg);
-                        kept += 1;
-                    } else {
-                        dups += 1;
-                    }
-                }
-                Err(e) => {
-                    skipped += 1;
-                    if reasons.len() < 5 {
-                        reasons.push(format!("{path}:{}: {e}", n + 1));
-                    }
-                }
-            }
-        }
-        // the gate header (engines, clock, book) sits in the first line of the sibling sprt.log
-        let log = path.trim_end_matches(".games.jsonl");
-        let header = File::open(log)
-            .ok()
-            .and_then(|f| {
-                let mut raw = Vec::new();
-                BufReader::new(f).take(8192).read_to_end(&mut raw).ok()?;
-                String::from_utf8_lossy(&raw).lines().next().map(String::from)
-            })
-            .unwrap_or_default();
-        sources.push(serde_json::json!({ "i": si, "path": path, "games": kept, "header": header }));
+    let exp = crate::genguard::experiment(args);
+    crate::genguard::announce("pack-games", &exp);
+    if let Err(e) = crate::genguard::check_inputs("pack-games", &exp, files.iter().map(String::as_str))
+        .and_then(|_| crate::genguard::check_output("pack-games", &exp, &stem))
+    {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
     }
-    let write = || -> std::io::Result<u64> {
-        let mut w = BufWriter::with_capacity(1 << 20, File::create(&out_path)?);
-        w.write_all(TGAM_MAGIC)?;
-        w.write_all(&1u32.to_le_bytes())?;
-        w.write_all(&(games.len() as u64).to_le_bytes())?;
-        w.write_all(&plies.to_le_bytes())?;
-        w.write_all(&(files.len() as u32).to_le_bytes())?;
-        w.write_all(&0u32.to_le_bytes())?;
-        let mut bytes = 32u64;
-        for g in &games {
-            g.write(&mut w)?;
-            bytes += g.byte_len() as u64;
+    let out_path = format!("{stem}.tgam");
+    for p in [&out_path, &format!("{stem}.tbst")] {
+        if std::path::Path::new(p).exists() {
+            eprintln!("data pack-games: {p} already exists; refusing to overwrite (pick a new --out)");
+            return ExitCode::FAILURE;
         }
-        w.flush()?;
-        Ok(bytes)
-    };
-    let bytes = match write() {
-        Ok(b) => b,
+        if files.iter().any(|f| f.trim_end_matches(".tgam") == stem) {
+            eprintln!("data pack-games: --out {stem} is one of the inputs");
+            return ExitCode::FAILURE;
+        }
+    }
+    let t = std::time::Instant::now();
+    let mut out = match crate::gen::BinOut::create(&stem) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("data pack-games: {out_path}: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let mut seen_json: HashSet<u64> = HashSet::new();
+    let mut seen_bin: HashSet<u64> = HashSet::new();
+    let (mut dups_json, mut repeats_bin, mut skipped) = (0u64, 0u64, 0u64);
+    let mut reasons: Vec<String> = Vec::new();
+    let mut sources = Vec::new();
+    let res = (|| -> Result<(), String> {
+        for (si, path) in files.iter().enumerate() {
+            let mut kept = 0u64;
+            if path.ends_with(".tgam") {
+                let mut rd = GameReader::open(path)?;
+                let tbp = format!("{}.tbst", path.trim_end_matches(".tgam"));
+                let mut tb = if std::path::Path::new(&tbp).exists() { Some(TbstReader::open(path)?) } else { None };
+                for g in rd.by_ref() {
+                    let mut g = g.map_err(|e| format!("{path}: {e}"))?;
+                    let (gid, labels) = match tb.as_mut() {
+                        Some(tr) => tr.next_game(g.plies.len()).map_err(|e| format!("{tbp}: {e}"))?,
+                        None => return Err(format!("{path}: no {tbp}: best-move labels missing (D925/D930); refusing")),
+                    };
+                    if !seen_bin.insert(game_key(&g)) {
+                        repeats_bin += 1;
+                    }
+                    g.src = si as u16;
+                    out.append(&g, gid, &labels).map_err(|e| format!("{out_path}: {e}"))?;
+                    kept += 1;
+                }
+                sources.push(serde_json::json!({ "i": si, "path": path, "games": kept, "labels": "tbst" }));
+                continue;
+            }
+            let text = match fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => return Err(format!("{path}: {e}")),
+            };
+            for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+                match crate::games::parse_game(line).and_then(|g| pack_game(&g, line, si as u16)) {
+                    Ok(pg) => {
+                        if seen_json.insert(game_key(&pg)) {
+                            let labels: Vec<(u16, i16)> = pg.plies.iter().map(|p| (p.0 & 0x3ff, p.1)).collect();
+                            out.append(&pg, 0, &labels).map_err(|e| format!("{out_path}: {e}"))?;
+                            kept += 1;
+                        } else {
+                            dups_json += 1;
+                        }
+                    }
+                    Err(e) => {
+                        skipped += 1;
+                        if reasons.len() < 5 {
+                            reasons.push(format!("{path}:{}: {e}", n + 1));
+                        }
+                    }
+                }
+            }
+            // the gate header (engines, clock, book) sits in the first line of the sibling sprt.log
+            let log = path.trim_end_matches(".games.jsonl");
+            let header = File::open(log)
+                .ok()
+                .and_then(|f| {
+                    let mut raw = Vec::new();
+                    BufReader::new(f).take(8192).read_to_end(&mut raw).ok()?;
+                    String::from_utf8_lossy(&raw).lines().next().map(String::from)
+                })
+                .unwrap_or_default();
+            sources.push(serde_json::json!({ "i": si, "path": path, "games": kept, "labels": "played (gate games)", "header": header }));
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        // never leave a half-written pair that looks valid
+        let _ = fs::remove_file(&out_path);
+        let _ = fs::remove_file(format!("{stem}.tbst"));
+        eprintln!("data pack-games: {e} (nothing written)");
+        return ExitCode::FAILURE;
+    }
+    let (games, plies) = (out.games, out.plies);
+    drop(out);
+    let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     let manifest = serde_json::json!({
-        "format": "TGAM1", "games": games.len(), "plies": plies, "bytes": bytes,
-        "duplicates_dropped": dups, "games_skipped": skipped, "sources": sources,
+        "format": "TGAM1+TBST1", "games": games, "plies": plies, "bytes": bytes,
+        "json_duplicates_dropped": dups_json, "binary_repeated_games_kept": repeats_bin,
+        "jsonl_shadowed_by_tgam": shadowed, "games_skipped": skipped, "sources": sources,
     });
     if let Err(e) = fs::write(format!("{out_path}.json"), serde_json::to_string_pretty(&manifest).unwrap_or_default()) {
         eprintln!("data pack-games: manifest: {e}");
         return ExitCode::FAILURE;
     }
     println!(
-        "data pack-games: {} files -> {out_path}: {} games, {plies} plies, {bytes} B ({:.2} B per position) in {:.1}s",
+        "data pack-games: {} files -> {out_path} + {stem}.tbst: {games} games, {plies} plies, {bytes} B in {:.1}s",
         files.len(),
-        games.len(),
-        bytes as f64 / plies.max(1) as f64,
         t.elapsed().as_secs_f64()
     );
-    println!("  exact duplicates dropped: {dups}; games skipped (unparsable or illegal): {skipped}");
+    println!(
+        "  binary repeated games kept (D809): {repeats_bin}; identical JSON records dropped: {dups_json}; JSON logs shadowed by their .tgam: {shadowed}; games skipped (unparsable or illegal): {skipped}"
+    );
     for r in &reasons {
         println!("  skipped: {r}");
     }
