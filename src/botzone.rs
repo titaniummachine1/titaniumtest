@@ -276,6 +276,18 @@ fn parse_debug(dbg: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>
             "depth" => depth = toks.get(i + 1).and_then(|v| v.parse().ok()),
             "nodes" => nodes = toks.get(i + 1).and_then(|v| v.parse().ok()),
             "time" => ms = toks.get(i + 1).and_then(|v| ms_of(v)),
+            // D938 cheetax: "depth 20 seldepth 30nodes 8908800 evaluation -41 eval score 56". `evaluation` is its SEARCH
+            // score from the mover's view (-19952 = proven loss); `eval score` is another number and must not override it.
+            "evaluation" => {
+                if let Some(x) = toks.get(i + 1).and_then(|x| x.parse::<f64>().ok()) {
+                    eval = Some(x);
+                    kind = "ev";
+                }
+            }
+            _ if t.ends_with("nodes") && t.len() > 5 && t[..t.len() - 5].chars().all(|c| c.is_ascii_digit()) => {
+                nodes = toks.get(i + 1).and_then(|v| v.parse().ok());
+            }
+            "score" if kind == "ev" => {}
             "score" => {
                 let (kind_tok, val) = match toks.get(i + 1).copied() {
                     Some(v @ ("cp" | "mate")) => (Some(v), toks.get(i + 2).copied()),
@@ -484,6 +496,9 @@ fn game_jsonl(path: &Path, cand: &str) -> Result<String, String> {
             (Some(h), "h") if h.abs() < 0.9999 => (Some((400.0 * ((1.0 + h) / (1.0 - h)).ln()).round() as i64), None),
             (Some(h), "h") => (Some(if h > 0.0 { 19990 } else { -19990 }), None),
             (Some(x), "cp") => (Some(x.round() as i64), None),
+            // cheetax search score: +-19950.. = proven win / loss (D938)
+            (Some(x), "ev") if x.abs() >= 19000.0 => (Some(if x > 0.0 { 19990 } else { -19990 }), None),
+            (Some(x), "ev") => (Some(x.round() as i64), None),
             _ => (None, None::<i64>),
         };
         let sidec = if key == "0" { "x" } else { "o" };
@@ -656,6 +671,15 @@ mod tests {
         assert_eq!((d, n, t, e, k), (Some(5), Some(1343), Some(209), Some(-38.0), "cp"));
         let (_, _, t, e, k) = parse_debug("nodes=1 depth=7 winrate=0.572 scoring=2.949 time=3.60");
         assert_eq!((t, e, k), (Some(3600), Some(0.572), "wr"));
+    }
+
+    #[test]
+    fn parses_cheetax_debug_search_score_not_eval_score() {
+        // D938: `evaluation` = search score (mover's view); `eval score` must not override it; "30nodes" glued token
+        let (d, n, _, e, k) = parse_debug("depth 20 seldepth 30nodes 8908800 evaluation -41 eval score 56");
+        assert_eq!((d, n, e, k), (Some(20), Some(8908800), Some(-41.0), "ev"));
+        let (_, _, _, e, _) = parse_debug("depth 99 seldepth 44nodes 117567 evaluation 19964 eval score -524");
+        assert_eq!(e, Some(19964.0));
     }
 
     #[test]
