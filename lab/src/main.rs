@@ -6,7 +6,10 @@ mod radius;
 mod hcecmp;
 mod hcefast;
 mod hcetrain;
+mod extval;
 mod hcefit;
+mod zattrain;
+mod pairs;
 mod seescreen;
 mod util;
 use std::process::ExitCode;
@@ -21,6 +24,10 @@ fn main() -> ExitCode {
         Some("hce-fast") => hcefast::run(&args[1..]),
         Some("hce-compare") => hcecmp::run(&args[1..]),
         Some("hce-train") => hcetrain::run(&args[1..]),
+        Some("val-fen") => extval::fen(&args[1..]),
+        Some("val-score") => extval::score(&args[1..]),
+        Some("zataxx-val") => extval::zataxx(&args[1..]),
+        Some("zataxx-train") => zattrain::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
