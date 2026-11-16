@@ -35,6 +35,7 @@ mod spsa;
 mod train;
 mod policy;
 mod policy2;
+mod seescreen;
 mod smallnet;
 mod snarch;
 mod bzupload;
@@ -73,6 +74,7 @@ fn main() -> ExitCode {
         "relabel" => run_relabel_local(&args[1..]),
         "policy" => policy::run_policy(&args[1..]),
         "policy2" => policy2::run(&args[1..]),
+        "see-screen" => seescreen::run(&args[1..]),
         "botzone-upload" => bzupload::run(&args[1..]),
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
