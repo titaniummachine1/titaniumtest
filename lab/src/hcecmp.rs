@@ -32,7 +32,8 @@ pub(crate) fn nbk() -> usize {
 }
 pub(crate) fn bk(e: u64) -> usize {
     let n = nbk();
-    if n == 4 { phase(e) } else { (e.count_ones() as usize * n / 50).min(n - 1) }
+    // 45 = one bucket per legal stone count (D983, user): stones only grow from 4, so a live position has 1..45 empties
+    if n == 4 { phase(e) } else if n == 45 { (e.count_ones() as usize).saturating_sub(1).min(44) } else { (e.count_ones() as usize * n / 50).min(n - 1) }
 }
 const SETS: [&str; 5] = ["gataxx", "funes", "autaxx", "ours", "ours+gataxx"];
 // per-phase block sizes
