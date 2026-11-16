@@ -3,6 +3,7 @@
 //!   lab see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]
 mod deepsee;
 mod radius;
+mod hcecmp;
 mod hcefast;
 mod hcefit;
 mod seescreen;
@@ -17,6 +18,7 @@ fn main() -> ExitCode {
         Some("deep-see") => deepsee::run(&args[1..]),
         Some("radius") => radius::run(&args[1..]),
         Some("hce-fast") => hcefast::run(&args[1..]),
+        Some("hce-compare") => hcecmp::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
