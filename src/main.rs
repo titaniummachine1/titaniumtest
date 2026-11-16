@@ -128,7 +128,7 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let nodes = flag_u64(args, "--nodes").unwrap_or(genguard::STD_NODES);
+    let nodes = flag_u64(args, "--nodes").unwrap_or_else(|| genguard::standard().nodes);
     if exp.is_none() {
         if let Err(e) = genguard::check_nodes("relabel", nodes) {
             eprintln!("{e}");
@@ -161,8 +161,8 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
     let threads = resolve_threads(args);
     let bz_rules = has_flag(args, "--bz");
     let tt_bits = match &exp {
-        Some(_) => flag_u64(args, "--tt-bits").map_or(genguard::PROD_TT_BITS, |v| v as usize),
-        None => genguard::PROD_TT_BITS,
+        Some(_) => flag_u64(args, "--tt-bits").map_or(genguard::standard().tt_bits, |v| v as usize),
+        None => genguard::standard().tt_bits,
     };
     let net_spec = match &exp {
         Some(_) => flag_str(args, "--net").unwrap_or_else(|| "bundled".into()),

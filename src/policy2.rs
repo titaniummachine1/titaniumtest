@@ -608,9 +608,10 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
-    if exp.is_none() && (pat_kind != "k3c" || use_ring || see_arg != "none") {
-        eprintln!("policy2: refused (LAWS A12, D930): main plays only TPOL3 heads (--pat k3c, no --ring, --see none; anything else needs --experiment NAME, D931); got --pat {pat_kind}{}{}",
-            if use_ring { " --ring" } else { "" }, if see_arg != "none" { format!(" --see {see_arg}") } else { String::new() });
+    let st = crate::genguard::standard();
+    if exp.is_none() && (pat_kind != st.policy_pat || use_ring != st.policy_ring || see_arg != st.policy_see) {
+        eprintln!("policy2: refused on the standard path (LAWS A12, D930/D932): the standard head is --pat {} ring {} --see {} ({}); got --pat {pat_kind} ring {use_ring} --see {see_arg}. Try it as --experiment NAME; a winner becomes the standard by changing data/STANDARD.txt on main.",
+            st.policy_pat, st.policy_ring, st.policy_see, st.source);
         return ExitCode::from(2);
     }
     let see_mode: u8 = match see_arg.as_str() {

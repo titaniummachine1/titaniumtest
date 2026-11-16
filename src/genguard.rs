@@ -8,17 +8,64 @@
 //! the node counts, so a stale hub binary, a binary linked against an experiment worktree, or a binary from before a
 //! promotion is refused. There is no flag to skip the check.
 //!
-//! The dataset standard is fixed here as well: production TT size and at least [`STD_NODES`] nodes per move.
+//! The dataset STANDARD is NOT hard-coded (user 2026-11-16: "experiments can become the new better standard"): it is
+//! read from `data/STANDARD.txt` at origin/main, so promoting a better experiment = gate it, then change that file in
+//! the promotion commit. Until main carries the file, the built-in defaults in `standard()` are used (and said so).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use titanium::{Board, SearchLimits, Searcher};
 
-/// nodes per move of the dataset (D787: 5,000-node self-play and labels); fewer is refused, more is allowed
-pub const STD_NODES: u64 = 5000;
-/// transposition table bits of the played engine (`serve --tt-bits 22`, Botzone package)
-pub const PROD_TT_BITS: usize = 22;
+/// The standard every default run uses (D932). Keys of data/STANDARD.txt: `nodes`, `tt_bits`, `policy_pat`,
+/// `policy_ring`, `policy_see` (one `key value` per line, `#` comments).
+#[derive(Clone, Debug)]
+pub struct Standard {
+    /// nodes per move of self-play and labels (minimum on the standard path; more is allowed)
+    pub nodes: u64,
+    /// transposition table bits of the played engine
+    pub tt_bits: usize,
+    /// policy head the engine plays: pattern kind, ring tables, SEE input
+    pub policy_pat: String,
+    pub policy_ring: bool,
+    pub policy_see: String,
+    /// where the values came from
+    pub source: String,
+}
+
+/// Read the standard from origin/main (`data/STANDARD.txt`); built-in defaults (D787 / D930) while main has none.
+pub fn standard() -> Standard {
+    let mut st = Standard {
+        nodes: 5000,
+        tt_bits: 22,
+        policy_pat: "k3c".into(),
+        policy_ring: false,
+        policy_see: "none".into(),
+        source: "built-in defaults: origin/main has no data/STANDARD.txt yet".into(),
+    };
+    let txt = Command::new("git")
+        .args(["show", "origin/main:data/STANDARD.txt"])
+        .current_dir("C:/gitProjects/mainpromo-ataxx")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if let Some(t) = txt {
+        for l in t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("nodes"), Some(v)) => st.nodes = v.parse().unwrap_or(st.nodes),
+                (Some("tt_bits"), Some(v)) => st.tt_bits = v.parse().unwrap_or(st.tt_bits),
+                (Some("policy_pat"), Some(v)) => st.policy_pat = v.into(),
+                (Some("policy_ring"), Some(v)) => st.policy_ring = v == "1" || v == "true",
+                (Some("policy_see"), Some(v)) => st.policy_see = v.into(),
+                _ => {}
+            }
+        }
+        st.source = "origin/main:data/STANDARD.txt".into();
+    }
+    st
+}
 /// depth of the identity searches (fast: well under a second per position)
 const CHECK_DEPTH: u8 = 7;
 /// number of book positions searched for the identity check
@@ -41,7 +88,7 @@ impl EngineId {
             "main_exe_sha": self.main_exe_sha,
             "main_version": self.main_version,
             "identity_check": format!("{} book positions at depth {CHECK_DEPTH}: node counts and best moves equal to the main gate exe ({} nodes)", self.positions, self.nodes),
-            "tt_bits": PROD_TT_BITS,
+            "standard": format!("{:?}", standard()),
         })
     }
 }
@@ -51,8 +98,11 @@ pub fn refuse_weakening_flags(cmd: &str, args: &[String], banned: &[&str]) -> Re
     for b in banned {
         if args.iter().any(|a| a == b || a.starts_with(&format!("{b}="))) {
             return Err(format!(
-                "{cmd}: {b} is refused (LAWS A12, D927): games and labels are made only by the current main engine with its own \
-                 net, policy head and SmallNet, production TT 2^{PROD_TT_BITS} and >= {STD_NODES} nodes per move"
+                "{cmd}: {b} is refused on the standard path (LAWS A12, D927): games and labels are made by the current main \
+                 engine with its own net, policy head and SmallNet at the standard ({}). To try something else run it as \
+                 --experiment NAME (outputs under experiments/); if it wins its gate, make it the standard by changing \
+                 data/STANDARD.txt on main.",
+                standard().source
             ));
         }
     }
@@ -61,8 +111,9 @@ pub fn refuse_weakening_flags(cmd: &str, args: &[String], banned: &[&str]) -> Re
 
 /// Refuse a node budget below the dataset standard.
 pub fn check_nodes(cmd: &str, nodes: u64) -> Result<(), String> {
-    if nodes < STD_NODES {
-        return Err(format!("{cmd}: --nodes {nodes} is below the dataset standard {STD_NODES} (LAWS A12, D927)"));
+    let st = standard();
+    if nodes < st.nodes {
+        return Err(format!("{cmd}: --nodes {nodes} is below the standard {} ({}); use --experiment NAME to try fewer", st.nodes, st.source));
     }
     Ok(())
 }
@@ -88,7 +139,7 @@ pub fn require_main_engine(cmd: &str) -> Result<EngineId, String> {
         .collect::<Result<_, _>>()?;
 
     let mut child = Command::new(&main.exe)
-        .args(["serve", "--tt-bits", &PROD_TT_BITS.to_string()])
+        .args(["serve", "--tt-bits", &standard().tt_bits.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -130,7 +181,7 @@ pub fn require_main_engine(cmd: &str) -> Result<EngineId, String> {
             .find_map(|l| l.split_whitespace().skip_while(|t| *t != "nodes").nth(1).and_then(|n| n.parse::<u64>().ok()));
         let main_best = seen.last().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
 
-        let mut se = Searcher::with_tt_bits(PROD_TT_BITS);
+        let mut se = Searcher::with_tt_bits(standard().tt_bits);
         let r = se.search(b, &SearchLimits { time: None, max_nodes: None, max_depth: CHECK_DEPTH });
         let main_mv = b.parse_uai_move(&main_best);
         let mine_best = r.best.map(|m| format!("{m:?}")).unwrap_or_default();

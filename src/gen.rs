@@ -145,7 +145,7 @@ pub fn run_gen(args: &[String]) -> ExitCode {
         }
     }
     let games = crate::flag_u64(args, "--games").unwrap_or(500) as u32;
-    let nodes = crate::flag_u64(args, "--nodes").unwrap_or(crate::genguard::STD_NODES);
+    let nodes = crate::flag_u64(args, "--nodes").unwrap_or_else(|| crate::genguard::standard().nodes);
     if exp.is_none() {
         if let Err(e) = crate::genguard::check_nodes("gen", nodes) {
             eprintln!("{e}");
@@ -188,8 +188,8 @@ pub fn run_gen(args: &[String]) -> ExitCode {
     let threads = crate::flag_u64(args, "--threads").unwrap_or(default_threads).max(1) as usize;
     let book0 = crate::flag_u64(args, "--book0").unwrap_or(0) as usize;
     let tt_bits = match &exp {
-        Some(_) => crate::flag_u64(args, "--tt-bits").map_or(crate::genguard::PROD_TT_BITS, |v| v as usize),
-        None => crate::genguard::PROD_TT_BITS,
+        Some(_) => crate::flag_u64(args, "--tt-bits").map_or(crate::genguard::standard().tt_bits, |v| v as usize),
+        None => crate::genguard::standard().tt_bits,
     };
     let src = crate::flag_str(args, "--src").unwrap_or_else(|| {
         std::path::Path::new(&out).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| out.clone())
