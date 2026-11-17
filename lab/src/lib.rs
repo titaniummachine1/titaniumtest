@@ -13,3 +13,4 @@ mod deepsee;
 mod radius;
 mod hcefast;
 pub mod hceeval;
+pub mod gxeval;
