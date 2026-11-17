@@ -121,6 +121,42 @@ pub fn run(args: &[String]) -> ExitCode {
         worse += (s > f) as u64;
     }
     println!("fixed split costs MORE than a full refresh on {:.1}% of children", 100.0 * worse as f64 / kids.max(1) as f64);
+    // --net NET.tnn: time split of one full big-net eval on the same children (single thread, distinct boards)
+    if let Some(np) = arg(args, "--net") {
+        let net = titanium::nnue::Nnue::load(&np).expect("load --net");
+        let mut boards = Vec::new();
+        for r in recs.iter().step_by(step).take(n) {
+            let b = board(r);
+            b.legal_moves_dedup_into(&mut ml);
+            for m in ml.iter().take(8) {
+                boards.push(b.make(m));
+            }
+        }
+        let time = |f: &dyn Fn(&Board) -> i64| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let mut s = 0i64;
+                for b in std::hint::black_box(&boards) {
+                    s = s.wrapping_add(f(b));
+                }
+                std::hint::black_box(s);
+                best = best.min(t.elapsed().as_nanos() as f64 / boards.len() as f64);
+            }
+            best
+        };
+        let t_ext = time(&|b| {
+            let (u, nu, t, nt) = titanium::nnfeat::both(b, titanium::nnfeat::ALL_GROUPS);
+            (u[0] as i64) + (t[0] as i64) + (nu + nt) as i64
+        });
+        let t_ft = time(&|b| net.bench_ft(b) as i64);
+        let t_ev = time(&|b| net.eval(b, 0) as i64);
+        let ft = (t_ft - t_ext).max(0.0);
+        let save = |r: f64| ft * (1.0 - r);
+        println!("eval time split ({} distinct child boards, best of 5, 1 thread; box may be busy): feature extraction {t_ext:.0} ns | extraction + FT sum + psqt {t_ft:.0} ns => FT sum ~{ft:.0} ns | full eval {t_ev:.0} ns (FT sum = {:.0}% of the eval)", boards.len(), 100.0 * ft / t_ev);
+        let (rs, ra) = (split as f64 / full as f64, adaptive as f64 / full as f64);
+        println!("estimated saving per eval if the row adds shrink as counted (no copy / bookkeeping overhead): fixed split {:.0} ns ({:.1}% of the eval), adaptive {:.0} ns ({:.1}%)", save(rs), 100.0 * save(rs) / t_ev, save(ra), 100.0 * save(ra) / t_ev);
+    }
     println!("NOT counted: feature extraction (still needed for the changed groups), the per-node accumulator copy, children whose parent has no accumulator (eval-cache hits), memory traffic per row");
     ExitCode::SUCCESS
 }
