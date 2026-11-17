@@ -88,6 +88,42 @@ pub struct ValStats {
 }
 
 /// Evenly spread validation rows (val is source-ordered, so a contiguous slice would be biased).
+/// D1130 (user: "remove any way to disobey me accidentally"): how many `--train` rows a child-sampling trainer uses.
+/// ALL of them by default; `--rows` below that is refused unless `--experiment NAME`, whose output must sit under an
+/// `experiments` folder (and a standard run must not). Also refuses a run whose samples (~45 legal children per row,
+/// kept 1/every) would not fit in 8 GB on the 16 GB box, naming the `--child-every` that fits: rows are never dropped.
+pub fn whole_rows_or_experiment(tool: &str, tr: &Tdat, req: Option<usize>, exp: &Option<String>, out: &str, every: u64, sample_bytes: usize) -> Result<usize, String> {
+    let under = out.replace('\\', "/").split('/').any(|c| c.eq_ignore_ascii_case("experiments"));
+    match (exp, under) {
+        (Some(n), false) => return Err(format!("{tool}: --experiment {n}: --out must be under a folder named 'experiments' (got {out})")),
+        (None, true) => return Err(format!("{tool}: --out {out} is under 'experiments' but this is a standard run; pass --experiment NAME")),
+        _ => {}
+    }
+    let rows = match (req, exp) {
+        (None, _) => tr.rows,
+        (Some(r), None) if r < tr.rows => {
+            return Err(format!(
+                "{tool}: --rows {r} is refused: the standard trains on EVERY row of --train ({} rows, user order D1130); a subset only with --experiment NAME",
+                tr.rows
+            ))
+        }
+        (Some(r), _) => r.min(tr.rows),
+    };
+    let est = rows as f64 * 45.0 / every.max(1) as f64 * sample_bytes as f64;
+    if est > 8e9 {
+        let need = (rows as f64 * 45.0 * sample_bytes as f64 / 8e9).ceil() as u64;
+        return Err(format!(
+            "{tool}: {rows} rows at --child-every {every} need ~{:.1} GB of samples (> 8 GB on the 16 GB box): use --child-every {need} or more (every row stays in; never fewer rows)",
+            est / 1e9
+        ));
+    }
+    match exp {
+        Some(n) => println!("[{tool}] EXPERIMENT {n}: NOT the standard ({rows} of {} rows)", tr.rows),
+        None => println!("[{tool}] STANDARD (D1130): every row of --train = {rows} rows"),
+    }
+    Ok(rows)
+}
+
 pub fn load_val(val: &mut Tdat, rows: usize) -> Result<Vec<Rec>, String> {
     let blocks = (rows / BLOCK).max(1);
     let nblk = val.rows / BLOCK;

@@ -14,7 +14,9 @@
 //!   5. export TSN1 and verify it against the ENGINE's own `SmallNet::parse` + `bound` (max |diff| must be <= 1 cp).
 //!
 //!   ti train smallnet --net nnue_main.tnn --train data/nnue/packed/train_v9 --val data/nnue/packed/val_v9_clean \
-//!       --out sn_new.tsn --init data/nnue/fut_small.tsn [--rows 1200000] [--val-rows 60000] [--child-every 3] \
+//!       --out sn_new.tsn --init data/nnue/fut_small.tsn [--val-rows 60000] [--child-every 24] \
+//!   (D1130: always EVERY row of --train; --rows N below that only with --experiment NAME, output under experiments/;
+//!    the run refuses when the samples would not fit in RAM and names the --child-every that fits)
 //!       [--patience 4] [--tau 0.02] [--lr 0.002] [--threads 7] [--seed 1]
 //!   (D898: trains the pinball bound until --patience epochs bring no val gain; no epoch counts exist, LAWS C15)
 use std::process::ExitCode;
@@ -458,7 +460,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let train_stem = need("--train")?;
     let val_stem = need("--val")?;
     let out = need("--out")?;
-    let rows = num("--rows", 1_200_000.0) as usize;
+    // D1130 (user: "remove any way to disobey me accidentally"): the default is EVERY row of --train; fewer rows only with
+    // --experiment NAME (output under experiments/), so a subset can never be trained by accident
+    let experiment = flag("--experiment");
+    let rows_req = flag("--rows").map(|x| x.parse::<usize>().map_err(|e| format!("--rows {x}: {e}"))).transpose()?;
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
     // LAWS C15 (D868): no epoch limit of any size; every phase stops only by saturation (--patience epochs, default 4)
@@ -474,12 +479,13 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err(format!("{out} exists (refusing to overwrite)"));
     }
 
+    let mut tr = Tdat::open(&train_stem)?;
+    let rows = crate::trainer::whole_rows_or_experiment("smallnet", &tr, rows_req, &experiment, &out, every, std::mem::size_of::<Sample>())?;
     let bytes = std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?;
     let big = TrainableNet::from_tnn_bytes(&bytes)?;
     println!("[smallnet] big net {} (width {}), tau {tau}, {rows} source rows, child 1/{every}", net_path, big.width);
 
     let t0 = Instant::now();
-    let mut tr = Tdat::open(&train_stem)?;
     let mut va = Tdat::open(&val_stem)?;
     let tr_rows = load_val(&mut tr, rows)?;
     let va_rows = load_val(&mut va, val_rows)?;

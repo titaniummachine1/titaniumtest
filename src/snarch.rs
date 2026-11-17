@@ -1172,7 +1172,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // D847: "w2+pol" = the arch plus the policy input
     let archs: Vec<(Arch, Ext)> = flag("--arch").unwrap_or_else(|| "sq,w2,w2sq,delta".into()).split(',').map(|s| { let s = s.trim(); let (a, e) = Ext::parse(s)?; Arch::parse(&a).map(|x| (x, e)).ok_or(format!("unknown arch {s}")) }).collect::<Result<_, _>>()?;
     let nb = num("--buckets", 8.0) as usize;
-    let rows = num("--rows", 1_200_000.0) as usize;
+    // D1130: EVERY row of --train by default; fewer only with --experiment NAME (--save-dir under experiments/)
+    let experiment = flag("--experiment");
+    let rows_req = flag("--rows").map(|x| x.parse::<usize>().map_err(|e| format!("--rows {x}: {e}"))).transpose()?;
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
     let e_mse = num("--epochs-mse", 4.0) as usize;
@@ -1209,6 +1211,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let big = TrainableNet::from_tnn_bytes(&bytes)?;
     let t0 = Instant::now();
     let mut tr = Tdat::open(&train_stem)?;
+    let rows = crate::trainer::whole_rows_or_experiment("snarch", &tr, rows_req, &experiment, &save_dir.clone().unwrap_or_default(), every, std::mem::size_of::<Sample>())?;
     let mut va = Tdat::open(&val_stem)?;
     let trows = load_val(&mut tr, rows)?;
     let train = build_samples(&trows, &big, every, threads, data_seed);
