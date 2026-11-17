@@ -55,6 +55,11 @@ fn zidx(us: u64, them: u64, out: &mut [usize; 36]) {
     }
 }
 
+/// D1137: the Zataxx 2x2 window indices for jat3's step-0 parity check
+pub(crate) fn zidx_pub(us: u64, them: u64, out: &mut [usize; 36]) {
+    zidx(us, them, out)
+}
+
 /// forward; fills h (pre-activation) and returns out (= cp / 400)
 fn fwd(w: &[f32], ix: &[usize; 36], h: &mut [f32; H]) -> f32 {
     h.copy_from_slice(&w[FB..FB + H]);

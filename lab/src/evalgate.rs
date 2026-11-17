@@ -27,14 +27,22 @@ const MAX_PLIES: u32 = 400;
 pub enum Ev {
     Net(Nnue),
     Res(Box<crate::hcetrain::Residual>),
+    /// D1137: 3x3 tuple network (lab jat3-train `*_jat3.json`)
+    Jat(Box<crate::jat3::Jat3Net>),
 }
 
 impl Ev {
     fn load(p: &str) -> Ev {
-        if p.ends_with(".json") { Ev::Res(Box::new(crate::hcetrain::Residual::load(p))) } else { Ev::Net(Nnue::load(p).expect("load net")) }
+        if p.ends_with("_jat3.json") {
+            Ev::Jat(Box::new(crate::jat3::Jat3Net::load(p)))
+        } else if p.ends_with(".json") {
+            Ev::Res(Box::new(crate::hcetrain::Residual::load(p)))
+        } else {
+            Ev::Net(Nnue::load(p).expect("load net"))
+        }
     }
     fn eval(&self, b: &Board) -> i32 {
-        match self { Ev::Net(n) => n.eval(b, 0), Ev::Res(r) => r.eval(b) }
+        match self { Ev::Net(n) => n.eval(b, 0), Ev::Res(r) => r.eval(b), Ev::Jat(j) => j.eval(b) }
     }
 }
 
