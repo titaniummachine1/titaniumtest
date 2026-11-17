@@ -46,6 +46,7 @@ pub(crate) fn block(set: usize) -> usize {
     match set {
         0 => G_N,
         5 => 1, // D1053: bias only (calibration baseline for hce-train --on-nnue)
+        6..=8 => O_N, // D1057: parts of "ours" (6 = scalar terms, 7 = dynamic PST, 8 = soft weaknesses), same layout
         1 => F_N,
         2 => A_N,
         3 => O_N,
@@ -182,6 +183,13 @@ pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mu
             }
         }
         5 => push(out, base, 1.0),
+        6..=8 => {
+            // D1057 split of "ours": index ranges inside the block (0 = bias kept in all three)
+            let (lo, hi) = match set { 6 => (0, 7), 7 => (7, 187), _ => (187, O_N) };
+            let mut t = Vec::new();
+            ours(b, ring, base, &mut t);
+            out.extend(t.into_iter().filter(|&(i, _)| { let r = i as usize - base; r == 0 || (lo..hi).contains(&r) }));
+        }
         _ => ours(b, ring, base, out),
     }
 }

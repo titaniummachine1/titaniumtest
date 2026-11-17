@@ -171,3 +171,45 @@ pub fn incr_stats(args: &[String]) -> ExitCode {
     );
     ExitCode::SUCCESS
 }
+
+/// `lab weak-cost --val V.tdat [--n 20000]` (D1062, user: "can the weaknesses be made cheaper to derive?"): cost of the
+/// per-square weakness information as BITBOARD planes (4 bit-planes = a 0..15 count per square, for every square at once:
+/// box2 reach + victim planes, the inputs of the dynamic PST and the soft weaknesses) vs the per-stone table extraction.
+pub fn weak_cost(args: &[String]) -> ExitCode {
+    use crate::hcefit::box2;
+    use crate::util::victim_planes;
+    let val = arg(args, "--val").expect("--val V.tdat");
+    let n: usize = arg(args, "--n").map_or(20000, |v| v.parse().unwrap());
+    let rows = crate::hcetrain::read_rows(&val, 600_000);
+    let step = (rows.len() / n).max(1);
+    let boards: Vec<Board> = rows.iter().step_by(step).take(n).map(board).collect();
+    let reps = 20;
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for _ in 0..reps {
+        for b in std::hint::black_box(&boards) {
+            let (me, op, e) = (b.me(), b.opp(), b.empty());
+            let (bm, bo) = (box2(me), box2(op));
+            let (lo, lm) = (bo & e, bm & e);
+            let near_e = box2(e);
+            let p = [victim_planes(lo), victim_planes(lm), victim_planes(op & near_e), victim_planes(me & near_e)];
+            for q in std::hint::black_box(&p) {
+                acc = acc.wrapping_add(q[0].count_ones() as u64 + q[1].count_ones() as u64 * 2 + q[2].count_ones() as u64 * 4 + q[3].count_ones() as u64 * 8);
+            }
+        }
+    }
+    let planes = t.elapsed().as_nanos() as f64 / (reps * boards.len()) as f64;
+    let ring = crate::util::ring1();
+    let m = crate::hcecmp::masks();
+    let mut out = Vec::new();
+    let t = Instant::now();
+    for _ in 0..reps {
+        for b in &boards {
+            crate::hcecmp::feats(7, b, &ring, &m, &mut out);
+            acc ^= out.len() as u64;
+        }
+    }
+    let table = t.elapsed().as_nanos() as f64 / (reps * boards.len()) as f64;
+    println!("weak-cost: {} positions: weakness bit-planes for ALL squares (4 planes x 4 inputs) {planes:.1} ns; per-stone dynamic-PST feature extraction (lab code, allocating) {table:.1} ns (checksum {acc})", boards.len());
+    ExitCode::SUCCESS
+}
