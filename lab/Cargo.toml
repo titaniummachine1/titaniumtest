@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Research lab binary (studies of the champion eval: hce-fit, see-screen). Kept OUT of the hub so an edit recompiles one small crate, not the whole hub (D957)."
 
+[lib]
+name = "titanium_lab"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lab"
 path = "src/main.rs"
