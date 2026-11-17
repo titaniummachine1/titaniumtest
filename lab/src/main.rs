@@ -14,6 +14,8 @@ mod seescreen;
 mod util;
 mod hceeval;
 mod gxeval;
+mod nodecost;
+mod boundcmp;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -31,6 +33,8 @@ fn main() -> ExitCode {
         Some("zataxx-val") => extval::zataxx(&args[1..]),
         Some("zataxx-train") => zattrain::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
+        Some("node-cost") => nodecost::run(&args[1..]),
+        Some("bound-cmp") => boundcmp::run(&args[1..]),
         Some("hce-ablate") => hceeval::ablate(&args[1..]),
         Some("gx-eval") => gxeval::cli(&args[1..]),
         _ => {
