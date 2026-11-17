@@ -17,6 +17,8 @@ mod gxeval;
 mod nodecost;
 mod boundcmp;
 mod evalgate;
+mod groupdiff;
+mod spairs;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         Some("hce-ablate") => hceeval::ablate(&args[1..]),
         Some("gx-eval") => gxeval::cli(&args[1..]),
         Some("eval-gate") => evalgate::run(&args[1..]),
+        Some("group-diff") => groupdiff::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)

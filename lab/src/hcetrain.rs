@@ -13,6 +13,9 @@
 use crate::hcecmp::{block, feats, masks, nbk, set_nbk};
 use crate::hcefit::{phase, Ridge, CLAMP};
 use crate::pairs::Pairs;
+use crate::spairs::SPairs;
+/// D1072: --spairs BANDS = stone pairs by distance band, appended after the pair / mobility block (offset stored here)
+static SP: std::sync::OnceLock<(SPairs, u32)> = std::sync::OnceLock::new();
 use crate::zattrain::{d4maps, sym};
 use crate::util::{arg, ring1, Rec, REC};
 use std::fs::File;
@@ -54,6 +57,9 @@ fn fx(set: usize, pr: Option<&Pairs>, off: u32, b: &Board, ring: &[u64; 49], m: 
     out.extend(tmp.iter().map(|&(i, v)| (i as u32, v)));
     if let Some(p) = pr {
         p.feats(b.me(), b.opp(), off, out);
+    }
+    if let Some((sp, o)) = SP.get() {
+        sp.feats(b.me(), b.opp(), *o, out);
     }
 }
 
@@ -114,7 +120,17 @@ pub fn run(args: &[String]) -> ExitCode {
     // D1053: --nnue-scale 1 (with --on-nnue) adds one weight per bucket on the champion cp / 400 (a learned scale), so the
     // calibration baseline (set 5 = bias + scale) can be separated from real information in the other groups
     let nn_scale = on_nnue0 && g("--nnue-scale", 0.0) as usize == 1;
-    let sc_off = (d_base + pr.map_or(0, |p| p.dims())) as u32;
+    let sp_off = d_base + pr.map_or(0, |p| p.dims());
+    let sp_dims = match arg(args, "--spairs") {
+        Some(bands) => {
+            let s = SPairs::new(&bands);
+            let n = s.dims();
+            let _ = SP.set((s, sp_off as u32));
+            n
+        }
+        None => 0,
+    };
+    let sc_off = (sp_off + sp_dims) as u32;
     let d = sc_off as usize + if nn_scale { nbk() } else { 0 };
     let off = d_base as u32;
     // lr multiplier for the pair / mobility block (Adam step size in cp)
@@ -158,6 +174,9 @@ pub fn run(args: &[String]) -> ExitCode {
     } else {
         (read_rows(&data, max_rows), read_rows(&valp, 600_000))
     };
+    if let Some((s, o)) = SP.get() {
+        say(format!("hce-train: stone pairs by distance (D1072), bands {} = {} D4-tied classes at offset {o}", s.bands, s.nclass), &mut log);
+    }
     say(format!("hce-train: set {set}, {} buckets ({d_base} HCE weights + {} pair/mobility weights{}, plr {plr}), {} train rows, {} val rows, {threads} threads, bs {bs} ({:.0}s)", nbk(), d - d_base, pr.map_or(String::new(), |p| format!(" = {} pair classes + {}", p.nclass, crate::pairs::MOB)), train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
 
     // feature cost per eval, single thread (speed only, not the engine's incremental cost)
@@ -429,11 +448,12 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
     let js = format!(
-        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
         nbk(),
         pr.is_some(),
         pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),
         pr.is_none_or(|p| p.mob),
+        SP.get().map_or(String::new(), |s| s.0.bands.clone()),
         best.2,
         best.0,
         best.1
