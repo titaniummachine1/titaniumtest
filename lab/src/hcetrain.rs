@@ -114,6 +114,13 @@ pub fn run(args: &[String]) -> ExitCode {
     let off = d_base as u32;
     // lr multiplier for the pair / mobility block (Adam step size in cp)
     let plr = g("--plr", 1.0) as f32;
+    // D1034 (user: HCE features into the NNUE): --on-nnue 1 = the frozen champion NNUE cp is a fixed base and the HCE
+    // features learn only a linear correction on top (lower bound of a joint hybrid). Init = zero correction = exactly
+    // the champion (step-0 parity, C14). Not a standalone HCE: the weights JSON says "on_nnue":true.
+    let on_nnue = g("--on-nnue", 0.0) as usize == 1;
+    // --val-target 1: train on the validation target (0.75 sigmoid + 0.25 outcome everywhere) instead of the NNUE recipe
+    // (0.55 outcome at <= 12 empties): an information test then measures only what the features add, not the target gap.
+    let val_tgt = g("--val-target", 0.0) as usize == 1;
     let ring = ring1();
     let m = masks();
     let net = Nnue::bundled();
@@ -126,8 +133,18 @@ pub fn run(args: &[String]) -> ExitCode {
         let _ = std::fs::write(format!("{out}.log"), log.as_bytes());
     };
 
-    let train = read_rows(&data, max_rows);
-    let val = read_rows(&valp, 600_000);
+    let (train, val) = if g("--val-split", 0.0) as usize == 1 {
+        // D1034 held-out information test: the champion NNUE was trained on train_v10, so its errors there are not its
+        // errors on new positions; fit on the even rows of the val file, score on the odd rows (--data is ignored).
+        let all = read_rows(&valp, 600_000);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for (i, r) in all.into_iter().enumerate() {
+            if i % 2 == 0 { a.push(r) } else { b.push(r) }
+        }
+        (a, b)
+    } else {
+        (read_rows(&data, max_rows), read_rows(&valp, 600_000))
+    };
     say(format!("hce-train: set {set}, {} buckets ({d_base} HCE weights + {} pair/mobility weights{}, plr {plr}), {} train rows, {} val rows, {threads} threads, bs {bs} ({:.0}s)", nbk(), d - d_base, pr.map_or(String::new(), |p| format!(" = {} pair classes + {}", p.nclass, crate::pairs::MOB)), train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
 
     // feature cost per eval, single thread (speed only, not the engine's incremental cost)
@@ -170,6 +187,9 @@ pub fn run(args: &[String]) -> ExitCode {
             w.resize(d, 0.0); // graft: trained HCE + zero residual = step-0 parity (C14)
         }
         assert_eq!(w.len(), d, "{p}: {} weights, this model needs {d}", w.len());
+        init_w = w.clone();
+    } else if on_nnue {
+        w = vec![0f32; d];
         init_w = w.clone();
     } else {
         let mut ridge = Ridge::new(d_base);
@@ -220,12 +240,14 @@ pub fn run(args: &[String]) -> ExitCode {
         (parts.iter().map(|p| p.0).sum::<f64>() / ws, parts.iter().map(|p| p.1).sum::<f64>() / ws)
     };
     let (nn_l, nn_q) = vloss(&|b: &Board| net.eval(b, 0) as f32);
+    let netr = &net;
     let hce = |w: &[f32]| {
         let w = w.to_vec();
         move |b: &Board| {
             let (mut t, mut x) = (Vec::new(), Vec::new());
             fx(set, pr, off, b, &ring1(), &masks(), &mut t, &mut x);
-            x.iter().map(|&(i, v)| w[i as usize] * v).sum::<f32>()
+            let base = if on_nnue { netr.eval(b, 0) as f32 } else { 0.0 };
+            base + x.iter().map(|&(i, v)| w[i as usize] * v).sum::<f32>()
         }
     };
     let (i_l, i_q) = vloss(&hce(&w));
@@ -300,9 +322,12 @@ pub fn run(args: &[String]) -> ExitCode {
                                 let b0 = board(r);
                                 let bsym = Board::from_occ(sym(b0.me(), sm), sym(b0.opp(), sm), 0, 0);
                                 fx(set, pr, off, &bsym, &ring, &m, &mut t, &mut x);
-                                let y = x.iter().map(|&(i, v)| wr[i as usize] * v).sum::<f32>() / 400.0;
+                                // base on the UNROTATED board: the champion NNUE is not D4-invariant (smoke 2026-11-17:
+                                // max 858 cp, mean 40 cp across symmetries) and val scores it unrotated; the HCE part is D4-tied.
+                                let base = if on_nnue { netr.eval(&b0, 0) as f32 } else { 0.0 };
+                                let y = (base + x.iter().map(|&(i, v)| wr[i as usize] * v).sum::<f32>()) / 400.0;
                                 let p = sig(y);
-                                let t = target(r, true);
+                                let t = target(r, !val_tgt);
                                 let diff = p - t;
                                 let ad = diff.abs();
                                 l += (wt * ad.powf(2.5)) as f64;
@@ -367,7 +392,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 let c = b.make(mv);
                 let yn = -(net.eval(&c, 0) as f32);
                 fx(set, pr, off, &c, &ring, &m, &mut t, &mut x);
-                let yh = -x.iter().map(|&(i, v)| wv[i as usize] * v).sum::<f32>();
+                let yh = if on_nnue { yn } else { 0.0 } - x.iter().map(|&(i, v)| wv[i as usize] * v).sum::<f32>();
                 if yn > bn.0 {
                     bn = (yn, i);
                 }
@@ -382,7 +407,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
     let js = format!(
-        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
         nbk(),
         pr.is_some(),
         pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),

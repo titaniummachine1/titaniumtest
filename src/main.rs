@@ -77,6 +77,23 @@ fn main() -> ExitCode {
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
         "gen" => gen::run_gen(&args[1..]),
+        "gen-fingerprint" => match flag_str(&args[1..], "--out") {
+            // D1041: record main's behaviour (after the full identity check) for ti gen --main-fingerprint on a box
+            Some(p) => match genguard::write_fingerprint(&p) {
+                Ok(()) => {
+                    println!("gen-fingerprint: wrote {p}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("usage: ti gen-fingerprint --out FILE");
+                ExitCode::FAILURE
+            }
+        },
         "dag" => dag::run_dag(&args[1..]),
         "insight" => games::run_insight(&args[1..]),
         "bookprune" => games::run_bookprune(&args[1..]),

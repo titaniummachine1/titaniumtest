@@ -418,16 +418,28 @@ impl SeqConn {
 
     /// Moves (codes) recorded from the sequence with hash `parent`, with the number of games that played each.
     pub fn children(&self, parent: u64) -> Result<Vec<(u16, i64)>, String> {
-        block_on(async {
-            let mut st = self.conn.prepare_cached("SELECT mv, n FROM seq_lines WHERE parent=?1").await?;
-            let mut rows = st.query(vec![Value::Integer(parent as i64)]).await?;
-            let mut out = Vec::new();
-            while let Some(r) = rows.next().await? {
-                out.push((r.get::<i64>(0)? as u16, r.get::<i64>(1)?));
+        // D1041: a read can hit "database is locked" while another thread commits a game (killed pc_run9 batch 2 and
+        // pc_run11 batch 3, which stopped the whole overnight loop): retry with back-off instead of failing the run.
+        let mut tries = 0u32;
+        loop {
+            let r = block_on(async {
+                let mut st = self.conn.prepare_cached("SELECT mv, n FROM seq_lines WHERE parent=?1").await?;
+                let mut rows = st.query(vec![Value::Integer(parent as i64)]).await?;
+                let mut out = Vec::new();
+                while let Some(r) = rows.next().await? {
+                    out.push((r.get::<i64>(0)? as u16, r.get::<i64>(1)?));
+                }
+                Ok::<Vec<(u16, i64)>, Error>(out)
+            });
+            match r {
+                Ok(v) => return Ok(v),
+                Err(e) if tries < 200 && (e.to_string().contains("locked") || e.to_string().contains("busy")) => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20 + 10 * tries.min(50) as u64));
+                }
+                Err(e) => return Err(format!("seq dag children: {e} (after {tries} retries)")),
             }
-            Ok::<Vec<(u16, i64)>, Error>(out)
-        })
-        .map_err(|e| format!("seq dag children: {e}"))
+        }
     }
 
     /// Store one finished game: the game row, its place in the sequence tree and the W/D/L of every move on it, in ONE
@@ -557,6 +569,7 @@ pub fn run_dag(args: &[String]) -> ExitCode {
         "seq-verify" => run_seq_verify(&db, rest),
         "tbst-check" => run_tbst_check(&db, rest),
         "gate-import" => run_gate_import(&db, rest),
+        "seq-add" => run_seq_add(&db, rest),
         "seq-import" | "jsonl-to-bin" => Err(format!("`ti dag {sub}` is deleted (LAWS A12, D927): old JSON game files were converted once (D807, data/gen/bin/all_runs_D806); new games are binary from ti gen / ti gate")),
         _ => Err(format!("unknown subcommand `{sub}` (init | stat | verify | add | bench | probe | seq-stat | seq-verify | tbst-check | gate-import)")),
     };
@@ -950,6 +963,52 @@ pub fn import_gate_logs_ex(db: &str, roots: &[String], redo: bool) -> Result<(u6
         nnew += new_here;
     }
     Ok((nf, ng, nnew))
+}
+
+/// `ti dag seq-add --db SEQ.db --games BOX.tgam --out STEM [--src NAME]` (D1041): games made by `ti gen` on ANOTHER machine
+/// (a Docker box with its own copy of the sequence DAG) join this DAG. The input pair BOX.tgam + BOX.tbst is only read;
+/// every game whose sequence is new here is written to STEM.tgam + STEM.tbst with THIS DAG's game id (the box's ids mean
+/// nothing here) and the box's labels unchanged; a sequence already in this DAG only raises its counts and is not
+/// written again (same rule as ti gen). Refuses an existing STEM.
+fn run_seq_add(db: &str, args: &[String]) -> Result<(), String> {
+    let usage = "usage: ti dag seq-add --db SEQ.db --games BOX.tgam --out STEM [--src NAME]";
+    let path = crate::flag_str(args, "--games").ok_or(usage)?;
+    let out = crate::flag_str(args, "--out").ok_or(usage)?;
+    let stem = out.trim_end_matches(".tgam").to_string();
+    for ext in ["tgam", "tbst"] {
+        if std::path::Path::new(&format!("{stem}.{ext}")).exists() {
+            return Err(format!("{stem}.{ext} already exists; refusing to overwrite"));
+        }
+    }
+    let src = crate::flag_str(args, "--src").unwrap_or_else(|| {
+        std::path::Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone())
+    });
+    let mut rd = crate::gamedata::GameReader::open(&path)?;
+    let mut tb = crate::gamedata::TbstReader::open(&path)?;
+    let c = SeqDag::open(db)?.connect()?;
+    let mut bin = crate::gen::BinOut::create(&stem).map_err(|e| format!("{stem}.tgam: {e}"))?;
+    let t0 = Instant::now();
+    let (mut n, mut new, mut dup, mut unk) = (0u64, 0u64, 0u64, 0u64);
+    while let Some(g) = rd.next() {
+        let g = g?;
+        let (_, labels) = tb.next_game(g.plies.len())?;
+        n += 1;
+        if g.result > 2 {
+            unk += 1;
+            continue;
+        }
+        let (views, _) = g.replay().map_err(|e| format!("{path} game {}: {e}", n - 1))?;
+        let moves: Vec<Move> = views.iter().map(|v| v.mv).collect();
+        match c.record(&src, n as i64 - 1, g.start(), &moves, g.result, true)? {
+            Some((gid, _)) => {
+                bin.append(&g, gid as u32, &labels).map_err(|e| format!("{stem}.tgam: {e}"))?;
+                new += 1;
+            }
+            None => dup += 1,
+        }
+    }
+    println!("seq-add: {path}: {n} games, {new} new sequences -> {stem}.tgam/.tbst, {dup} already in the DAG (counts raised), {unk} unknown results ({:.0}s)", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn run_gate_import(db: &str, args: &[String]) -> Result<(), String> {

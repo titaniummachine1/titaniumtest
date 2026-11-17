@@ -118,14 +118,8 @@ pub fn check_nodes(cmd: &str, nodes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The behavioural identity check described in the module comment.
-pub fn require_main_engine(cmd: &str) -> Result<EngineId, String> {
-    // always compare against the LATEST main on GitHub (offline: the local origin/main, with a warning)
-    let f = Command::new("git").args(["fetch", "-q", "origin"]).current_dir("C:/gitProjects/mainpromo-ataxx").status();
-    if !f.map(|s| s.success()).unwrap_or(false) {
-        eprintln!("{cmd}: warning: git fetch origin failed; checking against the local origin/main");
-    }
-    let main = crate::gate::ensure_main_champion().map_err(|e| format!("{cmd}: cannot resolve the main engine: {e}"))?;
+/// The fixed positions of the identity check (evenly spaced lines of the default gate book).
+fn check_boards(cmd: &str) -> Result<Vec<Board>, String> {
     let root = crate::gate::engine_root()?;
     let book_path = crate::gate::default_book(&root);
     let text = std::fs::read_to_string(&book_path).map_err(|e| format!("{cmd}: book {}: {e}", book_path.display()))?;
@@ -134,9 +128,75 @@ pub fn require_main_engine(cmd: &str) -> Result<EngineId, String> {
         return Err(format!("{cmd}: book {} too small for the identity check", book_path.display()));
     }
     let step = lines.len() / CHECK_POSITIONS;
-    let boards: Vec<Board> = (0..CHECK_POSITIONS)
+    (0..CHECK_POSITIONS)
         .map(|i| Board::from_str(lines[i * step]).ok_or_else(|| format!("{cmd}: bad book line {}", i * step)))
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
+
+/// D1041 (user 2026-11-17: game generation on Docker boxes). A Linux box has no main checkout and no gate exe, so the
+/// full check cannot run there. `ti gen-fingerprint --out F` runs the FULL check on the PC (this binary vs the main gate
+/// exe) and only then records what this binary does on the check positions (node count + best move each) plus the
+/// standard it used; `ti gen --main-fingerprint F` on the box re-searches those positions with ITS linked engine and
+/// refuses unless every node count and best move is identical. Same behavioural proof, the main exe replaced by its
+/// recorded behaviour.
+pub fn write_fingerprint(path: &str) -> Result<(), String> {
+    let id = require_main_engine("gen-fingerprint")?;
+    let st = standard();
+    let mut txt = format!(
+        "# ti gen fingerprint (D1041): behaviour of main on the identity positions, recorded after the full check passed\nmain_commit {}\nmain_exe_sha {}\nmain_version {}\nnodes {}\ntt_bits {}\ndepth {CHECK_DEPTH}\n",
+        id.main_commit, id.main_exe_sha, id.main_version.replace(char::is_whitespace, "_"), st.nodes, st.tt_bits
+    );
+    for b in check_boards("gen-fingerprint")? {
+        let mut se = Searcher::with_tt_bits(st.tt_bits);
+        let r = se.search(&b, &SearchLimits { time: None, max_nodes: None, max_depth: CHECK_DEPTH });
+        txt.push_str(&format!("pos {} | {} | {}\n", b.to_ataxx_fen(), r.nodes, r.best.map(|m| format!("{m:?}")).unwrap_or_default()));
+    }
+    std::fs::write(path, txt).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The box side of D1041: this binary must reproduce the fingerprint exactly; the standard comes from the file and must
+/// equal this binary's own standard (built-in defaults on a box without a main checkout).
+pub fn check_fingerprint(cmd: &str, path: &str) -> Result<EngineId, String> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("{cmd}: fingerprint {path}: {e}"))?;
+    let key = |k: &str| txt.lines().find_map(|l| l.strip_prefix(&format!("{k} ")).map(str::trim).map(String::from));
+    let need = |k: &str| key(k).ok_or_else(|| format!("{cmd}: fingerprint {path}: no '{k}' line"));
+    let (fnodes, ftt): (u64, usize) = (need("nodes")?.parse().map_err(|_| "fingerprint nodes")?, need("tt_bits")?.parse().map_err(|_| "fingerprint tt_bits")?);
+    let st = standard();
+    if fnodes != st.nodes || ftt != st.tt_bits {
+        return Err(format!("{cmd}: REFUSED: fingerprint standard (nodes {fnodes}, tt_bits {ftt}) differs from this binary's ({}, {}; {})", st.nodes, st.tt_bits, st.source));
+    }
+    let (mut n, mut total) = (0usize, 0u64);
+    for l in txt.lines().filter_map(|l| l.strip_prefix("pos ")) {
+        let f: Vec<&str> = l.split(" | ").collect();
+        let (Some(fen), Some(nodes), Some(best)) = (f.first(), f.get(1), f.get(2)) else { return Err(format!("{cmd}: fingerprint {path}: bad pos line")) };
+        let b = Board::from_ataxx_fen(fen).ok_or_else(|| format!("{cmd}: fingerprint {path}: bad FEN {fen}"))?;
+        let mut se = Searcher::with_tt_bits(ftt);
+        let r = se.search(&b, &SearchLimits { time: None, max_nodes: None, max_depth: CHECK_DEPTH });
+        let mine = r.best.map(|m| format!("{m:?}")).unwrap_or_default();
+        if nodes.trim().parse::<u64>().ok() != Some(r.nodes) || best.trim() != mine {
+            return Err(format!(
+                "{cmd}: REFUSED (LAWS A12, D1041): this binary is NOT the main of the fingerprint {} (position {n}: main {nodes} nodes / best {best}, this binary {} nodes / best {mine})",
+                need("main_commit")?, r.nodes
+            ));
+        }
+        n += 1;
+        total += r.nodes;
+    }
+    if n < CHECK_POSITIONS {
+        return Err(format!("{cmd}: fingerprint {path}: only {n} positions"));
+    }
+    Ok(EngineId { main_commit: need("main_commit")?, main_exe_sha: need("main_exe_sha")?, main_version: format!("{} (via fingerprint {path}, D1041)", need("main_version")?), positions: n, nodes: total })
+}
+
+/// The behavioural identity check described in the module comment.
+pub fn require_main_engine(cmd: &str) -> Result<EngineId, String> {
+    // always compare against the LATEST main on GitHub (offline: the local origin/main, with a warning)
+    let f = Command::new("git").args(["fetch", "-q", "origin"]).current_dir("C:/gitProjects/mainpromo-ataxx").status();
+    if !f.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("{cmd}: warning: git fetch origin failed; checking against the local origin/main");
+    }
+    let main = crate::gate::ensure_main_champion().map_err(|e| format!("{cmd}: cannot resolve the main engine: {e}"))?;
+    let boards = check_boards(cmd)?;
 
     let mut child = Command::new(&main.exe)
         .args(["serve", "--tt-bits", &standard().tt_bits.to_string()])

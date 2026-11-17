@@ -165,11 +165,32 @@ pub fn run_gen(args: &[String]) -> ExitCode {
     if let (Some(_), Some(pol)) = (&exp, crate::flag_str(args, "--policy")) {
         titanium::policy::configure(&pol);
     }
-    let identity = crate::genguard::require_main_engine("gen");
+    // D1041: on a Docker box (no main checkout) the identity is proven against the PC's recorded main behaviour
+    let fingerprint = crate::flag_str(args, "--main-fingerprint");
+    let identity = match &fingerprint {
+        Some(f) => crate::genguard::check_fingerprint("gen", f),
+        None => crate::genguard::require_main_engine("gen"),
+    };
+    // D1041 shard: --shard K/N plays only the 2-ply openings whose sequence hash % N == K (several machines, one DAG
+    // each, no duplicated work); the label of every ply is still the engine's unrestricted best move and score.
+    let shard: Option<(u64, u64)> = match crate::flag_str(args, "--shard") {
+        None => None,
+        Some(s) => match s.split_once('/').and_then(|(k, n)| Some((k.parse::<u64>().ok()?, n.parse::<u64>().ok()?))) {
+            Some((k, n)) if n >= 2 && k < n => Some((k, n)),
+            _ => {
+                eprintln!("gen: --shard must be K/N with 0 <= K < N, N >= 2 (got {s})");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     let engine_id = match (identity, &exp) {
         (Ok(id), _) => {
             eprintln!("gen: engine = current main {} (identity check: {} positions, {} nodes equal to the main exe)", id.main_commit, id.positions, id.nodes);
             Some(id)
+        }
+        (Err(e), None) if fingerprint.is_some() => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
         }
         (Err(e), None) => {
             if let Err(e2) = crate::genguard::rebuild_and_rerun("gen", &e) {
@@ -252,6 +273,7 @@ pub fn run_gen(args: &[String]) -> ExitCode {
     id["tt_bits"] = serde_json::json!(tt_bits);
     id["network"] = serde_json::json!(crate::flag_str(args, "--network").filter(|_| exp.is_some()).unwrap_or_else(|| "bundled".into()));
     id["nodes_per_move"] = serde_json::json!(nodes);
+    id["shard"] = serde_json::json!(shard.map(|(k, n)| format!("{k}/{n} (2-ply openings by sequence hash, D1041)")));
     id["started"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
     if let Err(e) = std::fs::write(format!("{stem}.engine.json"), serde_json::to_string_pretty(&id).unwrap_or_default()) {
         eprintln!("gen: cannot write {stem}.engine.json: {e}");
@@ -319,8 +341,21 @@ pub fn run_gen(args: &[String]) -> ExitCode {
                             // position); only when that move was already played here, (2) one search that leaves
                             // out every move already played here at once.
                             let t_dag = std::time::Instant::now();
-                            let played_here = played_from(h)?;
+                            let mut played_here = played_from(h)?;
                             cnt.dag_ns.fetch_add(t_dag.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            if let (Some((k, n)), 1) = (shard, ply) {
+                                // ply 1 (second move): moves whose 2-ply sequence belongs to another shard count as
+                                // played many times, so the novelty rule never picks them while an own-shard move exists
+                                b.legal_moves_dedup_into(&mut ml);
+                                for m in ml.iter() {
+                                    let c = seq_code(&b, m);
+                                    let x = seq_child(h, c);
+                                    if (x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) % n != k {
+                                        let e = played_here.entry(c).or_insert(0);
+                                        *e = (*e).max(1 << 40);
+                                    }
+                                }
+                            }
                             let first = searcher.search_bz(&b, &limits);
                             cnt.searches.fetch_add(1, Ordering::Relaxed);
                             let Some(m0) = first.best else { break };
