@@ -1,4 +1,4 @@
-﻿//! `lab`: research studies of the champion eval, outside the hub (D957).
+//! `lab`: research studies of the champion eval, outside the hub (D957).
 //!   lab hce-fit --tdat X.tdat [--train 20000] [--val 2000] [--seed 7] [--out FILE]
 //!   lab see-screen --tdat X.tdat [--rows 50000] [--seed 7] [--bench]
 mod deepsee;
@@ -19,6 +19,7 @@ mod boundcmp;
 mod evalgate;
 mod groupdiff;
 mod spairs;
+mod archloc;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         Some("gx-eval") => gxeval::cli(&args[1..]),
         Some("eval-gate") => evalgate::run(&args[1..]),
         Some("group-diff") => groupdiff::run(&args[1..]),
+        Some("arch-locality") => archloc::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
