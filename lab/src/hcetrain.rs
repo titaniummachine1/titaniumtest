@@ -1,4 +1,4 @@
-﻿//! `lab hce-train` (D977): train the hand-crafted eval EXACTLY like the NNUE: same dataset, same target, same loss, same
+//! `lab hce-train` (D977): train the hand-crafted eval EXACTLY like the NNUE: same dataset, same target, same loss, same
 //! validation, stop only at saturation (LAWS C15), initialised from the closed-form fit to the champion (LAWS C14).
 //!
 //!   lab hce-train --data train_v10.tdat --val val_v9_clean.tdat [--set 4] [--threads 7] [--bs 16384] [--lr 2.0]
@@ -61,6 +61,119 @@ fn fx(set: usize, pr: Option<&Pairs>, off: u32, b: &Board, ring: &[u64; 49], m: 
     if let Some((sp, o)) = SP.get() {
         sp.feats(b.me(), b.opp(), *o, out);
     }
+}
+
+/// D1113 (user: "use the plain alpha-beta to see directly how the architecture changes strength"): a finished
+/// `hce-train --on-nnue 1` model (`*_weights.json`) as an evaluator = the frozen bundled champion + its learned linear
+/// correction, exactly as scored in training (same feature layout, pairs keep/mob, stone-pair bands, per-bucket scale).
+/// One model per process (bucket count and the stone-pair table are process-global).
+pub struct Residual {
+    set: usize,
+    pairs: Option<Pairs>,
+    off: u32,
+    sc_off: Option<u32>,
+    /// own stone-pair table (not the process-global SP), so models with and without bands can play each other
+    sp: Option<(SPairs, u32)>,
+    w: Vec<f32>,
+    ring: [u64; 49],
+    m: crate::hcecmp::Masks,
+    net: Nnue,
+}
+
+impl Residual {
+    pub fn load(path: &str) -> Residual {
+        let s = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let field = |k: &str| -> String {
+            let t = s.split(&format!("\"{k}\":")).nth(1).unwrap_or_else(|| panic!("{path}: no field {k}"));
+            t.split([',', '}']).next().unwrap().trim().trim_matches('"').to_string()
+        };
+        assert_eq!(field("on_nnue"), "true", "{path}: not an --on-nnue residual model");
+        let set: usize = field("set").parse().unwrap();
+        set_nbk(field("buckets").parse().unwrap());
+        let d_base: usize = field("base_dims").parse().unwrap();
+        assert_eq!(d_base, nbk() * block(set), "{path}: base_dims");
+        let mut pairs = if field("pairs") == "true" { Some(Pairs::new()) } else { None };
+        if let Some(p) = pairs.as_mut() {
+            if let Some(t) = s.split("\"pair_keep\":[").nth(1).and_then(|t| t.split(']').next()) {
+                if !t.trim().is_empty() {
+                    let mut k = [false; crate::pairs::PLACEMENTS];
+                    for v in t.split(',') {
+                        k[v.trim().parse::<usize>().unwrap()] = true;
+                    }
+                    p.keep = k;
+                }
+            }
+            if s.contains("\"mob\":false") {
+                p.mob = false;
+            }
+        }
+        let sp_off = d_base + pairs.as_ref().map_or(0, |p| p.dims());
+        // models trained before D1072 have no spairs field
+        let bands = if s.contains("\"spairs\":") { field("spairs") } else { String::new() };
+        let sp = if bands.is_empty() || bands == "null" { None } else { Some((SPairs::new(&bands), sp_off as u32)) };
+        let sp_dims = sp.as_ref().map_or(0, |s| s.0.dims());
+        let body = s.split("\"weights\":[").nth(1).and_then(|t| t.split(']').next()).expect("weights array");
+        let w: Vec<f32> = body.split(',').map(|v| v.trim().parse::<f32>().unwrap()).collect();
+        let core = sp_off + sp_dims;
+        let sc_off = if w.len() == core + nbk() {
+            Some(core as u32)
+        } else {
+            assert_eq!(w.len(), core, "{path}: {} weights, layout needs {core} (+{} with --nnue-scale)", w.len(), nbk());
+            None
+        };
+        Residual { set, pairs, off: d_base as u32, sc_off, sp, w, ring: ring1(), m: masks(), net: Nnue::bundled() }
+    }
+
+    /// cp from the side to move (same scale as `Nnue::eval`)
+    pub fn eval(&self, b: &Board) -> i32 {
+        self.eval_f(b).round().clamp(-30000.0, 30000.0) as i32
+    }
+
+    /// unrounded cp, exactly the training scorer
+    pub fn eval_f(&self, b: &Board) -> f32 {
+        let (mut t, mut x) = (Vec::new(), Vec::new());
+        feats(self.set, b, &self.ring, &self.m, &mut t);
+        x.extend(t.iter().map(|&(i, v)| (i as u32, v)));
+        if let Some(p) = self.pairs.as_ref() {
+            p.feats(b.me(), b.opp(), self.off, &mut x);
+        }
+        if let Some((sp, o)) = &self.sp {
+            sp.feats(b.me(), b.opp(), *o, &mut x);
+        }
+        let base = self.net.eval(b, 0) as f32;
+        let mut v = base + x.iter().map(|&(i, v)| self.w[i as usize] * v).sum::<f32>();
+        if let Some(o) = self.sc_off {
+            v += self.w[o as usize + crate::hcecmp::bk(b.empty())] * base / 400.0;
+        }
+        v
+    }
+}
+
+/// `lab residual-check --model M_weights.json --data X.tdat [--holdout 0.1]` (D1113): parity of `Residual::eval` with the
+/// training run: recomputes the held-out val loss (same split, same target, same loss) that hce-train logged as best.
+pub fn residual_check(args: &[String]) -> ExitCode {
+    let mp = arg(args, "--model").expect("--model M_weights.json");
+    let data = arg(args, "--data").expect("--data X.tdat");
+    let h: f64 = arg(args, "--holdout").map_or(0.1, |v| v.parse().unwrap());
+    let r = Residual::load(&mp);
+    let mut all = read_rows(&data, usize::MAX);
+    let k = ((all.len() as f64) * (1.0 - h)) as usize;
+    let val = all.split_off(k);
+    drop(all);
+    let (mut l, mut ln, mut ws) = (0f64, 0f64, 0f64);
+    for row in &val {
+        let b = board(row);
+        let t = target(row, false);
+        let wt = row.wsum.max(0.0) as f64;
+        // the training scorer is f32 (not rounded to whole cp): use the unrounded value for parity
+        let p = sig(r.eval_f(&b) / 400.0);
+        let pn = sig(r.net.eval(&b, 0) as f32 / 400.0);
+        l += wt * ((p - t).abs() as f64).powf(2.5);
+        ln += wt * ((pn - t).abs() as f64).powf(2.5);
+        ws += wt;
+    }
+    println!("residual-check: {mp}: {} held-out rows: val loss {:.6} (champion alone {:.6})", val.len(), l / ws, ln / ws);
+    ExitCode::SUCCESS
 }
 
 fn board(r: &Rec) -> Board {

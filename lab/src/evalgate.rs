@@ -23,8 +23,23 @@ use crate::util::arg;
 const WIN: i32 = 1_000_000;
 const MAX_PLIES: u32 = 400;
 
+/// D1113: an evaluator = a net file (.tnn) or a residual model on the champion (hce-train `*_weights.json`)
+pub enum Ev {
+    Net(Nnue),
+    Res(Box<crate::hcetrain::Residual>),
+}
+
+impl Ev {
+    fn load(p: &str) -> Ev {
+        if p.ends_with(".json") { Ev::Res(Box::new(crate::hcetrain::Residual::load(p))) } else { Ev::Net(Nnue::load(p).expect("load net")) }
+    }
+    fn eval(&self, b: &Board) -> i32 {
+        match self { Ev::Net(n) => n.eval(b, 0), Ev::Res(r) => r.eval(b) }
+    }
+}
+
 struct Ctx<'a> {
-    net: &'a Nnue,
+    net: &'a Ev,
     nodes: u64,
     budget: u64,
     abort: bool,
@@ -60,7 +75,7 @@ fn ab(c: &mut Ctx, b: &Board, depth: u32, mut alpha: i32, beta: i32) -> i32 {
         return terminal(b);
     }
     if depth == 0 {
-        return c.net.eval(b, 0);
+        return c.net.eval(b);
     }
     let mut best = -2 * WIN;
     for m in ordered(b) {
@@ -82,7 +97,7 @@ fn ab(c: &mut Ctx, b: &Board, depth: u32, mut alpha: i32, beta: i32) -> i32 {
 }
 
 /// Root search: returns (move, completed depth, nodes).
-fn choose(net: &Nnue, b: &Board, depth: u32, budget: u64) -> (Move, u32, u64) {
+fn choose(net: &Ev, b: &Board, depth: u32, budget: u64) -> (Move, u32, u64) {
     let mut root = ordered(b);
     let mut c = Ctx { net, nodes: 0, budget, abort: false };
     let (mut best_m, mut done) = (root[0], 0u32);
@@ -131,7 +146,7 @@ struct Game {
     moves: [u64; 2],
 }
 
-fn play(start: &Board, a_first: bool, nets: [&Nnue; 2], depth: u32, budget: u64) -> Game {
+fn play(start: &Board, a_first: bool, nets: [&Ev; 2], depth: u32, budget: u64) -> Game {
     // side index 0 = net A, 1 = net B; A moves first from the book position when a_first
     let mut b = *start;
     let first_turn = b.turn;
@@ -174,13 +189,13 @@ pub fn run(args: &[String]) -> ExitCode {
     let book0: usize = arg(args, "--book0").map_or(0, |v| v.parse().unwrap());
     let pairs: usize = arg(args, "--pairs").map_or(400, |v| v.parse().unwrap());
     let threads: usize = arg(args, "--threads").map_or(6, |v| v.parse().unwrap());
-    let na = Nnue::load(&pa).expect("load --a");
-    let nb = Nnue::load(&pb).expect("load --b");
+    let na = Ev::load(&pa);
+    let nb = Ev::load(&pb);
     // sanity: eval is from the side to move (a side with far more stones must score higher)
     let up = Board::from_occ(0x0000_0000_00FF_FFFF, 0x1, 0, 0);
     let down = Board::from_occ(0x1, 0x0000_0000_00FF_FFFF, 0, 0);
     for (n, name) in [(&na, "A"), (&nb, "B")] {
-        if n.eval(&up, 0) <= n.eval(&down, 0) {
+        if n.eval(&up) <= n.eval(&down) {
             eprintln!("eval-gate: net {name} does not score from the side to move; refusing");
             return ExitCode::from(1);
         }
