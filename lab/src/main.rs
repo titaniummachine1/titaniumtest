@@ -20,6 +20,7 @@ mod evalgate;
 mod groupdiff;
 mod spairs;
 mod archloc;
+mod netscale;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -47,6 +48,7 @@ fn main() -> ExitCode {
         Some("group-diff") => groupdiff::run(&args[1..]),
         Some("arch-locality") => archloc::run(&args[1..]),
         Some("residual-check") => hcetrain::residual_check(&args[1..]),
+        Some("net-scale") => netscale::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
