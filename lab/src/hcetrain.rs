@@ -81,6 +81,7 @@ pub struct Residual {
     sp: Option<(SPairs, u32)>,
     wn: Option<(crate::win::Win, u32)>,
     w: Vec<f32>,
+    on_nnue: bool,
     ring: [u64; 49],
     m: crate::hcecmp::Masks,
     net: Nnue,
@@ -98,7 +99,8 @@ impl Residual {
                 t.split([',', '}']).next().unwrap().trim().to_string()
             }
         };
-        assert_eq!(field("on_nnue"), "true", "{path}: not an --on-nnue residual model");
+        // D1119: standalone models (on_nnue false) score without the champion base
+        let on_nnue = field("on_nnue") == "true";
         let set: usize = field("set").parse().unwrap();
         set_nbk(field("buckets").parse().unwrap());
         let d_base: usize = field("base_dims").parse().unwrap();
@@ -135,7 +137,7 @@ impl Residual {
             assert_eq!(w.len(), core, "{path}: {} weights, layout needs {core} (+{} with --nnue-scale)", w.len(), nbk());
             None
         };
-        Residual { set, pairs, off: d_base as u32, sc_off, sp, wn, w, ring: ring1(), m: masks(), net: Nnue::bundled() }
+        Residual { set, pairs, off: d_base as u32, sc_off, sp, wn, w, on_nnue, ring: ring1(), m: masks(), net: Nnue::bundled() }
     }
 
     /// cp from the side to move (same scale as `Nnue::eval`)
@@ -157,7 +159,7 @@ impl Residual {
         if let Some((wn, o)) = &self.wn {
             wn.feats(b.me(), b.opp(), *o, &mut x);
         }
-        let base = self.net.eval(b, 0) as f32;
+        let base = if self.on_nnue { self.net.eval(b, 0) as f32 } else { 0.0 };
         let mut v = base + x.iter().map(|&(i, v)| self.w[i as usize] * v).sum::<f32>();
         if let Some(o) = self.sc_off {
             v += self.w[o as usize + crate::hcecmp::bk(b.empty())] * base / 400.0;
