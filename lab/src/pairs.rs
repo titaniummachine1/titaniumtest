@@ -137,6 +137,33 @@ impl Pairs {
         Pairs { first, second, class, nclass, digits }
     }
 
+    /// D1030 fast path: weights expanded to a direct table [placement][b3(first) + 81 * b3(second)] (80 x 6561 f32, 2.1 MB,
+    /// no class indirection), b3 = base-3 code of a 2x2 block (squares s, s+1, s+7, s+8 -> digits x1, x3, x9, x27)
+    pub(crate) fn direct_table(&self, w: &[f32], off: usize) -> Vec<f32> {
+        let mut t = vec![0f32; PLACEMENTS * 6561];
+        for p in 0..PLACEMENTS {
+            for code in 0..6561usize {
+                let (mut c, mut pat) = (code, 0u32);
+                for i in 0..8 {
+                    pat |= ((c % 3) as u32) << (2 * (i % 4) + 8 * (i / 4));
+                    c /= 3;
+                }
+                let cl = self.class[p << 16 | pat as usize];
+                if cl != u32::MAX {
+                    t[p * 6561 + code] = w[off + cl as usize];
+                }
+            }
+        }
+        t
+    }
+    pub(crate) fn first_second(&self) -> ([u8; PLACEMENTS], [u8; PLACEMENTS]) {
+        (self.first, self.second)
+    }
+    pub(crate) fn mob_index(me: u64, op: u64) -> (usize, usize) {
+        let occ = me | op;
+        (Self::mob_idx(me, occ), Self::mob_idx(op, occ))
+    }
+
     pub(crate) fn dims(&self) -> usize {
         self.nclass + MOB
     }
