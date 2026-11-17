@@ -26,6 +26,31 @@ fn field<'a>(s: &'a str, key: &str) -> &'a str {
     t.split([',', '}']).next().unwrap().trim()
 }
 
+// D1029: C ABI for engines in other languages (gataxx/Java via java.lang.foreign): one HCE per process.
+static FFI_HCE: std::sync::OnceLock<HceEval> = std::sync::OnceLock::new();
+
+/// load the weights JSON (NUL-terminated UTF-8 path); returns 0 on success. Must be called before ti_hce_eval.
+#[no_mangle]
+pub extern "C" fn ti_hce_load(path: *const std::os::raw::c_char) -> i32 {
+    if path.is_null() {
+        return 1;
+    }
+    let p = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy().into_owned();
+    match std::panic::catch_unwind(|| HceEval::load(&p)) {
+        Ok(h) => {
+            let _ = FFI_HCE.set(h);
+            0
+        }
+        Err(_) => 2,
+    }
+}
+
+/// HCE cp (our sigmoid(cp/400) scale) for the side to move; `me` / `op` in a1 = bit 0, row-major 7x7 (the HCE is D4-invariant)
+#[no_mangle]
+pub extern "C" fn ti_hce_eval(me: u64, op: u64) -> f32 {
+    FFI_HCE.get().map_or(0.0, |h| h.eval(me, op))
+}
+
 /// `lab hce-eval --weights J --val V.tdat [--n 20]`: HCE cp of the first N val rows (same order as `lab val-fen`),
 /// for parity checks of an engine that embeds HceEval (D1024)
 pub fn cli(args: &[String]) -> std::process::ExitCode {
