@@ -135,3 +135,39 @@ pub fn run(args: &[String]) -> ExitCode {
     println!("  (checksum {acc})");
     ExitCode::SUCCESS
 }
+
+/// `lab incr-stats --val V.tdat [--n 20000]` (D1056, user: "make the HCE incremental: a move only touches one part"):
+/// per legal move of val positions, how many squares change state and how many of the 80 pair placements
+/// (two 2x2 blocks each) contain a changed square = the work of an incremental pair-table update.
+pub fn incr_stats(args: &[String]) -> ExitCode {
+    let val = arg(args, "--val").expect("--val V.tdat");
+    let n: usize = arg(args, "--n").map_or(20000, |v| v.parse().unwrap());
+    let rows = crate::hcetrain::read_rows(&val, 600_000);
+    let step = (rows.len() / n).max(1);
+    let p = crate::pairs::Pairs::new();
+    let (fa, fb) = p.first_second();
+    let blk = |s: u8| -> u64 { let s = s as u64; (1 << s) | (1 << (s + 1)) | (1 << (s + 7)) | (1 << (s + 8)) };
+    let masks: Vec<u64> = (0..crate::pairs::PLACEMENTS).map(|q| blk(fa[q]) | blk(fb[q])).collect();
+    let mut ml = MoveList::new();
+    let (mut moves, mut sq, mut pl, mut hist) = (0u64, 0u64, 0u64, [0u64; 81]);
+    for r in rows.iter().step_by(step).take(n) {
+        let b = board(r);
+        b.legal_moves_dedup_into(&mut ml);
+        for m in ml.iter() {
+            let c = b.make(m);
+            let changed = (b.me() ^ c.opp()) | (b.opp() ^ c.me());
+            let k = masks.iter().filter(|&&mk| mk & changed != 0).count();
+            moves += 1;
+            sq += changed.count_ones() as u64;
+            pl += k as u64;
+            hist[k] += 1;
+        }
+    }
+    let pct = |lo: usize, hi: usize| 100.0 * hist[lo..=hi].iter().sum::<u64>() as f64 / moves as f64;
+    println!(
+        "incr-stats: {moves} moves of {n} val positions: changed squares {:.2} per move; pair placements touched {:.1} of {} per move ({:.0}%); share of moves touching <=20 placements {:.1}%, 21-40 {:.1}%, >40 {:.1}%",
+        sq as f64 / moves as f64, pl as f64 / moves as f64, crate::pairs::PLACEMENTS, 100.0 * pl as f64 / (moves * crate::pairs::PLACEMENTS as u64) as f64,
+        pct(0, 20), pct(21, 40), pct(41, 80)
+    );
+    ExitCode::SUCCESS
+}

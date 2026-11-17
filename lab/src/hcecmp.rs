@@ -45,6 +45,7 @@ pub(crate) const O_N: usize = 7 + 2 * 10 * 9 + 18; // as hce-fast
 pub(crate) fn block(set: usize) -> usize {
     match set {
         0 => G_N,
+        5 => 1, // D1053: bias only (calibration baseline for hce-train --on-nnue)
         1 => F_N,
         2 => A_N,
         3 => O_N,
@@ -180,6 +181,7 @@ pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mu
                 push(out, base + i, *v);
             }
         }
+        5 => push(out, base, 1.0),
         _ => ours(b, ring, base, out),
     }
 }

@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         Some("zataxx-train") => zattrain::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
         Some("node-cost") => nodecost::run(&args[1..]),
+        Some("incr-stats") => nodecost::incr_stats(&args[1..]),
         Some("bound-cmp") => boundcmp::run(&args[1..]),
         Some("hce-ablate") => hceeval::ablate(&args[1..]),
         Some("gx-eval") => gxeval::cli(&args[1..]),

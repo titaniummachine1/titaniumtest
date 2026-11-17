@@ -110,7 +110,12 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
     let pr = pairs.as_ref();
-    let d = d_base + pr.map_or(0, |p| p.dims());
+    let on_nnue0 = g("--on-nnue", 0.0) as usize == 1;
+    // D1053: --nnue-scale 1 (with --on-nnue) adds one weight per bucket on the champion cp / 400 (a learned scale), so the
+    // calibration baseline (set 5 = bias + scale) can be separated from real information in the other groups
+    let nn_scale = on_nnue0 && g("--nnue-scale", 0.0) as usize == 1;
+    let sc_off = (d_base + pr.map_or(0, |p| p.dims())) as u32;
+    let d = sc_off as usize + if nn_scale { nbk() } else { 0 };
     let off = d_base as u32;
     // lr multiplier for the pair / mobility block (Adam step size in cp)
     let plr = g("--plr", 1.0) as f32;
@@ -142,6 +147,14 @@ pub fn run(args: &[String]) -> ExitCode {
             if i % 2 == 0 { a.push(r) } else { b.push(r) }
         }
         (a, b)
+    } else if g("--holdout", 0.0) > 0.0 {
+        // D1053: train and score on the SAME distribution: --data rows are in game order (games-tdat chains), so the last
+        // fraction is a set of whole games the fit never sees (--val is ignored). Needed because train rows labelled by
+        // today's main and val_v9's older labels differ systematically (the correction learned that gap, D1053).
+        let mut all = read_rows(&data, max_rows);
+        let k = ((all.len() as f64) * (1.0 - g("--holdout", 0.0))) as usize;
+        let v = all.split_off(k);
+        (all, v)
     } else {
         (read_rows(&data, max_rows), read_rows(&valp, 600_000))
     };
@@ -247,6 +260,9 @@ pub fn run(args: &[String]) -> ExitCode {
             let (mut t, mut x) = (Vec::new(), Vec::new());
             fx(set, pr, off, b, &ring1(), &masks(), &mut t, &mut x);
             let base = if on_nnue { netr.eval(b, 0) as f32 } else { 0.0 };
+            if nn_scale {
+                x.push((sc_off + crate::hcecmp::bk(b.empty()) as u32, base / 400.0));
+            }
             base + x.iter().map(|&(i, v)| w[i as usize] * v).sum::<f32>()
         }
     };
@@ -325,6 +341,9 @@ pub fn run(args: &[String]) -> ExitCode {
                                 // base on the UNROTATED board: the champion NNUE is not D4-invariant (smoke 2026-11-17:
                                 // max 858 cp, mean 40 cp across symmetries) and val scores it unrotated; the HCE part is D4-tied.
                                 let base = if on_nnue { netr.eval(&b0, 0) as f32 } else { 0.0 };
+                                if nn_scale {
+                                    x.push((sc_off + crate::hcecmp::bk(b0.empty()) as u32, base / 400.0));
+                                }
                                 let y = (base + x.iter().map(|&(i, v)| wr[i as usize] * v).sum::<f32>()) / 400.0;
                                 let p = sig(y);
                                 let t = target(r, !val_tgt);
@@ -392,6 +411,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 let c = b.make(mv);
                 let yn = -(net.eval(&c, 0) as f32);
                 fx(set, pr, off, &c, &ring, &m, &mut t, &mut x);
+                if nn_scale {
+                    x.push((sc_off + crate::hcecmp::bk(c.empty()) as u32, -yn / 400.0));
+                }
                 let yh = if on_nnue { yn } else { 0.0 } - x.iter().map(|&(i, v)| wv[i as usize] * v).sum::<f32>();
                 if yn > bn.0 {
                     bn = (yn, i);
