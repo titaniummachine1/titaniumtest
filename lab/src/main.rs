@@ -16,6 +16,7 @@ mod hceeval;
 mod gxeval;
 mod nodecost;
 mod boundcmp;
+mod evalgate;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Some("bound-cmp") => boundcmp::run(&args[1..]),
         Some("hce-ablate") => hceeval::ablate(&args[1..]),
         Some("gx-eval") => gxeval::cli(&args[1..]),
+        Some("eval-gate") => evalgate::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)
