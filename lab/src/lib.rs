@@ -5,6 +5,7 @@ mod hcecmp;
 mod hcefit;
 mod pairs;
 mod spairs;
+mod win;
 mod util;
 mod zattrain;
 mod extval;

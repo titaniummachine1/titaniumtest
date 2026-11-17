@@ -16,6 +16,8 @@ use crate::pairs::Pairs;
 use crate::spairs::SPairs;
 /// D1072: --spairs BANDS = stone pairs by distance band, appended after the pair / mobility block (offset stored here)
 static SP: std::sync::OnceLock<(SPairs, u32)> = std::sync::OnceLock::new();
+/// D1117: --win SIZES = k x k window tuples (D4-tied), appended after the stone-pair block
+static WN: std::sync::OnceLock<(crate::win::Win, u32)> = std::sync::OnceLock::new();
 use crate::zattrain::{d4maps, sym};
 use crate::util::{arg, ring1, Rec, REC};
 use std::fs::File;
@@ -61,6 +63,9 @@ fn fx(set: usize, pr: Option<&Pairs>, off: u32, b: &Board, ring: &[u64; 49], m: 
     if let Some((sp, o)) = SP.get() {
         sp.feats(b.me(), b.opp(), *o, out);
     }
+    if let Some((wn, o)) = WN.get() {
+        wn.feats(b.me(), b.opp(), *o, out);
+    }
 }
 
 /// D1113 (user: "use the plain alpha-beta to see directly how the architecture changes strength"): a finished
@@ -74,6 +79,7 @@ pub struct Residual {
     sc_off: Option<u32>,
     /// own stone-pair table (not the process-global SP), so models with and without bands can play each other
     sp: Option<(SPairs, u32)>,
+    wn: Option<(crate::win::Win, u32)>,
     w: Vec<f32>,
     ring: [u64; 49],
     m: crate::hcecmp::Masks,
@@ -84,8 +90,13 @@ impl Residual {
     pub fn load(path: &str) -> Residual {
         let s = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let field = |k: &str| -> String {
-            let t = s.split(&format!("\"{k}\":")).nth(1).unwrap_or_else(|| panic!("{path}: no field {k}"));
-            t.split([',', '}']).next().unwrap().trim().trim_matches('"').to_string()
+            let t = s.split(&format!("\"{k}\":")).nth(1).unwrap_or_else(|| panic!("{path}: no field {k}")).trim_start();
+            // quoted values may contain commas ("1,2,3,4"): take up to the closing quote
+            if let Some(q) = t.strip_prefix('"') {
+                q.split('"').next().unwrap().to_string()
+            } else {
+                t.split([',', '}']).next().unwrap().trim().to_string()
+            }
         };
         assert_eq!(field("on_nnue"), "true", "{path}: not an --on-nnue residual model");
         let set: usize = field("set").parse().unwrap();
@@ -112,16 +123,19 @@ impl Residual {
         let bands = if s.contains("\"spairs\":") { field("spairs") } else { String::new() };
         let sp = if bands.is_empty() || bands == "null" { None } else { Some((SPairs::new(&bands), sp_off as u32)) };
         let sp_dims = sp.as_ref().map_or(0, |s| s.0.dims());
+        let wspec = if s.contains("\"win\":") { field("win") } else { String::new() };
+        let wn = if wspec.is_empty() { None } else { Some((crate::win::Win::new(&wspec), (sp_off + sp_dims) as u32)) };
+        let wn_dims = wn.as_ref().map_or(0, |w| w.0.dims());
         let body = s.split("\"weights\":[").nth(1).and_then(|t| t.split(']').next()).expect("weights array");
         let w: Vec<f32> = body.split(',').map(|v| v.trim().parse::<f32>().unwrap()).collect();
-        let core = sp_off + sp_dims;
+        let core = sp_off + sp_dims + wn_dims;
         let sc_off = if w.len() == core + nbk() {
             Some(core as u32)
         } else {
             assert_eq!(w.len(), core, "{path}: {} weights, layout needs {core} (+{} with --nnue-scale)", w.len(), nbk());
             None
         };
-        Residual { set, pairs, off: d_base as u32, sc_off, sp, w, ring: ring1(), m: masks(), net: Nnue::bundled() }
+        Residual { set, pairs, off: d_base as u32, sc_off, sp, wn, w, ring: ring1(), m: masks(), net: Nnue::bundled() }
     }
 
     /// cp from the side to move (same scale as `Nnue::eval`)
@@ -139,6 +153,9 @@ impl Residual {
         }
         if let Some((sp, o)) = &self.sp {
             sp.feats(b.me(), b.opp(), *o, &mut x);
+        }
+        if let Some((wn, o)) = &self.wn {
+            wn.feats(b.me(), b.opp(), *o, &mut x);
         }
         let base = self.net.eval(b, 0) as f32;
         let mut v = base + x.iter().map(|&(i, v)| self.w[i as usize] * v).sum::<f32>();
@@ -243,7 +260,17 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         None => 0,
     };
-    let sc_off = (sp_off + sp_dims) as u32;
+    let wn_off = sp_off + sp_dims;
+    let wn_dims = match arg(args, "--win") {
+        Some(k) => {
+            let w = crate::win::Win::new(&k);
+            let n = w.dims();
+            let _ = WN.set((w, wn_off as u32));
+            n
+        }
+        None => 0,
+    };
+    let sc_off = (wn_off + wn_dims) as u32;
     let d = sc_off as usize + if nn_scale { nbk() } else { 0 };
     let off = d_base as u32;
     // lr multiplier for the pair / mobility block (Adam step size in cp)
@@ -561,12 +588,13 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
     let js = format!(
-        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"win\":\"{}\",\"win_dims\":{wn_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
         nbk(),
         pr.is_some(),
         pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),
         pr.is_none_or(|p| p.mob),
         SP.get().map_or(String::new(), |s| s.0.bands.clone()),
+        WN.get().map_or(String::new(), |w| w.0.spec.clone()),
         best.2,
         best.0,
         best.1

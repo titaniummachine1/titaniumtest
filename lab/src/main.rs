@@ -19,6 +19,7 @@ mod boundcmp;
 mod evalgate;
 mod groupdiff;
 mod spairs;
+mod win;
 mod archloc;
 mod netscale;
 use std::process::ExitCode;
