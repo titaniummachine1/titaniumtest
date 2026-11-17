@@ -12,6 +12,7 @@ mod zattrain;
 mod pairs;
 mod seescreen;
 mod util;
+mod hceeval;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
         Some("val-score") => extval::score(&args[1..]),
         Some("zataxx-val") => extval::zataxx(&args[1..]),
         Some("zataxx-train") => zattrain::run(&args[1..]),
+        Some("hce-eval") => hceeval::cli(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");
             ExitCode::from(2)

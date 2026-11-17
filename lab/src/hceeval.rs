@@ -26,6 +26,22 @@ fn field<'a>(s: &'a str, key: &str) -> &'a str {
     t.split([',', '}']).next().unwrap().trim()
 }
 
+/// `lab hce-eval --weights J --val V.tdat [--n 20]`: HCE cp of the first N val rows (same order as `lab val-fen`),
+/// for parity checks of an engine that embeds HceEval (D1024)
+pub fn cli(args: &[String]) -> std::process::ExitCode {
+    let (Some(wp), Some(v)) = (crate::util::arg(args, "--weights"), crate::util::arg(args, "--val")) else {
+        eprintln!("usage: lab hce-eval --weights J --val V.tdat [--n 20]");
+        return std::process::ExitCode::from(2);
+    };
+    let n: usize = crate::util::arg(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let h = HceEval::load(&wp);
+    for (i, r) in crate::hcetrain::read_rows(&v, n).iter().enumerate() {
+        let (me, op) = crate::extval::own_opp(r);
+        println!("{i}\t{:.2}", h.eval(me, op));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 impl HceEval {
     /// load a lab hce-train `*_weights.json`; sets the global bucket count (one HCE model per process)
     pub fn load(path: &str) -> HceEval {
