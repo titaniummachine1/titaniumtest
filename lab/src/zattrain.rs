@@ -23,6 +23,8 @@ const P: usize = NI * H + 2 * H + 1;
 const FB: usize = NI * H;
 const OW: usize = FB + H;
 const OB: usize = OW + H;
+/// D1021: largest float output weight whose quantised value (x64) keeps clamp(h,0,255)*w inside i16 (Zataxx AVX2 path)
+const OW_MAX: f32 = 127.0 / 64.0;
 
 fn zidx(us: u64, them: u64, out: &mut [usize; 36]) {
     const POW: [usize; 4] = [1, 3, 9, 27];
@@ -180,6 +182,9 @@ pub fn run(args: &[String]) -> ExitCode {
     for i in OW..P {
         w[i] *= kb.1;
     }
+    for x in &mut w[OW..OB] {
+        *x = x.clamp(-OW_MAX, OW_MAX); // D1021 AVX2 bound
+    }
     let i_l = vloss(&w, 1.0);
     say(format!("zataxx-train: {} train rows, {} val rows, {P} weights, {threads} threads, bs {bs}, lr {lr}, D4 augmentation always on, {passes} symmetries per row per epoch ({:.0}s)", train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
     say(format!("init = net6.bin dequantised: val loss {raw:.6} raw, best scale {:.2} folded into the output layer -> {i_l:.6} (NNUE 0.008978, D994 HCE+pairs 0.010904)", kb.1), &mut log);
@@ -297,6 +302,10 @@ pub fn run(args: &[String]) -> ExitCode {
                     });
                 }
             });
+            // D1021: Zataxx's AVX2 flatten keeps 16 bits of clamp(h,0,255)*w, so |quantised ow| must stay <= 127
+            for x in &mut w[OW..OB] {
+                *x = x.clamp(-OW_MAX, OW_MAX);
+            }
         }
         }
         let vl = vloss(&w, 1.0);
@@ -325,12 +334,15 @@ pub fn run(args: &[String]) -> ExitCode {
     for i in 0..P {
         let s = if i < OW { 255.0 } else if i < OB { 64.0 } else { 255.0 * 64.0 };
         let v = bw[i] * s;
-        clipped += (v.abs() > 32767.0) as usize;
-        bytes.extend_from_slice(&q(bw[i], s).to_le_bytes());
+        let lim = if (OW..OB).contains(&i) { 127.0 } else { 32767.0 };
+        clipped += (v.abs() > lim) as usize;
+        let qi = q(bw[i], s).clamp(-(lim as i16), lim as i16);
+        bytes.extend_from_slice(&qi.to_le_bytes());
     }
     let np2 = format!("{out}_net.bin");
     let _ = std::fs::File::create(&np2).and_then(|mut f| f.write_all(&bytes));
-    let zq = Zat::load(&np2);
+    let mut zq = Zat::load(&np2);
+    zq.trunc = true; // score exactly what Zataxx's AVX2 build computes (D1021)
     let net = Nnue::bundled();
     let (mut l, mut ws) = (0f64, 0f64);
     for r in &val {
@@ -370,7 +382,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let a0 = agree(&|c: &Board| z.eval(c.me(), c.opp()) as f32);
     let a1 = agree(&|c: &Board| zq.eval(c.me(), c.opp()) as f32);
     say(format!(
-        "exported {np2} ({clipped} weights clipped to i16): QUANTISED val loss {:.6} (float best {:.6}); sibling best-move agreement with the NNUE: net6.bin {a0:.2}%, trained {a1:.2}%",
+        "exported {np2} ({clipped} weights clipped: output weights to +-127, rest to i16): QUANTISED val loss (AVX2 arithmetic) {:.6} (float best {:.6}); sibling best-move agreement with the NNUE: net6.bin {a0:.2}%, trained {a1:.2}%",
         l / ws, best.0
     ), &mut log);
     ExitCode::SUCCESS
