@@ -1,4 +1,4 @@
-﻿//! gataxx's pair-pattern residual + mobility table (D991), as sparse features for `lab hce-train --pairs`.
+//! gataxx's pair-pattern residual + mobility table (D991), as sparse features for `lab hce-train --pairs`.
 //!
 //! Same definition as gataxx 2.0.0 `PairPatterns.java` (MIT): every square is empty (0), side to move (1) or opponent (2);
 //! a 2x2 block with origin s is the base-4 number of squares (s, s+1, s+7, s+8); a placement is a pair of blocks side by side
@@ -18,6 +18,11 @@ pub(crate) struct Pairs {
     class: Vec<u32>,
     pub(crate) nclass: usize,
     digits: [[u8; 16]; 16],
+    /// D1032: placements in use (pruned models drop whole D4 orbits) and whether the mobility table is used
+    pub(crate) keep: [bool; PLACEMENTS],
+    pub(crate) mob: bool,
+    /// D4 orbit id of each placement (= smallest placement index among its images)
+    pub(crate) orbit: [u8; PLACEMENTS],
 }
 
 const ALL: u64 = (1u64 << 49) - 1;
@@ -134,7 +139,17 @@ impl Pairs {
             }
         }
         let nclass = ids.len();
-        Pairs { first, second, class, nclass, digits }
+        let mut orbit = [0u8; PLACEMENTS];
+        for p in 0..PLACEMENTS {
+            let sq = sqs(p);
+            let mut best = p;
+            for t in 0..8 {
+                let fp = sq.iter().fold(0u64, |m, &s| m | 1 << transform(s, t));
+                best = best.min(by_fp[&fp]);
+            }
+            orbit[p] = best as u8;
+        }
+        Pairs { first, second, class, nclass, digits, keep: [true; PLACEMENTS], mob: true, orbit }
     }
 
     /// D1030 fast path: weights expanded to a direct table [placement][b3(first) + 81 * b3(second)] (80 x 6561 f32, 2.1 MB,
@@ -149,7 +164,7 @@ impl Pairs {
                     c /= 3;
                 }
                 let cl = self.class[p << 16 | pat as usize];
-                if cl != u32::MAX {
+                if cl != u32::MAX && self.keep[p] {
                     t[p * 6561 + code] = w[off + cl as usize];
                 }
             }
@@ -189,6 +204,9 @@ impl Pairs {
             }
         }
         for p in 0..PLACEMENTS {
+            if !self.keep[p] {
+                continue;
+            }
             let pat = bl[self.first[p] as usize] | bl[self.second[p] as usize] << 8;
             let c = self.class[p << 16 | pat as usize];
             debug_assert!(c != u32::MAX);
@@ -197,7 +215,7 @@ impl Pairs {
         let occ = me | op;
         let base = off + self.nclass as u32;
         let (a, b) = (Self::mob_idx(me, occ), Self::mob_idx(op, occ));
-        if a != b {
+        if self.mob && a != b {
             out.push((base + a as u32, 1.0));
             out.push((base + b as u32, -1.0));
         }

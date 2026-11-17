@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         Some("zataxx-val") => extval::zataxx(&args[1..]),
         Some("zataxx-train") => zattrain::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
+        Some("hce-ablate") => hceeval::ablate(&args[1..]),
         Some("gx-eval") => gxeval::cli(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");

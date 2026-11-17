@@ -92,7 +92,23 @@ pub fn run(args: &[String]) -> ExitCode {
     set_nbk(g("--buckets", 16.0) as usize);
     let d_base = nbk() * block(set);
     // --pairs 1 (D991): gataxx's pair-pattern residual + mobility table, appended after the bucketed HCE, init 0
-    let pairs = if g("--pairs", 0.0) as usize == 1 { Some(Pairs::new()) } else { None };
+    let mut pairs = if g("--pairs", 0.0) as usize == 1 { Some(Pairs::new()) } else { None };
+    // D1032: --pair-keep "i,j,.." = use only these placements (whole D4 orbits, from lab hce-ablate); --no-mob 1 = drop mobility
+    if let Some(p) = pairs.as_mut() {
+        if let Some(list) = arg(args, "--pair-keep") {
+            let mut k = [false; crate::pairs::PLACEMENTS];
+            for s in list.split(',').filter(|s| !s.trim().is_empty()) {
+                k[s.trim().parse::<usize>().expect("--pair-keep: placement ids")] = true;
+            }
+            for q in 0..crate::pairs::PLACEMENTS {
+                assert_eq!(k[q], k[p.orbit[q] as usize], "--pair-keep must hold whole D4 orbits (placement {q})");
+            }
+            p.keep = k;
+        }
+        if g("--no-mob", 0.0) as usize == 1 {
+            p.mob = false;
+        }
+    }
     let pr = pairs.as_ref();
     let d = d_base + pr.map_or(0, |p| p.dims());
     let off = d_base as u32;
@@ -366,9 +382,11 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
     let js = format!(
-        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
         nbk(),
         pr.is_some(),
+        pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),
+        pr.is_none_or(|p| p.mob),
         best.2,
         best.0,
         best.1
