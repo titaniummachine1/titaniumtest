@@ -99,8 +99,11 @@ fn rec_ix(r: &Rec, ix: &mut [usize; 36]) {
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    let (Some(data), Some(valp), Some(np)) = (arg(args, "--data"), arg(args, "--val"), arg(args, "--net")) else {
-        eprintln!("usage: lab zataxx-train --data X.tdat --val V.tdat --net net6.bin [--threads 7] [--bs 16384] [--lr 0.001] [--max-rows N] [--out PREFIX]");
+    // D1130: standard = WHOLE dataset (lab/STANDARD_TRAIN.txt) + its held-out tail; --data / --val / --max-rows only with
+    // --experiment NAME (output under experiments/, stamped)
+    let exp = crate::standard::experiment(args);
+    let Some(np) = arg(args, "--net") else {
+        eprintln!("usage: lab zataxx-train --net net6.bin [--threads 7] [--bs 16384] [--lr 0.001] [--out PREFIX]  (experiment: --experiment NAME --data X --val V [--max-rows N])");
         return ExitCode::from(2);
     };
     let g = |k: &str, d: f64| arg(args, k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
@@ -128,8 +131,30 @@ pub fn run(args: &[String]) -> ExitCode {
         log.push('\n');
         let _ = std::fs::write(format!("{out}.log"), log.as_bytes());
     };
-    let train = read_rows(&data, max_rows);
-    let val = read_rows(&valp, 600_000);
+    if let Err(e) = crate::standard::check_out(&out, &exp) {
+        eprintln!("zataxx-train: {e}");
+        return ExitCode::from(2);
+    }
+    let (train, val) = if exp.is_none() {
+        match crate::standard::standard_split(args, &["--max-rows", "--val"]) {
+            Ok((st, tr, va)) => {
+                say(crate::standard::stamp(&exp, &st, tr.len(), va.len()), &mut log);
+                (tr, va)
+            }
+            Err(e) => {
+                eprintln!("zataxx-train: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let (Some(data), Some(valp)) = (arg(args, "--data"), arg(args, "--val")) else {
+            eprintln!("zataxx-train --experiment: needs --data X --val V");
+            return ExitCode::from(2);
+        };
+        let (tr, va) = (read_rows(&data, max_rows), read_rows(&valp, 600_000));
+        say(format!("EXPERIMENT {}: NOT the standard: {} train rows, {} val rows (data {data})", exp.clone().unwrap_or_default(), tr.len(), va.len()), &mut log);
+        (tr, va)
+    };
     let vix: Vec<[usize; 36]> = val.iter().map(|r| { let mut a = [0; 36]; rec_ix(r, &mut a); a }).collect();
 
     // init: dequantised net6.bin

@@ -172,13 +172,23 @@ impl Residual {
 /// training run: recomputes the held-out val loss (same split, same target, same loss) that hce-train logged as best.
 pub fn residual_check(args: &[String]) -> ExitCode {
     let mp = arg(args, "--model").expect("--model M_weights.json");
-    let data = arg(args, "--data").expect("--data X.tdat");
-    let h: f64 = arg(args, "--holdout").map_or(0.1, |v| v.parse().unwrap());
     let r = Residual::load(&mp);
-    let mut all = read_rows(&data, usize::MAX);
-    let k = ((all.len() as f64) * (1.0 - h)) as usize;
-    let val = all.split_off(k);
-    drop(all);
+    // D1130: standard = the standard held-out tail; a typed --data / --holdout only with --experiment NAME
+    let val = if crate::standard::experiment(args).is_none() {
+        match crate::standard::standard_split(args, &["--holdout", "--max-rows"]) {
+            Ok((_, _, v)) => v,
+            Err(e) => {
+                eprintln!("residual-check: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let data = arg(args, "--data").expect("--data X.tdat");
+        let h: f64 = arg(args, "--holdout").map_or(0.1, |v| v.parse().unwrap());
+        let mut all = read_rows(&data, usize::MAX);
+        let k = ((all.len() as f64) * (1.0 - h)) as usize;
+        all.split_off(k)
+    };
     let (mut l, mut ln, mut ws) = (0f64, 0f64, 0f64);
     for row in &val {
         let b = board(row);
@@ -193,6 +203,28 @@ pub fn residual_check(args: &[String]) -> ExitCode {
     }
     println!("residual-check: {mp}: {} held-out rows: val loss {:.6} (champion alone {:.6})", val.len(), l / ws, ln / ws);
     ExitCode::SUCCESS
+}
+
+/// --experiment only (D1130): the pre-D1130 data paths (val-split, typed holdout fraction, separate val file, --max-rows).
+fn experiment_split(args: &[String], data: &str, valp: &str, max_rows: usize) -> (Vec<Rec>, Vec<Rec>) {
+    let g = |k: &str, d: f64| arg(args, k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    if g("--val-split", 0.0) as usize == 1 {
+        // D1034: fit on the even rows of the val file, score on the odd rows (--data is ignored).
+        let all = read_rows(valp, 600_000);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for (i, r) in all.into_iter().enumerate() {
+            if i % 2 == 0 { a.push(r) } else { b.push(r) }
+        }
+        (a, b)
+    } else if g("--holdout", 0.0) > 0.0 {
+        // D1053: the last fraction of --data (game order) is held out (--val is ignored).
+        let mut all = read_rows(data, max_rows);
+        let k = ((all.len() as f64) * (1.0 - g("--holdout", 0.0))) as usize;
+        let v = all.split_off(k);
+        (all, v)
+    } else {
+        (read_rows(data, max_rows), read_rows(valp, 600_000))
+    }
 }
 
 fn board(r: &Rec) -> Board {
@@ -216,10 +248,14 @@ pub(crate) fn read_rows(path: &str, max: usize) -> Vec<Rec> {
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    let (Some(data), Some(valp)) = (arg(args, "--data"), arg(args, "--val")) else {
-        eprintln!("usage: lab hce-train --data X.tdat --val V.tdat [--set 4] [--threads 7] [--bs 16384] [--lr 2.0] [--max-rows N] [--out PREFIX]");
+    // D1130: standard = the WHOLE dataset + champion target from lab/STANDARD_TRAIN.txt; --data / --val / --max-rows /
+    // --holdout / --val-split / --val-target only with --experiment NAME (output under experiments/, stamped)
+    let exp = crate::standard::experiment(args);
+    let (data, valp) = (arg(args, "--data").unwrap_or_default(), arg(args, "--val").unwrap_or_default());
+    if exp.is_some() && (data.is_empty() || valp.is_empty()) {
+        eprintln!("usage (experiment): lab hce-train --experiment NAME --data X.tdat --val V.tdat [--holdout F] [--max-rows N] --out experiments/...");
         return ExitCode::from(2);
-    };
+    }
     let g = |k: &str, d: f64| arg(args, k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
     let set = g("--set", 4.0) as usize;
     let threads = g("--threads", 7.0) as usize;
@@ -296,29 +332,35 @@ pub fn run(args: &[String]) -> ExitCode {
         let _ = std::fs::write(format!("{out}.log"), log.as_bytes());
     };
 
-    let (train, val) = if g("--val-split", 0.0) as usize == 1 {
-        // D1034 held-out information test: the champion NNUE was trained on train_v10, so its errors there are not its
-        // errors on new positions; fit on the even rows of the val file, score on the odd rows (--data is ignored).
-        let all = read_rows(&valp, 600_000);
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        for (i, r) in all.into_iter().enumerate() {
-            if i % 2 == 0 { a.push(r) } else { b.push(r) }
+    if let Err(e) = crate::standard::check_out(&out, &exp) {
+        eprintln!("hce-train: {e}");
+        return ExitCode::from(2);
+    }
+    let std_run = exp.is_none();
+    let (train, val, stamp_line) = if std_run {
+        match crate::standard::standard_split(args, &["--max-rows", "--holdout", "--val-split", "--val-target", "--val"]) {
+            Ok((st, tr, va)) => {
+                let s = crate::standard::stamp(&exp, &st, tr.len(), va.len());
+                (tr, va, s)
+            }
+            Err(e) => {
+                eprintln!("hce-train: {e}");
+                return ExitCode::from(2);
+            }
         }
-        (a, b)
-    } else if g("--holdout", 0.0) > 0.0 {
-        // D1053: train and score on the SAME distribution: --data rows are in game order (games-tdat chains), so the last
-        // fraction is a set of whole games the fit never sees (--val is ignored). Needed because train rows labelled by
-        // today's main and val_v9's older labels differ systematically (the correction learned that gap, D1053).
-        let mut all = read_rows(&data, max_rows);
-        let k = ((all.len() as f64) * (1.0 - g("--holdout", 0.0))) as usize;
-        let v = all.split_off(k);
-        (all, v)
     } else {
-        (read_rows(&data, max_rows), read_rows(&valp, 600_000))
+        let (tr, va) = experiment_split(args, &data, &valp, max_rows);
+        let s = format!("EXPERIMENT {}: NOT the standard: {} train rows, {} val rows (data {data})", exp.clone().unwrap_or_default(), tr.len(), va.len());
+        (tr, va, s)
     };
+    say(stamp_line, &mut log);
     if let Some((s, o)) = SP.get() {
         say(format!("hce-train: stone pairs by distance (D1072), bands {} = {} D4-tied classes at offset {o}", s.bands, s.nclass), &mut log);
     }
+    let stamp_json = match &exp {
+        None => format!("\"standard\":true,\"experiment\":\"\",\"train_rows\":{},\"val_rows\":{}", train.len(), val.len()),
+        Some(n) => format!("\"standard\":false,\"experiment\":\"{n}\",\"train_rows\":{},\"val_rows\":{}", train.len(), val.len()),
+    };
     say(format!("hce-train: set {set}, {} buckets ({d_base} HCE weights + {} pair/mobility weights{}, plr {plr}), {} train rows, {} val rows, {threads} threads, bs {bs} ({:.0}s)", nbk(), d - d_base, pr.map_or(String::new(), |p| format!(" = {} pair classes + {}", p.nclass, crate::pairs::MOB)), train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
 
     // feature cost per eval, single thread (speed only, not the engine's incremental cost)
@@ -590,7 +632,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
     let js = format!(
-        "{{\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"win\":\"{}\",\"win_dims\":{wn_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+        "{{{stamp_json},\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"win\":\"{}\",\"win_dims\":{wn_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
         nbk(),
         pr.is_some(),
         pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),

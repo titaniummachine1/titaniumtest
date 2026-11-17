@@ -10,6 +10,7 @@ mod util;
 mod zattrain;
 mod extval;
 mod hcetrain;
+mod standard;
 mod seescreen;
 mod deepsee;
 mod radius;

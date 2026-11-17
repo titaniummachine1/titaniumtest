@@ -1,0 +1,12 @@
+# Lab training standard (user order D1130, 2026-11-17): DATA, not code. Every lab trainer (hce-train, zataxx-train,
+# residual-check) reads this file and refuses anything else unless the caller passes --experiment NAME (outputs then
+# must go under a folder named "experiments" and every log / model is stamped EXPERIMENT).
+# Change a line only by the user's order, with a DECISIONS row.
+#
+# data: the WHOLE dataset. rows: its exact row count (48-byte records); a different count = the file changed -> refuse.
+# holdout_rows: the last N rows (whole self-play games of main, the same rows as every screen since D1053) are the only
+# rows not trained on; they are the validation set. target: the champion recipe (hub targets.rs, D330/D427).
+data = C:/gitProjects/titanium-ataxx/data/nnue/packed/train_v11.tdat
+rows = 53004489
+holdout_rows = 1528091
+target = champion

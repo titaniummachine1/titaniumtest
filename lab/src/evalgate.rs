@@ -189,6 +189,21 @@ pub fn run(args: &[String]) -> ExitCode {
     let book0: usize = arg(args, "--book0").map_or(0, |v| v.parse().unwrap());
     let pairs: usize = arg(args, "--pairs").map_or(400, |v| v.parse().unwrap());
     let threads: usize = arg(args, "--threads").map_or(6, |v| v.parse().unwrap());
+    // D1130: a trained lab model plays only if it was trained by the standard (whole dataset, champion target);
+    // a non-standard model needs --experiment NAME, and the result line says EXPERIMENT
+    let exp = crate::standard::experiment(args);
+    for p in [&pa, &pb] {
+        if p.ends_with(".json") {
+            let s = std::fs::read_to_string(p).unwrap_or_default();
+            if !s.contains("\"standard\":true") && exp.is_none() {
+                eprintln!("eval-gate: {p} was not trained by the lab standard (whole dataset, champion target; no \"standard\":true stamp, D1130). Refusing; pass --experiment NAME to play it anyway.");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(n) = &exp {
+        println!("eval-gate: EXPERIMENT {n}: at least one model may be non-standard; this is NOT a standard result");
+    }
     let na = Ev::load(&pa);
     let nb = Ev::load(&pb);
     // sanity: eval is from the side to move (a side with far more stones must score higher)

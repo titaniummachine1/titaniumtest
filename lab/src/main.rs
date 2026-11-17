@@ -22,6 +22,7 @@ mod spairs;
 mod win;
 mod archloc;
 mod netscale;
+mod standard;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
