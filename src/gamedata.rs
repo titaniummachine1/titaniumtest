@@ -392,6 +392,21 @@ pub fn run_append(args: &[String]) -> ExitCode {
     };
     let strip = |s: &str| s.trim_end_matches(".tdat").to_string();
     let (base, add, out) = (strip(&base), strip(&add), strip(&out));
+    // D1146: --before-tail N inserts the new rows BEFORE the last N base rows (the held-out validation games of the lab
+    // standard stay the last N rows, so every validation number stays comparable); 0 = append at the end (old behaviour)
+    let tail = crate::flag_u64(args, "--before-tail").unwrap_or(0);
+    if tail > 0 {
+        return match insert_before_tail(&base, &add, &out, tail) {
+            Ok((nb, na)) => {
+                println!("data append: {out}.tdat = {} base rows + {na} new rows + the last {tail} base rows (held-out tail kept last) = {} rows (base and add files untouched)", nb - tail, nb + na);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("data append: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let r = || -> Result<(u64, u64), String> {
         if out == base || out == add {
             return Err("--out must be a new stem".into());
@@ -464,6 +479,88 @@ pub fn run_append(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// D1146: `--before-tail N` form of `ti data append`: base rows [0, nb - N), then the added rows, then the last N base
+/// rows. .kata / .aux get zero records for the added rows at the same place; chains are shifted, a base chain that
+/// crosses the cut is split in two (its rows are unchanged, only the insertion point separates them). Every output size
+/// is checked; nothing is written over an existing file.
+fn insert_before_tail(base: &str, add: &str, out: &str, tail: u64) -> Result<(u64, u64), String> {
+    if out == base || out == add {
+        return Err("--out must be a new stem".into());
+    }
+    if std::path::Path::new(&format!("{out}.tdat")).exists() {
+        return Err(format!("{out}.tdat already exists; refusing to overwrite"));
+    }
+    let len = |p: &str| fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{p}: {e}"));
+    let (nb, na) = (len(&format!("{base}.tdat"))? / REC as u64, len(&format!("{add}.tdat"))? / REC as u64);
+    if tail >= nb {
+        return Err(format!("--before-tail {tail} >= base rows {nb}"));
+    }
+    let cut = nb - tail;
+    for (ext, rec) in [("tdat", REC as u64), ("kata", 16u64), ("aux", 12u64)] {
+        let (src, dst) = (format!("{base}.{ext}"), format!("{out}.{ext}"));
+        if !std::path::Path::new(&src).exists() {
+            if ext == "tdat" {
+                return Err(format!("{src} missing"));
+            }
+            continue;
+        }
+        if len(&src)? != nb * rec {
+            return Err(format!("{src}: {} records for {nb} rows (refusing to insert into a short sidecar)", len(&src)? / rec));
+        }
+        let mut r = BufReader::with_capacity(1 << 22, File::open(&src).map_err(|e| format!("{src}: {e}"))?);
+        let mut w = std::io::BufWriter::with_capacity(1 << 22, File::create(&dst).map_err(|e| format!("{dst}: {e}"))?);
+        std::io::copy(&mut (&mut r).take(cut * rec), &mut w).map_err(|e| format!("{dst}: {e}"))?;
+        if ext == "tdat" {
+            let mut a = BufReader::with_capacity(1 << 22, File::open(format!("{add}.tdat")).map_err(|e| e.to_string())?);
+            std::io::copy(&mut a, &mut w).map_err(|e| format!("{dst}: {e}"))?;
+        } else {
+            let zeros = vec![0u8; 1 << 20];
+            let mut left = na * rec;
+            while left > 0 {
+                let n = left.min(zeros.len() as u64) as usize;
+                w.write_all(&zeros[..n]).map_err(|e| format!("{dst}: {e}"))?;
+                left -= n as u64;
+            }
+        }
+        std::io::copy(&mut r, &mut w).map_err(|e| format!("{dst}: {e}"))?;
+        w.flush().map_err(|e| e.to_string())?;
+        drop(w);
+        if len(&dst)? != (nb + na) * rec {
+            return Err(format!("{dst}: {} bytes, expected {}", len(&dst)?, (nb + na) * rec));
+        }
+    }
+    let mut chains: Vec<Chain> = Vec::new();
+    if std::path::Path::new(&format!("{base}.chains")).exists() {
+        for c in read_chains(&format!("{base}.chains"))?.1 {
+            let (s, e) = (c.start as u64, c.start as u64 + c.len as u64);
+            if e <= cut {
+                chains.push(c);
+            } else if s >= cut {
+                chains.push(Chain { start: (s + na) as u32, len: c.len, conv: c.conv });
+            } else {
+                chains.push(Chain { start: c.start, len: (cut - s) as u16, conv: c.conv });
+                chains.push(Chain { start: (cut + na) as u32, len: (e - cut) as u16, conv: c.conv });
+            }
+        }
+    }
+    if std::path::Path::new(&format!("{add}.chains")).exists() {
+        for c in read_chains(&format!("{add}.chains"))?.1 {
+            chains.push(Chain { start: (c.start as u64 + cut) as u32, len: c.len, conv: c.conv });
+        }
+    }
+    chains.sort_by_key(|c| c.start);
+    write_chains(&format!("{out}.chains"), nb + na, &chains)?;
+    let manifest = format!(
+        "{{\"src\":{},\"rows\":{},\"rec\":{REC},\"kata_rec\":16,\"aux_rec\":12,\"holdout_tail_rows\":{tail}}}",
+        crate::json_str(&format!(
+            "{base}.tdat rows [0, {cut}) + {add}.tdat ({na} rows inserted by ti data append --before-tail {tail}; kata/aux zero-padded for them) + {base}.tdat rows [{cut}, {nb}) = the held-out tail, kept last"
+        )),
+        nb + na
+    );
+    fs::write(format!("{out}.manifest.json"), manifest).map_err(|e| e.to_string())?;
+    Ok((nb, na))
 }
 
 /// `ti data games-tdat`: replay a `.tgam` and write trainer rows. This is the
