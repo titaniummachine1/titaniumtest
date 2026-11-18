@@ -187,6 +187,236 @@ impl Jat3Net {
     }
 }
 
+/// one size option: time per eval (index extraction + accumulate + SCReLU + output), f32 and i16 tables
+fn bench_f32<const W: usize>(rows: usize, map: Option<&[u32]>, pos: &[(u64, u64)], tab: &[[u16; 8]; 8]) -> (f64, f64) {
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 40) as f32 / (1u64 << 24) as f32 * 0.02 - 0.01
+    };
+    let t: Vec<f32> = (0..rows * W).map(|_| rnd()).collect();
+    let fb: Vec<f32> = (0..W).map(|_| 0.5 + rnd()).collect();
+    let ow: Vec<f32> = (0..W).map(|_| rnd()).collect();
+    let mut ix = [0u32; NW];
+    let mut sink = 0f32;
+    let t0 = std::time::Instant::now();
+    for &(me, op) in pos {
+        jidx(me, op, tab, &mut ix);
+        let mut h = [0f32; W];
+        h.copy_from_slice(&fb);
+        for &i in &ix {
+            let r = map.map_or(i, |m| m[i as usize]) as usize;
+            let row = &t[r * W..r * W + W];
+            for k in 0..W {
+                h[k] += row[k];
+            }
+        }
+        let mut o = 0f32;
+        for k in 0..W {
+            let a = h[k].clamp(0.0, 1.0);
+            o += a * a * ow[k];
+        }
+        sink += o;
+    }
+    let ns = t0.elapsed().as_nanos() as f64 / pos.len() as f64;
+    std::hint::black_box(sink);
+    (ns, (rows * W * 4) as f64 / 1e6)
+}
+
+fn bench_i16<const W: usize>(rows: usize, map: Option<&[u32]>, pos: &[(u64, u64)], tab: &[[u16; 8]; 8]) -> (f64, f64) {
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 50) as i32 - 8192) as i16 / 64
+    };
+    let t: Vec<i16> = (0..rows * W).map(|_| rnd()).collect();
+    let fb: Vec<i16> = (0..W).map(|_| 128 + rnd()).collect();
+    let ow: Vec<i16> = (0..W).map(|_| rnd()).collect();
+    let mut ix = [0u32; NW];
+    let mut sink = 0i64;
+    let t0 = std::time::Instant::now();
+    for &(me, op) in pos {
+        jidx(me, op, tab, &mut ix);
+        let mut h = [0i16; W];
+        h.copy_from_slice(&fb);
+        for &i in &ix {
+            let r = map.map_or(i, |m| m[i as usize]) as usize;
+            let row = &t[r * W..r * W + W];
+            for k in 0..W {
+                h[k] = h[k].wrapping_add(row[k]);
+            }
+        }
+        let mut o = 0i32;
+        for k in 0..W {
+            let a = h[k].clamp(0, 255) as i32;
+            o = o.wrapping_add(a * a * ow[k] as i32);
+        }
+        sink += o as i64;
+    }
+    let ns = t0.elapsed().as_nanos() as f64 / pos.len() as f64;
+    std::hint::black_box(sink);
+    (ns, (rows * W * 2) as f64 / 1e6)
+}
+
+/// `lab jat3-bench [--n 200000]` (D1142): ns per eval (single thread, lab code, full refresh) of each 3x3-network size
+/// option on real positions, next to the champion's eval on the same positions. Weights are random: only the arithmetic
+/// and the memory traffic are timed, not the quality.
+pub fn bench(args: &[String]) -> ExitCode {
+    let n = arg(args, "--n").and_then(|v| v.parse().ok()).unwrap_or(200_000usize);
+    let val = read_rows("C:/gitProjects/titanium-ataxx/data/nnue/packed/val_v9_clean.tdat", n);
+    let pos: Vec<(u64, u64)> = val.iter().map(own_opp).collect();
+    let tab = row_tab();
+    // tied map: my index (window * NC + code, digit of cell (dr, dc) = 3^(3 dr + dc)) -> D4 class of win.rs
+    let wn = crate::win::Win::new("3");
+    let ct = wn.class_table();
+    let mut map = vec![0u32; NI];
+    for wi in 0..NW {
+        for code in 0..NC {
+            let mut x = code;
+            let mut wc = 0usize;
+            let mut d = [0usize; 9];
+            for v in d.iter_mut() {
+                *v = x % 3;
+                x /= 3;
+            }
+            for &di in &d {
+                wc = wc * 3 + di;
+            }
+            map[wi * NC + code] = ct[wi * NC + wc];
+        }
+    }
+    let ntied = wn.dims();
+    let net = Nnue::bundled();
+    let boards: Vec<Board> = pos.iter().map(|&(a, b)| Board::from_occ(a, b, 0, 0)).collect();
+    let mut sink = 0i64;
+    let t0 = std::time::Instant::now();
+    for b in &boards {
+        sink += net.eval(b, 0) as i64;
+    }
+    let champ = t0.elapsed().as_nanos() as f64 / boards.len() as f64;
+    std::hint::black_box(sink);
+    println!("jat3-bench: {} positions (val_v9_clean), single thread, full refresh, lab code; tied classes {ntied}", pos.len());
+    println!("champion NNUE eval (engine code, full refresh): {champ:.0} ns/eval");
+    println!("{:<38} {:>10} {:>12} {:>12}", "option", "weights", "f32 ns|MB", "i16 ns|MB");
+    let rows: [(&str, usize, Option<&[u32]>, usize); 4] = [
+        ("untied 25x19683 rows, 256 hidden (ran)", NI, None, 256),
+        ("1: untied, 128 hidden (Jataxx size)", NI, None, 128),
+        ("2: D4-tied rows, 256 hidden", ntied, Some(&map), 256),
+        ("3: D4-tied rows, 128 hidden", ntied, Some(&map), 128),
+    ];
+    for (name, r, m, h) in rows {
+        let (f, i) = if h == 256 { (bench_f32::<256>(r, m, &pos, &tab), bench_i16::<256>(r, m, &pos, &tab)) } else { (bench_f32::<128>(r, m, &pos, &tab), bench_i16::<128>(r, m, &pos, &tab)) };
+        println!("{name:<38} {:>10} {:>6.0} {:>5.0} {:>6.0} {:>5.0}", r * h + 2 * h + 1, f.0, f.1, i.0, i.1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lab jat3-compare --model X_jat3.bin` (D1144): on the standard held-out rows, by empties band: weighted loss of the
+/// 3x3 net vs the champion, the best logit blend of both (how much each knows that the other does not), the correlation
+/// of their errors, and how often their sibling best moves differ.
+pub fn compare(args: &[String]) -> ExitCode {
+    let Some(mp) = arg(args, "--model") else {
+        eprintln!("usage: lab jat3-compare --model X_jat3.bin");
+        return ExitCode::from(2);
+    };
+    let (st, _tr, val) = match crate::standard::standard_split(args, &["--max-rows", "--val", "--data", "--holdout"]) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("jat3-compare: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    drop(_tr);
+    let j = Jat3Net::load(&mp.replace("_jat3.bin", "_jat3.json"));
+    let net = Nnue::bundled();
+    println!("{}", crate::standard::stamp(&None, &st, 0, val.len()));
+    // per row: (band, weight, target, champion logit, jat3 logit)
+    let bands = [(0u32, 6u32), (7, 12), (13, 24), (25, 36), (37, 49)];
+    let rows: Vec<(usize, f32, f32, f32, f32)> = val
+        .iter()
+        .map(|r| {
+            let (me, op) = own_opp(r);
+            let b = Board::from_occ(me, op, 0, 0);
+            let e = b.empty().count_ones();
+            let bi = bands.iter().position(|&(lo, hi)| e >= lo && e <= hi).unwrap_or(4);
+            (bi, r.wsum.max(0.0), target(r, false), net.eval(&b, 0) as f32 / 400.0, j.eval(&b) as f32 / 400.0)
+        })
+        .collect();
+    let loss = |sel: &dyn Fn(usize) -> bool, a: f32| -> (f64, f64) {
+        let (mut l, mut ws) = (0f64, 0f64);
+        for &(bi, w, t, yc, yj) in &rows {
+            if sel(bi) {
+                let p = sig((1.0 - a) * yc + a * yj);
+                l += w as f64 * ((p - t).abs() as f64).powf(2.5);
+                ws += w as f64;
+            }
+        }
+        (l / ws.max(1e-9), ws)
+    };
+    println!("{:<12} {:>9} {:>10} {:>10} {:>9} {:>16} {:>9}", "empties", "rows", "champion", "3x3 net", "3x3 vs C", "best blend (a)", "err corr");
+    for bi in 0..=bands.len() {
+        let sel = |x: usize| bi == bands.len() || x == bi;
+        let name = if bi == bands.len() { "ALL".to_string() } else { format!("{}-{}", bands[bi].0, bands[bi].1) };
+        let n = rows.iter().filter(|r| sel(r.0)).count();
+        let (lc, _) = loss(&sel, 0.0);
+        let (lj, _) = loss(&sel, 1.0);
+        let mut bb = (lc, 0.0f32);
+        for k in 1..=20 {
+            let a = k as f32 * 0.05;
+            let (l, _) = loss(&sel, a);
+            if l < bb.0 {
+                bb = (l, a);
+            }
+        }
+        // correlation of the two errors (sigmoid - target), weighted
+        let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut sw) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+        for &(b2, w, t, yc, yj) in &rows {
+            if sel(b2) {
+                let (x, y, w) = ((sig(yc) - t) as f64, (sig(yj) - t) as f64, w as f64);
+                sx += w * x;
+                sy += w * y;
+                sxx += w * x * x;
+                syy += w * y * y;
+                sxy += w * x * y;
+                sw += w;
+            }
+        }
+        let cov = sxy / sw - (sx / sw) * (sy / sw);
+        let corr = cov / ((sxx / sw - (sx / sw).powi(2)).sqrt() * (syy / sw - (sy / sw).powi(2)).sqrt());
+        println!("{name:<12} {n:>9} {lc:>10.6} {lj:>10.6} {:>8.2}% {:>10.6} ({:.2}) {corr:>9.3}", 100.0 * (lj / lc - 1.0), bb.0, bb.1);
+    }
+    // sibling best-move disagreement (5,000 held-out positions)
+    let (mut dif, mut n) = (0f64, 0f64);
+    let mut ml = MoveList::new();
+    for r in val.iter().step_by((val.len() / 5000).max(1)).take(5000) {
+        let (me, op) = own_opp(r);
+        let b = Board::from_occ(me, op, 0, 0);
+        b.legal_moves_dedup_into(&mut ml);
+        if ml.len() < 2 {
+            continue;
+        }
+        let (mut a, mut c) = ((i32::MIN, 0usize), (i32::MIN, 0usize));
+        for (i, mv) in ml.iter().enumerate() {
+            let ch = b.make(mv);
+            let (yn, yj) = (-net.eval(&ch, 0), -j.eval(&ch));
+            if yn > a.0 {
+                a = (yn, i);
+            }
+            if yj > c.0 {
+                c = (yj, i);
+            }
+        }
+        dif += (a.1 != c.1) as u8 as f64;
+        n += 1.0;
+    }
+    println!("sibling best move differs between the two nets in {:.2}% of {} held-out positions", 100.0 * dif / n, n);
+    ExitCode::SUCCESS
+}
+
 fn save(out: &str, w: &[f32]) {
     let mut bytes = Vec::with_capacity(8 + w.len() * 4);
     bytes.extend_from_slice(b"JAT3");

@@ -41,6 +41,8 @@ fn main() -> ExitCode {
         Some("zataxx-val") => extval::zataxx(&args[1..]),
         Some("zataxx-train") => zattrain::run(&args[1..]),
         Some("jat3-train") => jat3::run(&args[1..]),
+        Some("jat3-bench") => jat3::bench(&args[1..]),
+        Some("jat3-compare") => jat3::compare(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
         Some("node-cost") => nodecost::run(&args[1..]),
         Some("incr-stats") => nodecost::incr_stats(&args[1..]),

@@ -62,6 +62,11 @@ impl Win {
         Win { sizes, nclass, spec: spec.to_string() }
     }
 
+    /// D1142: the class table of the first window size (window * 3^(k*k) + code, row-major digits, first cell most significant)
+    pub(crate) fn class_table(&self) -> &[u32] {
+        &self.sizes[0].2
+    }
+
     pub(crate) fn dims(&self) -> usize {
         self.nclass
     }
