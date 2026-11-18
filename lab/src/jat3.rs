@@ -56,7 +56,7 @@ impl Lay {
 }
 
 /// base-3 value of one 3-cell window row: TAB[me 3 bits][opp 3 bits]
-fn row_tab() -> [[u16; 8]; 8] {
+pub(crate) fn row_tab() -> [[u16; 8]; 8] {
     let mut t = [[0u16; 8]; 8];
     for m in 0..8usize {
         for o in 0..8usize {
@@ -369,9 +369,9 @@ fn shrink_refit(net: &Jat3Net, h2: usize, cal: &[(u64, u64)]) -> (Vec<f32>, Stri
 
 /// a trained jat3 net for eval-gate (`*_jat3.json` -> its `_jat3.bin`)
 pub struct Jat3Net {
-    w: Vec<f32>,
+    pub(crate) w: Vec<f32>,
     t: [[u16; 8]; 8],
-    ly: Lay,
+    pub(crate) ly: Lay,
 }
 
 impl Jat3Net {
