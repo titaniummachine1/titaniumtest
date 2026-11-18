@@ -3,12 +3,13 @@
 # must go under a folder named "experiments" and every log / model is stamped EXPERIMENT).
 # Change a line only by the user's order, with a DECISIONS row.
 # 2026-11-18 01:59 D1148 (user order D1146 'merge the new games'): train_v11 -> train_v12 (+1,398,256 rows of 13,817 self-play games inserted BEFORE the held-out tail; the last 1,528,091 rows are byte-identical to train_v11's tail).
+# 2026-11-18 10:33 D1172 (user order D1171 'merge games to dataset'): train_v12 -> train_v13 (+1,806,343 rows of 17,999 self-play games pc_run15_5k batches 1-9 inserted BEFORE the held-out tail; tail byte-identical, sha 008613886AED23AD).
 #
 # data: the WHOLE dataset. rows: its exact row count (48-byte records); a different count = the file changed -> refuse.
 # holdout_rows: the last N rows (whole self-play games of main, the same rows as every screen since D1053) are the only
 # rows not trained on; they are the validation set. target: the champion recipe (hub targets.rs, D330/D427).
-data = C:/gitProjects/titanium-ataxx/data/nnue/packed/train_v12.tdat
-rows = 54402745
+data = C:/gitProjects/titanium-ataxx/data/nnue/packed/train_v13.tdat
+rows = 56209088
 holdout_rows = 1528091
 target = champion
 
