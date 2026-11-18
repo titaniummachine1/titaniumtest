@@ -566,6 +566,9 @@ pub fn run_dag(args: &[String]) -> ExitCode {
         "bench" => run_bench(&db, rest),
         "probe" => run_probe(&db, rest),
         "seq-stat" => run_seq_stat(&db),
+        // D1174: after a killed writer (interrupted MVCC checkpoint, read-only opens refuse): one read-write open
+        // replays the log, writes no rows, then the usual counts
+        "seq-recover" => SeqDag::open(&db).and_then(|d| d.connect().map(|_| ())).and_then(|_| run_seq_stat(&db)),
         "seq-verify" => run_seq_verify(&db, rest),
         "tbst-check" => run_tbst_check(&db, rest),
         "gate-import" => run_gate_import(&db, rest),
