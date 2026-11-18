@@ -561,6 +561,8 @@ impl BatchGradients {
 }
 
 pub struct SparseAdamW {
+    /// D1159: Some = MuonAdamW (Muon on the l1 / l2 bucket blocks, AdamW on the rest)
+    pub muon: Option<Muon>,
     step: u32,
     m_ft: Vec<f32>,
     v_ft: Vec<f32>,
@@ -582,9 +584,139 @@ pub struct SparseAdamW {
     v_out_b: Vec<f32>,
 }
 
+/// D1159 MuonAdamW (user: "AdamW alone loses Elo, AdamW + Muon gains it", D1037): Muon (momentum, Nesterov, then a
+/// quintic Newton-Schulz orthogonalisation of the update, Keller Jordan 2024) on the DENSE hidden matrices only: every
+/// phase bucket's l1 block (l1 x din) and l2 block (l2 x l1); AdamW keeps everything else (sparse FT rows, psqt, biases,
+/// output layer), the standard MuonAdamW split. Update W <- W (1 - lr wd) - lr * max(1, rows/cols)^0.5 * NS5(g + mu m).
+pub struct Muon {
+    pub lr: f32,
+    pub mu: f32,
+    m_l1: Vec<f32>,
+    m_l2: Vec<f32>,
+}
+
+/// Quintic Newton-Schulz iteration (5 steps, coefficients 3.4445 / -4.7750 / 2.0315): an approximately orthogonal
+/// matrix with the singular vectors of `g` (r x c, row-major); works on the wide orientation.
+pub fn newton_schulz5(g: &[f32], r: usize, c: usize) -> Vec<f32> {
+    let (tr, m, n) = if r > c { (true, c, r) } else { (false, r, c) };
+    let mut x = vec![0f64; m * n];
+    for i in 0..r {
+        for j in 0..c {
+            let v = g[i * c + j] as f64;
+            if tr { x[j * n + i] = v } else { x[i * n + j] = v }
+        }
+    }
+    let nrm = x.iter().map(|v| v * v).sum::<f64>().sqrt() + 1e-7;
+    x.iter_mut().for_each(|v| *v /= nrm);
+    let (a, b, cc) = (3.4445f64, -4.7750f64, 2.0315f64);
+    let mut am = vec![0f64; m * m];
+    let mut bm = vec![0f64; m * m];
+    let mut nx = vec![0f64; m * n];
+    for _ in 0..5 {
+        for i in 0..m {
+            for k in 0..m {
+                let mut s = 0f64;
+                for j in 0..n {
+                    s += x[i * n + j] * x[k * n + j];
+                }
+                am[i * m + k] = s;
+            }
+        }
+        for i in 0..m {
+            for k in 0..m {
+                let mut s = 0f64;
+                for j in 0..m {
+                    s += am[i * m + j] * am[j * m + k];
+                }
+                bm[i * m + k] = b * am[i * m + k] + cc * s;
+            }
+        }
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0f64;
+                for k in 0..m {
+                    s += bm[i * m + k] * x[k * n + j];
+                }
+                nx[i * n + j] = a * x[i * n + j] + s;
+            }
+        }
+        std::mem::swap(&mut x, &mut nx);
+    }
+    let mut out = vec![0f32; r * c];
+    for i in 0..r {
+        for j in 0..c {
+            out[i * c + j] = if tr { x[j * n + i] } else { x[i * n + j] } as f32;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod muon_tests {
+    use super::newton_schulz5;
+    /// NS5 must return a matrix whose rows are close to orthonormal (singular values ~0.7..1.2 for the quintic
+    /// coefficients), for the wide (16 x 512, like an l1 block) and the tall (32 x 16, like an l2 block) orientation.
+    #[test]
+    fn ns5_orthogonalises() {
+        for &(r, c) in &[(16usize, 512usize), (32, 16)] {
+            let mut s = 0x2545_F491_4F6C_DD1Du64;
+            let g: Vec<f32> = (0..r * c)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let o = newton_schulz5(&g, r, c);
+            let (m, n, tr) = if r > c { (c, r, true) } else { (r, c, false) };
+            let at = |i: usize, j: usize| if tr { o[j * c + i] } else { o[i * c + j] };
+            for i in 0..m {
+                for k in 0..m {
+                    let d: f32 = (0..n).map(|j| at(i, j) * at(k, j)).sum();
+                    if i == k {
+                        assert!(d > 0.4 && d < 1.5, "{r}x{c}: diag {i} = {d}");
+                    } else {
+                        assert!(d.abs() < 0.3, "{r}x{c}: off-diag ({i},{k}) = {d}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Muon {
+    pub fn new(net: &TrainableNet, lr: f32, mu: f32) -> Self {
+        Muon { lr, mu, m_l1: vec![0.0; net.l1_w.len()], m_l2: vec![0.0; net.l2_w.len()] }
+    }
+    /// one Muon step on every bucket block of `w` (blocks of rows x cols, contiguous), gradient `g` (sum, scaled by inv_n)
+    fn step_blocks(w: &mut [f32], m: &mut [f32], g: &[f32], rows: usize, cols: usize, inv_n: f32, lr: f32, mu: f32, wd: f32) {
+        let blk = rows * cols;
+        let scale = ((rows as f32) / (cols as f32)).max(1.0).sqrt();
+        for b in 0..w.len() / blk {
+            let r = b * blk..(b + 1) * blk;
+            if g[r.clone()].iter().all(|&x| x == 0.0) && m[r.clone()].iter().all(|&x| x == 0.0) {
+                continue; // a bucket no sample reached and no momentum left: nothing to do
+            }
+            let mut u = vec![0f32; blk];
+            for i in 0..blk {
+                let gi = g[r.start + i] * inv_n;
+                m[r.start + i] = mu * m[r.start + i] + gi;
+                u[i] = gi + mu * m[r.start + i]; // Nesterov
+            }
+            let o = newton_schulz5(&u, rows, cols);
+            for i in 0..blk {
+                let wi = &mut w[r.start + i];
+                *wi = *wi * (1.0 - lr * wd) - lr * scale * o[i];
+            }
+        }
+    }
+}
+
 impl SparseAdamW {
     pub fn new(net: &TrainableNet) -> Self {
         SparseAdamW {
+            muon: None,
             step: 0,
             m_ft: vec![0.0; net.ft.len()],
             v_ft: vec![0.0; net.ft.len()],
@@ -641,9 +773,16 @@ impl SparseAdamW {
         };
 
         update_slice(&mut net.ftb, &mut self.m_ftb, &mut self.v_ftb, &grad.ftb, true);
-        update_slice(&mut net.l1_w, &mut self.m_l1_w, &mut self.v_l1_w, &grad.l1_w, false);
+        if let Some(mu) = self.muon.as_mut() {
+            // D1159 MuonAdamW: the dense hidden matrices by Muon, one block per phase bucket
+            let din = net.l1_w.len() / (net.buckets * net.l1).max(1);
+            Muon::step_blocks(&mut net.l1_w, &mut mu.m_l1, &grad.l1_w, net.l1, din, inv_n, mu.lr, mu.mu, wd);
+            Muon::step_blocks(&mut net.l2_w, &mut mu.m_l2, &grad.l2_w, net.l2, net.l1, inv_n, mu.lr, mu.mu, wd);
+        } else {
+            update_slice(&mut net.l1_w, &mut self.m_l1_w, &mut self.v_l1_w, &grad.l1_w, false);
+            update_slice(&mut net.l2_w, &mut self.m_l2_w, &mut self.v_l2_w, &grad.l2_w, false);
+        }
         update_slice(&mut net.l1_b, &mut self.m_l1_b, &mut self.v_l1_b, &grad.l1_b, false);
-        update_slice(&mut net.l2_w, &mut self.m_l2_w, &mut self.v_l2_w, &grad.l2_w, false);
         update_slice(&mut net.l2_b, &mut self.m_l2_b, &mut self.v_l2_b, &grad.l2_b, false);
         update_slice(&mut net.out_w, &mut self.m_out_w, &mut self.v_out_w, &grad.out_w, false);
         update_slice(&mut net.out_b, &mut self.m_out_b, &mut self.v_out_b, &grad.out_b, false);
