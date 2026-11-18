@@ -84,7 +84,7 @@ fn report(name: &str, rows: &[Rec], cp: &[f32]) -> String {
 
 /// Zataxx (zzzzz151) nn.rs, bit-exact: 36 2x2 windows (3^4 states each, 2916 inputs) -> 256 i16 -> SCReLU -> 1, QA 255,
 /// QB 64, SCALE 400; i16 accumulator wraps like the original release build. Weights read from its own net6.bin.
-pub(crate) struct Zat {
+pub struct Zat {
     pub(crate) fw: Vec<i16>,
     pub(crate) fb: Vec<i16>,
     pub(crate) ow: Vec<i16>,

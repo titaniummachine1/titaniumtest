@@ -29,18 +29,28 @@ pub enum Ev {
     Res(Box<crate::hcetrain::Residual>),
     /// D1137: 3x3 tuple network (lab jat3-train `*_jat3.json`)
     Jat(Box<crate::jat3::Jat3Net>),
+    /// D1237: Zataxx's own net (net6.bin or a lab zataxx-train `*_net.bin`), bit-exact port of its nn.rs (extval::Zat,
+    /// parity 8/8 with zataxx.exe 'eval', D995); score in Zataxx's own cp units (move choice only needs the order)
+    Zat(Box<crate::extval::Zat>),
 }
 
 impl Ev {
     /// unrounded cp from the side to move (D1196, lab residual-pair on any two evaluators)
     pub(crate) fn eval_f(&self, b: &Board) -> f32 {
-        match self { Ev::Net(n) => n.eval(b, 0) as f32, Ev::Res(r) => r.eval_f(b), Ev::Jat(j) => j.eval_f(b) }
+        match self {
+            Ev::Net(n) => n.eval(b, 0) as f32,
+            Ev::Res(r) => r.eval_f(b),
+            Ev::Jat(j) => j.eval_f(b),
+            Ev::Zat(z) => z.eval(b.me(), b.opp()) as f32,
+        }
     }
     pub(crate) fn is_res(&self) -> bool {
         matches!(self, Ev::Res(_))
     }
     pub(crate) fn load(p: &str) -> Ev {
-        if p.ends_with("_jat3.json") {
+        if p.ends_with("net6.bin") || p.ends_with("_net.bin") {
+            Ev::Zat(Box::new(crate::extval::Zat::load(p)))
+        } else if p.ends_with("_jat3.json") {
             Ev::Jat(Box::new(crate::jat3::Jat3Net::load(p)))
         } else if p.ends_with(".json") {
             Ev::Res(Box::new(crate::hcetrain::Residual::load(p)))
@@ -49,7 +59,12 @@ impl Ev {
         }
     }
     fn eval(&self, b: &Board) -> i32 {
-        match self { Ev::Net(n) => n.eval(b, 0), Ev::Res(r) => r.eval(b), Ev::Jat(j) => j.eval(b) }
+        match self {
+            Ev::Net(n) => n.eval(b, 0),
+            Ev::Res(r) => r.eval(b),
+            Ev::Jat(j) => j.eval(b),
+            Ev::Zat(z) => z.eval(b.me(), b.opp()),
+        }
     }
 }
 
