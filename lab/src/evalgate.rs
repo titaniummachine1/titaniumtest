@@ -32,7 +32,14 @@ pub enum Ev {
 }
 
 impl Ev {
-    fn load(p: &str) -> Ev {
+    /// unrounded cp from the side to move (D1196, lab residual-pair on any two evaluators)
+    pub(crate) fn eval_f(&self, b: &Board) -> f32 {
+        match self { Ev::Net(n) => n.eval(b, 0) as f32, Ev::Res(r) => r.eval_f(b), Ev::Jat(j) => j.eval_f(b) }
+    }
+    pub(crate) fn is_res(&self) -> bool {
+        matches!(self, Ev::Res(_))
+    }
+    pub(crate) fn load(p: &str) -> Ev {
         if p.ends_with("_jat3.json") {
             Ev::Jat(Box::new(crate::jat3::Jat3Net::load(p)))
         } else if p.ends_with(".json") {

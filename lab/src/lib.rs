@@ -10,6 +10,8 @@ mod util;
 mod zattrain;
 mod extval;
 mod hcetrain;
+mod evalgate;
+mod jat3;
 mod standard;
 mod seescreen;
 mod deepsee;

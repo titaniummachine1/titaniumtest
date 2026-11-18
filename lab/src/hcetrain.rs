@@ -216,10 +216,11 @@ pub fn residual_pair(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let blk: usize = arg(args, "--block").map_or(2000, |v| v.parse().unwrap());
-    let ra = Residual::load(&pa);
+    // D1196: any evaluator: a net (.tnn), a residual model (*_weights.json) or a 3x3 net (*_jat3.json)
+    let ra = crate::evalgate::Ev::load(&pa);
     let nb_a = nbk();
-    let rb = Residual::load(&pb);
-    if nbk() != nb_a {
+    let rb = crate::evalgate::Ev::load(&pb);
+    if ra.is_res() && rb.is_res() && nbk() != nb_a {
         eprintln!("residual-pair: bucket counts differ ({nb_a} vs {})", nbk());
         return ExitCode::from(2);
     }

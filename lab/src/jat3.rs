@@ -389,10 +389,14 @@ impl Jat3Net {
         Jat3Net { w, t: row_tab(), ly }
     }
     pub fn eval(&self, b: &Board) -> i32 {
+        self.eval_f(b).round().clamp(-30000.0, 30000.0) as i32
+    }
+    /// unrounded cp (D1196: paired scoring uses the same value training scored)
+    pub fn eval_f(&self, b: &Board) -> f32 {
         let mut ix = [0u32; NW];
         jidx(b.me(), b.opp(), &self.t, &mut ix);
         let mut h = [0f32; MAXH];
-        (fwd(&self.w, &ix, &mut h, self.ly) * 400.0).round().clamp(-30000.0, 30000.0) as i32
+        fwd(&self.w, &ix, &mut h, self.ly) * 400.0
     }
 }
 
