@@ -835,6 +835,193 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
     }
 }
 
+/// Proof value of a row for its own side to move: 1 / 0 for a proven win / loss (the trainer's threshold), 0.5 for an
+/// exact proven draw (hunt proof kinds 1, 2, 5 with score 0), else None.
+fn proof_value(r: &Rec) -> Option<f32> {
+    let t = crate::targets::target_of(r);
+    if t.proven >= 0 {
+        Some(t.proven as f32)
+    } else if matches!(r.proof_kind, 1 | 2 | 5) && r.cp == 0.0 {
+        Some(0.5)
+    } else {
+        None
+    }
+}
+
+/// Position key for pooling: side to move's stones, opponent's stones, minimum over the 8 board symmetries.
+fn pool_key(r: &Rec) -> (u64, u64) {
+    let (m, o) = if r.stm == 0 { (r.occ0, r.occ1) } else { (r.occ1, r.occ0) };
+    (0..8).map(|k| (crate::mapper::transform_bb(m, k), crate::mapper::transform_bb(o, k))).min().unwrap()
+}
+
+/// `ti data proof-wdl` (D1246, user design): every non-proven row's outcome becomes `w * proof + (1 - w) * wdl` with
+/// `w = decay^n`, `n` = plies to the first proven row later in its game run (the proof seen from the row's side: flipped
+/// when `n` is odd), and `wdl` = the pooled result of all non-proven training rows with the same position (D4 + side to
+/// move; a row counts `wsum^2` games when wsum > 1, as in the proof queue), or the row's own result when the position
+/// occurs once. Rows with no later proof keep `w = 0` (only the pooling applies). Proven rows are copied unchanged. The
+/// last `--preserve-tail` rows (held-out validation) are copied unchanged, never feed the pool and never lend a proof.
+pub fn run_proof_wdl(args: &[String]) -> ExitCode {
+    let (Some(tdat), Some(out)) = (crate::flag_str(args, "--tdat"), crate::flag_str(args, "--out")) else {
+        eprintln!("usage: ti data proof-wdl --tdat X.tdat --out STEM --chains X.chains --decay 0.9 --preserve-tail N");
+        return ExitCode::FAILURE;
+    };
+    let tdat = if tdat.ends_with(".tdat") { tdat } else { format!("{tdat}.tdat") };
+    let idx = crate::flag_str(args, "--chains").unwrap_or_else(|| format!("{}.chains", tdat.trim_end_matches(".tdat")));
+    let decay = crate::flag_str(args, "--decay").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.9).clamp(0.0, 1.0);
+    let Some(tail) = crate::flag_str(args, "--preserve-tail").and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("data proof-wdl: --preserve-tail N is required (the held-out validation tail is never rewritten)");
+        return ExitCode::FAILURE;
+    };
+    let out_tdat = format!("{}.tdat", out.trim_end_matches(".tdat"));
+    if std::path::Path::new(&out_tdat) == std::path::Path::new(&tdat) {
+        eprintln!("data proof-wdl: --out must differ from --tdat (LAWS A10)");
+        return ExitCode::FAILURE;
+    }
+    let t0 = std::time::Instant::now();
+    let work = || -> Result<(String, usize), String> {
+        let (idx_rows, chains) = read_chains(&idx)?;
+        let mut rs = RowStream::open(&tdat)?;
+        check_index(rs.rows, idx_rows, &chains)?;
+        let total = rs.rows as usize;
+        let head = total.saturating_sub(tail as usize);
+        // pass 1: proof value per row, pooling keys of the non-proven head rows
+        let mut proof = vec![-1i8; total]; // -1 none, 0 loss, 1 win, 2 draw (all for the row's side to move)
+        let mut keys: Vec<(u64, u64, u32)> = Vec::with_capacity(head);
+        let mut res = vec![(0f32, 0f32); head]; // (outcome, effective game count)
+        let mut done = 0usize;
+        while done < total {
+            let n = (total - done).min(1 << 16);
+            for (i, r) in rs.take(n)?.iter().enumerate() {
+                let row = done + i;
+                if row >= head || r.occ0 & r.occ1 != 0 {
+                    continue;
+                }
+                match proof_value(r) {
+                    Some(v) => proof[row] = if v == 0.5 { 2 } else { v as i8 },
+                    None => {
+                        let (km, ko) = pool_key(r);
+                        keys.push((km, ko, row as u32));
+                        let ne = if r.wsum > 1.001 && r.wsum.is_finite() { r.wsum * r.wsum } else { 1.0 };
+                        res[row] = (if r.outcome.is_finite() { r.outcome.clamp(0.0, 1.0) } else { 0.5 }, ne);
+                    }
+                }
+            }
+            done += n;
+        }
+        // pooled result per position (NaN = the position occurs once: the row keeps its own result)
+        keys.sort_unstable();
+        let mut pooled = vec![f32::NAN; head];
+        let (mut groups_multi, mut rows_pooled) = (0u64, 0u64);
+        let mut i = 0;
+        while i < keys.len() {
+            let mut j = i;
+            let (mut w, mut nn) = (0f64, 0f64);
+            while j < keys.len() && keys[j].0 == keys[i].0 && keys[j].1 == keys[i].1 {
+                let (o, ne) = res[keys[j].2 as usize];
+                w += (o * ne) as f64;
+                nn += ne as f64;
+                j += 1;
+            }
+            if j - i > 1 {
+                groups_multi += 1;
+                rows_pooled += (j - i) as u64;
+                let p = (w / nn.max(1e-9)) as f32;
+                for k in &keys[i..j] {
+                    pooled[k.2 as usize] = p;
+                }
+            }
+            i = j;
+        }
+        drop(keys);
+        // proof back-propagation along the runs: (proof value for the row's side, weight)
+        let mut back = vec![(0f32, 0f32); head];
+        let mut by_n = [0u64; 5]; // n 1..5, 6..10, 11..20, 21..40, > 40
+        // sanity of the side flip: the row's OWN game result vs the later proof seen from the row's side, per n bucket
+        // (a game that reached a proven position mostly ends that way, so agree must dominate if the flip is right)
+        let mut agree = [[0u64; 2]; 5];
+        for c in &chains {
+            let (s, e) = (c.start as usize, (c.start as usize + c.len as usize).min(head));
+            let mut last: Option<(usize, i8)> = None;
+            for t in (s..e).rev() {
+                if proof[t] >= 0 {
+                    last = Some((t, proof[t]));
+                    continue;
+                }
+                if let Some((tp, pv)) = last {
+                    let n = tp - t;
+                    let v = match pv {
+                        2 => 0.5,
+                        _ => {
+                            let v = pv as f32;
+                            if n % 2 == 1 { 1.0 - v } else { v }
+                        }
+                    };
+                    back[t] = (v, decay.powi(n as i32));
+                    let k = match n { 1..=5 => 0, 6..=10 => 1, 11..=20 => 2, 21..=40 => 3, _ => 4 };
+                    by_n[k] += 1;
+                    let own = res[t].0;
+                    if v != 0.5 && own != 0.5 {
+                        agree[k][((own > 0.5) != (v > 0.5)) as usize] += 1;
+                    }
+                }
+            }
+        }
+        // pass 2: write
+        let mut rs = RowStream::open(&tdat)?;
+        let mut w = BufWriter::with_capacity(1 << 20, File::create(&out_tdat).map_err(|e| format!("{out_tdat}: {e}"))?);
+        let (mut changed, mut moved, mut flipped) = (0u64, 0f64, 0u64);
+        done = 0;
+        while done < total {
+            let n = (total - done).min(1 << 16);
+            let mut rows = rs.take(n)?;
+            for (i, r) in rows.iter_mut().enumerate() {
+                let row = done + i;
+                if row < head && proof[row] < 0 && r.occ0 & r.occ1 == 0 {
+                    let wdl = if pooled[row].is_nan() { r.outcome } else { pooled[row] };
+                    let (pv, pw) = back[row];
+                    let g = pw * pv + (1.0 - pw) * wdl;
+                    if (g - r.outcome).abs() > 1e-6 {
+                        changed += 1;
+                        moved += (g - r.outcome).abs() as f64;
+                        flipped += ((g - 0.5) * (r.outcome - 0.5) < 0.0) as u64;
+                    }
+                    r.outcome = g;
+                }
+                w.write_all(&r.to_bytes()).map_err(|e| e.to_string())?;
+            }
+            done += n;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+        let proven_head = proof[..head].iter().filter(|&&p| p >= 0).count();
+        Ok((format!(
+            "data proof-wdl: {tdat} -> {out_tdat}: {total} rows ({head} head, {tail} tail copied unchanged) in {:.1}s, decay {decay}\n\
+             \x20 proven head rows {proven_head}; positions occurring > 1 time {groups_multi} ({rows_pooled} rows pooled)\n\
+             \x20 rows with a later proof in their run, by plies to it: 1-5 {} | 6-10 {} | 11-20 {} | 21-40 {} | > 40 {}\n\
+             \x20 own game result agrees / disagrees with that proof: 1-5 {}/{} | 6-10 {}/{} | 11-20 {}/{} | 21-40 {}/{} | > 40 {}/{}\n\
+             \x20 rows whose outcome changed {changed} ({:.2}%), mean |change| {:.4}, side of 0.5 flipped {flipped}",
+            t0.elapsed().as_secs_f64(),
+            by_n[0], by_n[1], by_n[2], by_n[3], by_n[4],
+            agree[0][0], agree[0][1], agree[1][0], agree[1][1], agree[2][0], agree[2][1], agree[3][0], agree[3][1], agree[4][0], agree[4][1],
+            100.0 * changed as f64 / head.max(1) as f64,
+            moved / changed.max(1) as f64
+        ), total))
+    };
+    match work() {
+        Ok((s, total)) => {
+            let desc = format!("{tdat} with outcome := decay^n * proof + (1 - decay^n) * pooled WDL (decay {decay}, tail {tail} unchanged); ti data proof-wdl (D1246)");
+            if let Err(e) = crate::data::write_tdat_manifest(out.trim_end_matches(".tdat"), &desc, total) {
+                eprintln!("data proof-wdl: manifest: {e}");
+            }
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data proof-wdl: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `ti data lambda`: copy of a `.tdat` whose `outcome` holds the truncated lambda return of the row's own run.
 pub fn run_lambda(args: &[String]) -> ExitCode {
     let (Some(tdat), Some(out)) = (crate::flag_str(args, "--tdat"), crate::flag_str(args, "--out")) else {
@@ -3146,6 +3333,181 @@ fn fnv_file(p: &str) -> Result<(u64, u64), String> {
         n += k as u64;
     }
     Ok((h, n))
+}
+
+// D1257 (user): a new dataset version goes to Modal as a DIFF against the version already there, never in full.
+// .tdif (40-byte header) = "TDIF" | u32 version 1 | u64 rows | u64 base fnv1a64 | u64 new fnv1a64 | u64 changed rows, then per changed row:
+// u32 row index | u16 mask of the 4-byte words (12 per 48-byte record) that differ | those words, in order.
+const TDIF_MAGIC: &[u8; 4] = b"TDIF";
+const WORDS: usize = REC / 4;
+
+fn fnv_step(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `ti data diff --base A.tdat --new B.tdat --out D.tdif`: the rows of B that differ from A (same row count required).
+pub fn run_diff(args: &[String]) -> ExitCode {
+    let (Some(base), Some(new), Some(out)) = (crate::flag_str(args, "--base"), crate::flag_str(args, "--new"), crate::flag_str(args, "--out")) else {
+        eprintln!("usage: ti data diff --base A.tdat --new B.tdat --out D.tdif");
+        return ExitCode::FAILURE;
+    };
+    let r = || -> Result<String, String> {
+        let len = |p: &str| fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{p}: {e}"));
+        let (la, lb) = (len(&base)?, len(&new)?);
+        if la != lb || la % REC as u64 != 0 {
+            return Err(format!("row counts differ or not whole rows: {base} {la} B, {new} {lb} B"));
+        }
+        let rows = la / REC as u64;
+        let (mut ra, mut rb) = (BufReader::with_capacity(1 << 22, File::open(&base).map_err(|e| e.to_string())?), BufReader::with_capacity(1 << 22, File::open(&new).map_err(|e| e.to_string())?));
+        let mut body: Vec<u8> = Vec::new();
+        let (mut ha, mut hb, mut changed, mut words) = (0xcbf2_9ce4_8422_2325u64, 0xcbf2_9ce4_8422_2325u64, 0u64, 0u64);
+        let (mut a, mut b) = (vec![0u8; REC * 65536], vec![0u8; REC * 65536]);
+        let mut row = 0u64;
+        while row < rows {
+            let n = ((rows - row) as usize).min(65536);
+            ra.read_exact(&mut a[..n * REC]).map_err(|e| e.to_string())?;
+            rb.read_exact(&mut b[..n * REC]).map_err(|e| e.to_string())?;
+            ha = fnv_step(ha, &a[..n * REC]);
+            hb = fnv_step(hb, &b[..n * REC]);
+            for i in 0..n {
+                let (x, y) = (&a[i * REC..(i + 1) * REC], &b[i * REC..(i + 1) * REC]);
+                if x == y {
+                    continue;
+                }
+                let mut mask = 0u16;
+                for w in 0..WORDS {
+                    if x[w * 4..w * 4 + 4] != y[w * 4..w * 4 + 4] {
+                        mask |= 1 << w;
+                    }
+                }
+                body.extend_from_slice(&((row + i as u64) as u32).to_le_bytes());
+                body.extend_from_slice(&mask.to_le_bytes());
+                for w in 0..WORDS {
+                    if mask & (1 << w) != 0 {
+                        body.extend_from_slice(&y[w * 4..w * 4 + 4]);
+                        words += 1;
+                    }
+                }
+                changed += 1;
+            }
+            row += n as u64;
+        }
+        let mut f = BufWriter::new(File::create(&out).map_err(|e| format!("{out}: {e}"))?);
+        f.write_all(TDIF_MAGIC).map_err(|e| e.to_string())?;
+        for v in [1u64.to_le_bytes()[..4].to_vec(), rows.to_le_bytes().to_vec(), ha.to_le_bytes().to_vec(), hb.to_le_bytes().to_vec(), changed.to_le_bytes().to_vec()] {
+            f.write_all(&v).map_err(|e| e.to_string())?;
+        }
+        f.write_all(&body).map_err(|e| e.to_string())?;
+        f.flush().map_err(|e| e.to_string())?;
+        Ok(format!(
+            "data diff: {base} [fnv {ha:016X}] -> {new} [fnv {hb:016X}]: {rows} rows, {changed} changed ({:.2}%), {words} words, diff {out} = {} B ({:.1}% of the full file)",
+            100.0 * changed as f64 / rows.max(1) as f64,
+            body.len() + 40,
+            100.0 * (body.len() + 40) as f64 / la.max(1) as f64
+        ))
+    };
+    match r() {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data diff: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ti data patch --base A.tdat --diff D.tdif --out B.tdat`: rebuilds B from A + the diff. Refuses a base whose
+/// fingerprint is not the one the diff was made from; writes B.tdat.tmp and renames it only if its fingerprint equals
+/// the one recorded in the diff (so a wrong or half result never takes the name). Never overwrites an existing B.
+pub fn run_patch(args: &[String]) -> ExitCode {
+    let (Some(base), Some(diff), Some(out)) = (crate::flag_str(args, "--base"), crate::flag_str(args, "--diff"), crate::flag_str(args, "--out")) else {
+        eprintln!("usage: ti data patch --base A.tdat --diff D.tdif --out B.tdat");
+        return ExitCode::FAILURE;
+    };
+    let r = || -> Result<String, String> {
+        if std::path::Path::new(&out).exists() {
+            return Err(format!("{out} already exists; refusing to overwrite"));
+        }
+        let d = fs::read(&diff).map_err(|e| format!("{diff}: {e}"))?;
+        if d.len() < 40 || &d[..4] != TDIF_MAGIC {
+            return Err(format!("{diff}: not a TDIF file"));
+        }
+        let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        let (rows, hbase, hnew, changed) = (u64_at(8), u64_at(16), u64_at(24), u64_at(32));
+        let la = fs::metadata(&base).map(|m| m.len()).map_err(|e| format!("{base}: {e}"))?;
+        if la != rows * REC as u64 {
+            return Err(format!("{base}: {la} B, the diff expects {rows} rows"));
+        }
+        let tmp = format!("{out}.tmp");
+        let mut ra = BufReader::with_capacity(1 << 22, File::open(&base).map_err(|e| e.to_string())?);
+        let mut w = BufWriter::with_capacity(1 << 22, File::create(&tmp).map_err(|e| format!("{tmp}: {e}"))?);
+        let (mut hb, mut ho) = (0xcbf2_9ce4_8422_2325u64, 0xcbf2_9ce4_8422_2325u64);
+        let mut p = 40usize;
+        let mut next = |p: &mut usize| -> Option<(u64, u16, usize)> {
+            if *p + 6 > d.len() {
+                return None;
+            }
+            let idx = u32::from_le_bytes(d[*p..*p + 4].try_into().unwrap()) as u64;
+            let mask = u16::from_le_bytes(d[*p + 4..*p + 6].try_into().unwrap());
+            let at = *p + 6;
+            *p = at + 4 * mask.count_ones() as usize;
+            Some((idx, mask, at))
+        };
+        let mut pend = next(&mut p);
+        let (mut applied, mut buf, mut row) = (0u64, vec![0u8; REC * 65536], 0u64);
+        while row < rows {
+            let n = ((rows - row) as usize).min(65536);
+            ra.read_exact(&mut buf[..n * REC]).map_err(|e| e.to_string())?;
+            hb = fnv_step(hb, &buf[..n * REC]);
+            while let Some((idx, mask, at)) = pend {
+                if idx >= row + n as u64 {
+                    break;
+                }
+                let o = (idx - row) as usize * REC;
+                let mut k = at;
+                for wi in 0..WORDS {
+                    if mask & (1 << wi) != 0 {
+                        buf[o + wi * 4..o + wi * 4 + 4].copy_from_slice(&d[k..k + 4]);
+                        k += 4;
+                    }
+                }
+                applied += 1;
+                pend = next(&mut p);
+            }
+            ho = fnv_step(ho, &buf[..n * REC]);
+            w.write_all(&buf[..n * REC]).map_err(|e| e.to_string())?;
+            row += n as u64;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+        drop(w);
+        let fail = |m: String| {
+            let _ = fs::remove_file(&tmp);
+            Err(m)
+        };
+        if hb != hbase {
+            return fail(format!("{base} fnv {hb:016X} is not the diff's base {hbase:016X}; nothing written"));
+        }
+        if applied != changed || ho != hnew {
+            return fail(format!("result fnv {ho:016X} (applied {applied} of {changed}) != expected {hnew:016X}; nothing written"));
+        }
+        fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+        Ok(format!("data patch: {base} [fnv {hb:016X}] + {diff} ({changed} rows) -> {out} [fnv {ho:016X}] = verified"))
+    };
+    match r() {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data patch: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `ti data fp --tdat X.tdat [--rows A..B]`: FNV-1a 64 fingerprint of a file (or of rows [A, B) via a temp-free stream)
