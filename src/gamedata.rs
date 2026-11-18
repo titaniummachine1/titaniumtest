@@ -3128,3 +3128,91 @@ mod tests {
         assert!((half[3] - 0.0).abs() < 1e-6 && (half[2] - 0.45).abs() < 1e-6 && (half[1] - 0.45).abs() < 1e-6 && (half[0] - 0.425).abs() < 1e-6);
     }
 }
+
+/// D1177: FNV-1a 64 over a file's bytes (portable, no table; used to prove two copies of a dataset are byte-identical,
+/// e.g. the PC file and the one built on Modal)
+fn fnv_file(p: &str) -> Result<(u64, u64), String> {
+    let mut r = BufReader::with_capacity(1 << 22, File::open(p).map_err(|e| format!("{p}: {e}"))?);
+    let (mut h, mut n) = (0xcbf2_9ce4_8422_2325u64, 0u64);
+    let mut buf = vec![0u8; 1 << 22];
+    loop {
+        let k = r.read(&mut buf).map_err(|e| format!("{p}: {e}"))?;
+        if k == 0 {
+            break;
+        }
+        for &b in &buf[..k] {
+            h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        n += k as u64;
+    }
+    Ok((h, n))
+}
+
+/// `ti data fp --tdat X.tdat [--rows A..B]`: FNV-1a 64 fingerprint of a file (or of rows [A, B) via a temp-free stream)
+pub fn run_fp(args: &[String]) -> ExitCode {
+    let Some(p) = crate::flag_str(args, "--tdat") else {
+        eprintln!("usage: ti data fp --tdat X.tdat");
+        return ExitCode::FAILURE;
+    };
+    match fnv_file(&p) {
+        Ok((h, n)) => {
+            println!("data fp: {p} {n} bytes ({} rows) fnv1a64 {h:016X}", n / REC as u64);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data fp: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// D1177: `ti data split --base STEM --tail N --head-out A --tail-out B`: rows [0, nb-N) -> A, the last N rows -> B
+/// (.tdat + .manifest.json only: what the trainer reads). The base is untouched; outputs are never overwritten.
+pub fn run_split(args: &[String]) -> ExitCode {
+    let (Some(base), Some(tail), Some(ho), Some(to)) = (
+        crate::flag_str(args, "--base"),
+        crate::flag_u64(args, "--tail"),
+        crate::flag_str(args, "--head-out"),
+        crate::flag_str(args, "--tail-out"),
+    ) else {
+        eprintln!("usage: ti data split --base STEM --tail N --head-out STEM --tail-out STEM");
+        return ExitCode::FAILURE;
+    };
+    let strip = |s: &str| s.trim_end_matches(".tdat").to_string();
+    let (base, ho, to) = (strip(&base), strip(&ho), strip(&to));
+    let r = || -> Result<(), String> {
+        for o in [&ho, &to] {
+            if *o == base || std::path::Path::new(&format!("{o}.tdat")).exists() {
+                return Err(format!("{o}.tdat exists or equals the base; refusing to overwrite"));
+            }
+        }
+        let src = format!("{base}.tdat");
+        let nb = fs::metadata(&src).map_err(|e| format!("{src}: {e}"))?.len() / REC as u64;
+        if tail == 0 || tail >= nb {
+            return Err(format!("--tail {tail} must be in 1..{nb}"));
+        }
+        let cut = nb - tail;
+        let mut rd = BufReader::with_capacity(1 << 22, File::open(&src).map_err(|e| format!("{src}: {e}"))?);
+        for (o, rows, what) in [(&ho, cut, format!("rows [0, {cut})")), (&to, tail, format!("rows [{cut}, {nb}) = the held-out tail"))] {
+            let dst = format!("{o}.tdat");
+            let mut w = BufWriter::with_capacity(1 << 22, File::create(&dst).map_err(|e| format!("{dst}: {e}"))?);
+            let k = std::io::copy(&mut (&mut rd).take(rows * REC as u64), &mut w).map_err(|e| format!("{dst}: {e}"))?;
+            w.flush().map_err(|e| e.to_string())?;
+            if k != rows * REC as u64 {
+                return Err(format!("{dst}: wrote {k} bytes, expected {}", rows * REC as u64));
+            }
+            let m = format!("{{\"src\":{},\"rows\":{rows},\"rec\":{REC}}}", crate::json_str(&format!("{base}.tdat {what} (ti data split)")));
+            fs::write(format!("{o}.manifest.json"), m).map_err(|e| e.to_string())?;
+            let (h, n) = fnv_file(&dst)?;
+            println!("data split: {dst} = {base}.tdat {what}: {rows} rows, {n} bytes, fnv1a64 {h:016X}");
+        }
+        Ok(())
+    };
+    match r() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("data split: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

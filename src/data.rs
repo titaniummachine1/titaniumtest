@@ -376,6 +376,8 @@ pub fn run_data(args: &[String]) -> ExitCode {
         Some("games-stat") => crate::gamedata::run_games_stat(args),
         Some("games-tdat") => crate::gamedata::run_games_tdat(args),
         Some("append") => crate::gamedata::run_append(args),
+        Some("split") => crate::gamedata::run_split(args),
+        Some("fp") => crate::gamedata::run_fp(args),
         Some("bestmove") => crate::gamedata::run_bestmove(args),
         Some("stitch") => crate::gamedata::run_stitch(args),
         _ => {
