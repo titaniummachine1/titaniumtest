@@ -83,6 +83,53 @@ impl Pool {
     }
 }
 
+/// D1199 LEVER ATTENTION (user: attention between INPUTS): the accumulator split per input group gives g group vectors
+/// of width d (the FT rows themselves cost the same as today and are not timed here); one attention layer over these g
+/// tokens (each lever re-weighted by the others), mean-pool, small MLP -> value. Timed = the head only.
+struct LeverAtt {
+    g: usize,
+    d: usize,
+    wq: Vec<f32>,
+    wk: Vec<f32>,
+    wv: Vec<f32>,
+    w1: Vec<f32>,
+    out: Vec<f32>,
+}
+
+impl LeverAtt {
+    fn new(g: usize, d: usize) -> LeverAtt {
+        let mut s = 0x5555_AAAA_1357_2468u64;
+        let sc = 1.0 / (d as f32).sqrt();
+        let mut m = |n: usize| rnd(&mut s, n, sc);
+        LeverAtt { g, d, wq: m(d * d), wk: m(d * d), wv: m(d * d), w1: m(d * 32), out: m(32) }
+    }
+    fn eval(&self, x: &[f32]) -> f32 {
+        let (g, d) = (self.g, self.d);
+        let (mut q, mut k, mut v) = (vec![0f32; g * d], vec![0f32; g * d], vec![0f32; g * d]);
+        Tf::mm(x, &self.wq, g, d, d, &mut q);
+        Tf::mm(x, &self.wk, g, d, d, &mut k);
+        Tf::mm(x, &self.wv, g, d, d, &mut v);
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut pooled = vec![0f32; d];
+        let mut sc = vec![0f32; g];
+        for i in 0..g {
+            let mut mx = f32::MIN;
+            for j in 0..g {
+                sc[j] = (0..d).map(|c| q[i * d + c] * k[j * d + c]).sum::<f32>() * scale;
+                mx = mx.max(sc[j]);
+            }
+            let z: f32 = sc.iter_mut().map(|s| { *s = (*s - mx).exp(); *s }).sum();
+            for c in 0..d {
+                let a: f32 = (0..g).map(|j| sc[j] * v[j * d + c]).sum::<f32>() / z;
+                pooled[c] += (x[i * d + c] + a) / g as f32; // residual: identity at init would keep the plain sum
+            }
+        }
+        let mut h = vec![0f32; 32];
+        Tf::mm(&pooled, &self.w1, 1, d, 32, &mut h);
+        h.iter().zip(&self.out).map(|(a, w)| a.max(0.0) * w).sum()
+    }
+}
+
 fn rnd(s: &mut u64, n: usize, sc: f32) -> Vec<f32> {
     (0..n)
         .map(|_| {
@@ -259,6 +306,20 @@ pub fn run(args: &[String]) -> ExitCode {
     let champ = Nnue::bundled();
     println!("tf-bench: {n} positions, best of {rounds} rounds, single thread (MEASURE ON A QUIET PC, D1105)");
     println!("tf-bench: champion NNUE (full refresh)           {:>9.0} ns/eval", time(&|b| champ.eval(b, 0) as f32));
+    for &(g, d) in &[(6usize, 32usize), (8, 32), (12, 32), (8, 64)] {
+        let la = LeverAtt::new(g, d);
+        let mut s = 0x7777_1111_2222_3333u64;
+        let xs: Vec<Vec<f32>> = (0..64).map(|_| rnd(&mut s, g * d, 1.0)).collect();
+        let cnt = std::cell::Cell::new(0usize);
+        println!(
+            "tf-bench: LEVER attention {g:>2} groups x d {d} (head only)  {:>9.0} ns/eval",
+            time(&|_b| {
+                let i = cnt.get();
+                cnt.set(i + 1);
+                la.eval(&xs[i & 63])
+            })
+        );
+    }
     for &d in &[16usize, 32, 64] {
         let p = Pool::new(d);
         println!("tf-bench: attention POOLING d {d:>2} (1 query)          {:>9.0} ns/eval", time(&|b| p.eval(b)));
