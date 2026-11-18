@@ -209,8 +209,9 @@ pub fn run_train(args: &[String]) -> ExitCode {
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
     if f("--backend").as_deref() == Some("cuda") {
-        if f("--opt").is_some_and(|o| o != "adamw") {
-            return Err("--opt muonadamw exists only on the CPU backend (bullet has no Muon, D1159)".into());
+        // D1181: the GPU optimiser is Ranger; `--opt muon` = Muon on the dense hidden blocks + Ranger on the rest
+        if f("--opt").is_some_and(|o| o != "muon") {
+            return Err("--backend cuda: --opt takes only muon (default = Ranger; adamw / muonadamw are the CPU backend)".into());
         }
         #[cfg(feature = "gpu")]
         {
@@ -250,6 +251,11 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                     None => None,
                 },
                 keep_all: crate::has_flag(args, "--keep-all"),
+                muon: if f("--opt").as_deref() == Some("muon") {
+                    Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
+                } else {
+                    None
+                },
             });
         }
         #[cfg(not(feature = "gpu"))]

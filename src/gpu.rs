@@ -102,6 +102,8 @@ pub struct GpuCfg {
     pub result_weight: Option<[f32; 3]>,
     /// keep every checkpoint (ckpt_<step>.tnn) so a strength-vs-step curve can be gated afterwards
     pub keep_all: bool,
+    /// D1181: Some((muon_lr, momentum)) = `--opt muon`: Muon on the l1w / l2w bucket blocks, Ranger on the rest; None = Ranger only (default)
+    pub muon: Option<(f32, f32)>,
 }
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
@@ -238,7 +240,36 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
-    let mut opt = Optimiser::<G, Ranger<G>>::new(defn, weights, device, params).map_err(|e| format!("{e:?}"))?;
+    match c.muon {
+        // default (no --opt): Ranger on every tensor, exactly as before D1181
+        None => {
+            let opt = Optimiser::<G, Ranger<G>>::new(defn, weights, device, params).map_err(|e| format!("{e:?}"))?;
+            train_with(opt, c, base, mapper)
+        }
+        Some((muon_lr, mom)) => {
+            // D1181: Muon on the dense hidden matrices, recognised by size (refused unless each size is unique)
+            let (nb, l1, l2) = (base.buckets, base.l1, base.l2);
+            let din = base.l1_w.len() / (nb * l1).max(1);
+            let shapes = vec![
+                crate::gpumuon::MuonShape { name: "l1w".into(), size: nb * l1 * din, rows: l1, cols: din, buckets: nb },
+                crate::gpumuon::MuonShape { name: "l2w".into(), size: nb * l2 * l1, rows: l2, cols: l1, buckets: nb },
+            ];
+            for s in &shapes {
+                let same: Vec<String> = weights.iter().filter(|(_, v)| v.values.size() == s.size).map(|(id, _)| id.clone()).collect();
+                if same != vec![s.name.clone()] {
+                    return Err(format!("--opt muon: tensor size {} of {} is not unique in the graph ({same:?})", s.size, s.name));
+                }
+            }
+            println!("[opt] MUON (D1181): Muon lr {muon_lr} (x the lr schedule factor), momentum {mom}, Nesterov, NS5 on {nb} blocks of l1w {l1}x{din} and l2w {l2}x{l1}; Ranger (default parameters) on every other tensor");
+            let p = crate::gpumuon::MuonRangerParams { ranger: params, shapes, muon_lr, lr0: c.lr, mom };
+            let opt = Optimiser::<G, crate::gpumuon::MuonRanger<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
+            train_with(opt, c, base, mapper)
+        }
+    }
+}
+
+/// the training loop of `run_on`, generic over the optimiser state (Ranger by default, Muon + Ranger with --opt muon)
+fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: Optimiser<G, S>, c: GpuCfg, base: TrainableNet, mapper: ModelInputsMapper<Rec>) -> Result<(), String> {
     std::fs::create_dir_all(&c.out).map_err(|e| e.to_string())?;
     let ckpt = format!("{}/bullet_ckpt", c.out);
     let mut start_sb = 1;

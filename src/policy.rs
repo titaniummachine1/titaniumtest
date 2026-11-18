@@ -1,4 +1,4 @@
-//! `ti policy`: step P0 of docs/POLICY_PLAN.md in the engine repo. Fits a move-ordering policy head on the frozen
+//! `ti policy`: step P0 of the engine repo's docs/research/policy/POLICY_PLAN.md. Fits a move-ordering policy head on the frozen
 //! activations of a net, with the moves already played in gate games (the engine's own 5k-node best move) as free labels.
 //!
 //! logit(m) = bias[slot] + sum(scalar move features) + U[slot] . h     (slot = to-square x clone/jump, 98 slots)

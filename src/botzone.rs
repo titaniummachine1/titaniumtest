@@ -249,6 +249,9 @@ fn parse_debug(dbg: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>
         }
     }
     let toks: Vec<&str> = dbg.split_whitespace().collect();
+    // noexcept Ataxx: `e15326 s15834 v26737 q-0.146 t3940` (D1151): q = expected score in [-1, 1],
+    // mapped like PyJataxx h; e/s/v are internal counters, NOT cp, so its bare `s` must not reach the `s` = cp arm.
+    let has_q = toks.iter().any(|t| t.strip_prefix('q').is_some_and(|r| r.parse::<f64>().is_ok()));
     let mut i = 0;
     while i < toks.len() {
         let t = toks[i];
@@ -320,9 +323,17 @@ fn parse_debug(dbg: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>
                         }
                     }
                     Some('s') => {
+                        if !has_q {
+                            if let Ok(x) = rest.parse::<f64>() {
+                                eval = Some(x);
+                                kind = "cp";
+                            }
+                        }
+                    }
+                    Some('q') => {
                         if let Ok(x) = rest.parse::<f64>() {
                             eval = Some(x);
-                            kind = "cp";
+                            kind = "h";
                         }
                     }
                     _ => {}
@@ -458,7 +469,7 @@ fn print_stats(m: &Match, path: &Path) {
 
 /// D546: one Botzone match as a gate-format games.jsonl line (ti insight / ti analyze read it): the side whose name
 /// contains `cand` is the "candidate", the other the "baseline". Scores: Titanium `s` = cp from the mover's view;
-/// a value in [-1, 1] (PyJataxx `h`, winrate-like) is mapped to cp = 400 ln((1+h)/(1-h)), |h| >= 1 = solved (+-19990).
+/// a value in [-1, 1] (PyJataxx `h`, noexcept `q`, winrate-like) is mapped to cp = 400 ln((1+h)/(1-h)), |h| >= 1 = solved (+-19990).
 fn game_jsonl(path: &Path, cand: &str) -> Result<String, String> {
     let m = read_match(path)?;
     let cs = m.names.iter().position(|n| n.to_lowercase().contains(&cand.to_lowercase())).ok_or_else(|| format!("{}: no player matches '{cand}'", m.id))?;

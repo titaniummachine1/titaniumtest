@@ -22,6 +22,8 @@ mod probe;
 mod shrink;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "gpu")]
+mod gpumuon;
 mod trainer;
 mod targets;
 mod gate;
