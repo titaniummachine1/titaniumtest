@@ -26,6 +26,8 @@
 //! in the DAG is NOT written to the files again (counted as a duplicate in the log); a stored game's `gid` is in the .tbst.
 //!
 //! Defaults: 5,000 nodes per move, up to 6 threads. `--book` gives start positions (the engine is never changed by it).
+//! CLEAN STOP (user D1174): a file named STOP in the --out folder (or `--stop-file PATH`) is checked before every new
+//! game: no new game starts, the games already being played finish and are written, the files are closed, exit 0.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -130,9 +132,15 @@ struct Counters {
 
 pub fn run_gen(args: &[String]) -> ExitCode {
     let Some(out) = crate::flag_str(args, "--out") else {
-        eprintln!("usage: ti gen --out STEM [--games 500] [--nodes 5000 (minimum)] [--threads auto] [--seq-dag DB] [--src NAME] [--book FILE] [--book0 N]");
+        eprintln!("usage: ti gen --out STEM [--games 500] [--nodes 5000 (minimum)] [--threads auto] [--seq-dag DB] [--src NAME] [--book FILE] [--book0 N] [--stop-file PATH (default: STOP in the --out folder)]");
         return ExitCode::FAILURE;
     };
+    // D1174: clean stop. Before each new game the threads look for this file; if it exists no new game starts.
+    let stop_file = crate::flag_str(args, "--stop-file").unwrap_or_else(|| {
+        let dir = std::path::Path::new(&out).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        dir.join("STOP").to_string_lossy().into_owned()
+    });
+    let stopped = std::sync::atomic::AtomicBool::new(false);
     // LAWS A12 (D927): one idiot-proof generator. STANDARD (default): the engine is the current main (behavioural check
     // below) with its own net / policy / SmallNet, TT 2^22, >= 5,000 nodes per move; the weakening flags are refused.
     // EXPERIMENT (D931): only with --experiment NAME; overrides allowed; outputs AND the DAG must be under experiments/.
@@ -313,6 +321,11 @@ pub fn run_gen(args: &[String]) -> ExitCode {
                     loop {
                         let game = next.fetch_add(1, Ordering::Relaxed);
                         if game >= games || err.lock().unwrap().is_some() {
+                            return Ok(());
+                        }
+                        // D1174: STOP file -> start no new game (games in flight on other threads finish and are written)
+                        if stopped.load(Ordering::Relaxed) || std::path::Path::new(&stop_file).exists() {
+                            stopped.store(true, Ordering::Relaxed);
                             return Ok(());
                         }
                         let idx = book.as_ref().map_or(0, |l| (book0 + game as usize) % l.len());
@@ -506,6 +519,9 @@ pub fn run_gen(args: &[String]) -> ExitCode {
     );
     eprintln!("gen: {} searches ({:.2} per ply), ban misses {}", g(&cnt.searches), g(&cnt.searches) as f64 / g(&cnt.plies).max(1) as f64, g(&cnt.ban_miss));
     eprintln!("gen: sequence DAG write-back: {} games stored, {} repeated sequences (already in the DAG: W/D/L counts updated, not written to the file again), {} conflict retries", g(&cnt.dag_written), g(&cnt.dup_games), g(&cnt.dag_retries));
+    if stopped.load(Ordering::Relaxed) {
+        eprintln!("gen: STOPPED CLEANLY by {stop_file}: no new games started, every game in flight finished and written");
+    }
     eprintln!("gen: done {} games -> {stem}.tgam + {stem}.tbst in {:.0}s on {threads} thread(s)", done.load(Ordering::Relaxed), t0.elapsed().as_secs_f64());
     ExitCode::SUCCESS
 }
