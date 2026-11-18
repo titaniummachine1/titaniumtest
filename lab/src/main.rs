@@ -24,6 +24,7 @@ mod archloc;
 mod netscale;
 mod standard;
 mod jat3;
+mod featbench;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
         Some("jat3-train") => jat3::run(&args[1..]),
         Some("jat3-bench") => jat3::bench(&args[1..]),
         Some("jat3-compare") => jat3::compare(&args[1..]),
+        Some("feat-bench") => featbench::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
         Some("node-cost") => nodecost::run(&args[1..]),
         Some("incr-stats") => nodecost::incr_stats(&args[1..]),
