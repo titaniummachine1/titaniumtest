@@ -183,6 +183,14 @@ pub fn evaluate_mode(net: &TrainableNet, val: &[Rec], threads: usize, mode: usiz
     ValStats { rows: n, mse: a / n as f64, mse_proven: if np > 0 { p / np as f64 } else { 0.0 }, n_proven: np, mse_other: o / (n - np).max(1) as f64 }
 }
 
+fn lr_at(step: usize, total: usize, lr: f32, lr_min: f32, warmup: usize) -> f32 {
+    if step < warmup {
+        return lr * (step + 1) as f32 / warmup as f32;
+    }
+    let p = (step - warmup) as f32 / (total.saturating_sub(warmup)).max(1) as f32;
+    lr_min + 0.5 * (lr - lr_min) * (1.0 + (std::f32::consts::PI * p.min(1.0)).cos())
+}
+
 fn tensor_report(n: &TrainableNet) -> String {
     let m = |v: &Vec<f32>| v.iter().fold(0f32, |a, &x| a.max(x.abs()));
     format!("max|w| ft {:.3} ftb {:.3} psqt {:.3} l1 {:.3} l2 {:.3} out {:.3}", m(&n.ft), m(&n.ftb), m(&n.psqt), m(&n.l1_w), m(&n.l2_w), m(&n.out_w))
@@ -200,16 +208,8 @@ pub fn run_train(args: &[String]) -> ExitCode {
 
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
-    // D1001 / D1159 (user: augmentation always on, no switch): the D4 opt-out is refused on both backends
-    if crate::has_flag(args, "--no-d4") {
-        return Err("--no-d4 is refused: D4 augmentation is always on (user D1001)".into());
-    }
-    let opt_kind = f("--opt").unwrap_or_else(|| "adamw".into());
-    if opt_kind != "adamw" && opt_kind != "muonadamw" {
-        return Err(format!("--opt {opt_kind}: use adamw or muonadamw"));
-    }
     if f("--backend").as_deref() == Some("cuda") {
-        if opt_kind != "adamw" {
+        if f("--opt").is_some_and(|o| o != "adamw") {
             return Err("--opt muonadamw exists only on the CPU backend (bullet has no Muon, D1159)".into());
         }
         #[cfg(feature = "gpu")]
@@ -229,7 +229,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 val_rows: g("--val-rows", 65536),
                 threads: g("--threads", 8),
                 seed: g("--seed", 7) as u64,
-                d4: true,
+                d4: !crate::has_flag(args, "--no-d4"),
                 holdout: crate::flag_u64(args, "--holdout-mode").map(|v| v as usize),
                 resume: crate::has_flag(args, "--resume"),
                 ram: crate::has_flag(args, "--ram"),
@@ -268,25 +268,17 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let out = f("--out").ok_or("--out <dir> required")?;
     let init = f("--init").unwrap_or_else(|| "bundled".into());
     let bs = crate::flag_u64(args, "--bs").unwrap_or(16384) as usize;
-    // D1159 / LAWS C15: the CPU backend trains to SATURATION only (it used to run a fixed --steps cosine = trap D1133):
-    // warmup, then constant lr, halved after each evaluation without a val gain > --min-delta, stop after --patience
-    // such evaluations in a row (default 4; one evaluation = one epoch of --data rows unless --eval-every is given)
-    if crate::flag_str(args, "--steps").is_some() || crate::flag_str(args, "--max-epochs").is_some() {
-        return Err("--steps / --max-epochs are refused on the CPU backend: it stops only by saturation (LAWS C15)".into());
-    }
-    let patience = crate::flag_u64(args, "--patience").unwrap_or(4).max(1) as usize;
-    let min_delta = crate::flag_f64(args, "--min-delta").unwrap_or(2e-6);
-    let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32;
-    let muon_mom = crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32;
-    let mut lr = crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32;
+    let steps = crate::flag_u64(args, "--steps").unwrap_or(1000) as usize;
+    let lr = crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32;
+    let lr_min = crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32;
     let warmup = crate::flag_u64(args, "--warmup").unwrap_or(200) as usize;
     let wd = crate::flag_f64(args, "--wd").unwrap_or(0.0) as f32;
     let threads = crate::flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
     let val_rows = crate::flag_u64(args, "--val-rows").unwrap_or(65536) as usize;
-    let eval_every_arg = crate::flag_u64(args, "--eval-every").map(|v| v as usize);
+    let eval_every = crate::flag_u64(args, "--eval-every").unwrap_or(250) as usize;
     let save_every = crate::flag_u64(args, "--save-every").unwrap_or(500) as usize;
     let seed = crate::flag_u64(args, "--seed").unwrap_or(7);
-    let d4 = true;
+    let d4 = !crate::has_flag(args, "--no-d4");
     let resume = crate::has_flag(args, "--resume");
     let wsum_clip = crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32;
     let guard = crate::flag_f64(args, "--guard").unwrap_or(1.15);
@@ -308,17 +300,24 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let mut train = if crate::has_flag(args, "--ram") { Tdat::open_ram(&data)? } else { Tdat::open(&data)? };
     let mut valf = Tdat::open(&val_stem)?;
     let val = load_val(&mut valf, val_rows)?;
-    let eval_every = eval_every_arg.unwrap_or((train.rows / bs.max(1)).max(1));
-    println!("[train] rows {} val {} bs {bs} lr {lr} warmup {warmup} threads {threads} d4 {d4} opt {opt_kind}{} | saturation: eval every {eval_every} steps, lr halves on no gain > {min_delta:e}, stop after {patience} in a row", train.rows, val.len(), if opt_kind == "muonadamw" { format!(" (Muon lr {muon_lr} mom {muon_mom} on l1/l2, AdamW lr {lr} elsewhere)") } else { String::new() });
+    println!("[train] rows {} val {} bs {bs} steps {steps} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len());
     let v0 = evaluate(&net, &val, threads);
     println!("[val step {step0}] mse {:.6} proven {:.6} (n={}) other {:.6}   {}", v0.mse, v0.mse_proven, v0.n_proven, v0.mse_other, tensor_report(&net));
 
     let mut opt = SparseAdamW::new(&net);
-    if opt_kind == "muonadamw" {
-        opt.muon = Some(crate::train::Muon::new(&net, muon_lr, muon_mom));
+    // D1162 (user: "same trainer, only the optimiser changed"): --opt muonadamw = Muon on the l1 / l2 bucket blocks
+    // (D1159), AdamW unchanged for everything else; Muon's lr follows the same schedule factor as the AdamW lr.
+    let opt_kind = f("--opt").unwrap_or_else(|| "adamw".into());
+    let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32;
+    match opt_kind.as_str() {
+        "adamw" => {}
+        "muonadamw" => {
+            let mom = crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32;
+            opt.muon = Some(crate::train::Muon::new(&net, muon_lr, mom));
+            println!("[train] EXPERIMENT optimiser: MuonAdamW (Muon lr {muon_lr} x schedule, momentum {mom}, on l1/l2; AdamW on the rest)");
+        }
+        k => return Err(format!("--opt {k}: use adamw or muonadamw")),
     }
-    let mut bad = 0usize;
-    let lr_scale_at = |step: usize, warmup: usize| if step < warmup { (step + 1) as f32 / warmup as f32 } else { 1.0 };
     let mut grads: Vec<BatchGradients> = (0..threads).map(|_| BatchGradients::new(&net)).collect();
     let mut main_grad = BatchGradients::new(&net);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -330,7 +329,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let mut best = v0.mse;
     let t0 = Instant::now();
     let (mut run_loss, mut run_w, mut run_n) = (0f64, 0f64, 0usize);
-    for step in step0.. {
+    for step in step0..steps {
         if buf.len() < bs {
             // refill: 64 batches worth of random 1024-row blocks, shuffled together (mixes sources and phases)
             buf.clear();
@@ -376,43 +375,35 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             g.clear_sparse(net.width, net.buckets);
         }
         let wsum: f64 = losses.iter().map(|x| x.1).sum();
-        let ls = lr_scale_at(step, warmup);
+        let cur_lr = lr_at(step, steps, lr, lr_min, warmup);
         if let Some(m) = opt.muon.as_mut() {
-            m.lr = muon_lr * ls;
+            m.lr = muon_lr * cur_lr / lr;
         }
-        opt.step_batch(&mut net, &main_grad, wsum.max(1.0) as usize, lr * ls, wd);
+        opt.step_batch(&mut net, &main_grad, wsum.max(1.0) as usize, cur_lr, wd);
         run_loss += losses.iter().map(|x| x.0).sum::<f64>();
         run_w += wsum;
         run_n += 1;
         let done = step + 1;
         if done % 50 == 0 {
-            println!("[step {done}] loss {:.6} lr {:.2e} {:.0} rows/s", run_loss / run_w.max(1.0), lr * ls, (done - step0) as f64 * bs as f64 / t0.elapsed().as_secs_f64());
+            println!("[step {done}/{steps}] loss {:.6} lr {:.2e} {:.0} rows/s", run_loss / run_w.max(1.0), lr_at(step, steps, lr, lr_min, warmup), (done - step0) as f64 * bs as f64 / t0.elapsed().as_secs_f64());
             run_loss = 0.0;
             run_w = 0.0;
             run_n = 0;
         }
-        if done % eval_every == 0 {
+        if done % eval_every == 0 || done == steps {
             let v = evaluate(&net, &val, threads);
+            println!("[val step {done}] mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
             if guard > 0.0 && v.mse > v0.mse * guard {
                 return Err(format!("GUARD TRIPPED at step {done}: val mse {:.6} > {guard} x init {:.6} (Mistake 39)", v.mse, v0.mse));
             }
-            if v.mse < best - min_delta {
+            if v.mse < best {
                 best = v.mse;
-                bad = 0;
                 let b = net.to_tnn_bytes();
                 std::fs::write(format!("{out}/best.tnn"), &b).map_err(|e| e.to_string())?;
                 crate::prov::record(&out, "best.tnn", &b, v.mse, &val_stem, val_rows, done);
-            } else {
-                bad += 1;
-                lr *= 0.5;
-            }
-            println!("[val step {done}] mse {:.6} proven {:.6} other {:.6} | best {best:.6} | no-gain {bad}/{patience} | lr now {lr:.2e}", v.mse, v.mse_proven, v.mse_other);
-            if bad >= patience {
-                println!("SATURATED: {patience} evaluations in a row without a val gain > {min_delta:e}; best val mse {best:.6} (init {:.6}) in {out}/best.tnn", v0.mse);
-                break;
             }
         }
-        if done % save_every == 0 {
+        if done % save_every == 0 || done == steps {
             let p = format!("{out}/ckpt_{done}.tnn");
             std::fs::write(&p, net.to_tnn_bytes()).map_err(|e| e.to_string())?;
             std::fs::write(&state, format!("{done} {p}")).map_err(|e| e.to_string())?;
