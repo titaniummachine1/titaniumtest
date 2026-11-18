@@ -27,6 +27,7 @@ mod jat3;
 mod jat3x;
 mod featbench;
 mod tfbench;
+mod levatt;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
         Some("jat3-explain") => jat3x::explain(&args[1..]),
         Some("feat-bench") => featbench::run(&args[1..]),
         Some("tf-bench") => tfbench::run(&args[1..]),
+        Some("levatt-train") => levatt::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
         Some("node-cost") => nodecost::run(&args[1..]),
         Some("incr-stats") => nodecost::incr_stats(&args[1..]),
