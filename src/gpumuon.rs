@@ -1,12 +1,12 @@
-//! D1181 (user: port Muon to the GPU trainer): `--opt muon` on `--backend cuda`. Muon (momentum, Nesterov, quintic
-//! Newton-Schulz, the CPU MuonAdamW math of train.rs D1159, same `newton_schulz5`) on every phase bucket block of the
-//! two DENSE hidden matrices l1w (l1 x 2w per bucket) and l2w (l2 x l1 per bucket); bullet's Ranger (the standard GPU
-//! optimiser, same parameters as the default run) keeps every other tensor. Without `--opt muon` the GPU trainer uses
-//! `Ranger<G>` directly and never touches this file (default path unchanged).
+//! D1181/D1262: `--opt muon` on `--backend cuda` (MuonAdamW). Muon (momentum, Nesterov, quintic Newton-Schulz,
+//! the CPU MuonAdamW math of train.rs D1159, same `newton_schulz5`) on every phase bucket block of the two DENSE
+//! hidden matrices l1w (l1 x 2w per bucket) and l2w (l2 x l1 per bucket); bullet's AdamW (D1262, replacing Ranger)
+//! keeps every other tensor. Without `--opt muon` the GPU trainer uses `Ranger<G>` directly and never touches this
+//! file (default path unchanged).
 //!
 //! The Muon blocks are small (16 x 512 and 32 x 16 per bucket), so the update runs on the host: per step the gradient and
 //! the weights of l1w / l2w are copied to the host (after the backward pass on the same stream), the Muon step is done
-//! there (blocks in parallel), and the new weights are copied back on the same stream. Weight clip = Ranger's +-1.98.
+//! there (blocks in parallel), and the new weights are copied back on the same stream. Weight clip = +-1.98.
 use std::{collections::BTreeMap, sync::Arc};
 
 use bullet_compiler::tensor::TValue;
@@ -15,7 +15,7 @@ use bullet_gpu::{
     runtime::{Device, Gpu, Stream},
 };
 use bullet_trainer::optimiser::{
-    ranger::{Ranger, RangerParams},
+    adam::{AdamW, AdamWParams},
     OptimiserState,
 };
 
@@ -32,9 +32,9 @@ pub struct MuonShape {
 
 #[derive(Clone, Debug, Default)]
 pub struct MuonRangerParams {
-    pub ranger: RangerParams,
+    pub adam: AdamWParams,
     pub shapes: Vec<MuonShape>,
-    /// Muon lr at schedule factor 1; the live factor = current lr / `lr0` (the same schedule as Ranger, D1164)
+    /// Muon lr at schedule factor 1; the live factor = current lr / `lr0` (the same schedule as AdamW, D1164)
     pub muon_lr: f32,
     pub lr0: f32,
     pub mom: f32,
@@ -49,7 +49,7 @@ pub struct MuonBlock<G: Gpu> {
 }
 
 pub enum MuonRanger<G: Gpu> {
-    R(Ranger<G>),
+    R(AdamW<G>),
     M(MuonBlock<G>),
 }
 
@@ -62,7 +62,7 @@ fn f32s(v: TValue) -> Vec<f32> {
 
 impl<G: Gpu> MuonBlock<G> {
     fn step(&mut self, g: &[f32], w: &mut [f32], gf: f32, lr: f32) {
-        step_colmajor(&self.shape, &mut self.m, g, w, gf, lr, self.p.mom, self.p.ranger.min_weight, self.p.ranger.max_weight);
+        step_colmajor(&self.shape, &mut self.m, g, w, gf, lr, self.p.mom, self.p.adam.min_weight, self.p.adam.max_weight);
     }
 }
 
@@ -196,7 +196,7 @@ impl<G: Gpu> OptimiserState<G> for MuonRanger<G> {
                 p: params,
                 _g: std::marker::PhantomData,
             })),
-            None => Ok(MuonRanger::R(<Ranger<G> as OptimiserState<G>>::new(device, size, params.ranger)?)),
+            None => Ok(MuonRanger::R(<AdamW<G> as OptimiserState<G>>::new(device, size, params.adam)?)),
         }
     }
 
@@ -239,7 +239,7 @@ impl<G: Gpu> OptimiserState<G> for MuonRanger<G> {
 
     fn set_params(&mut self, params: Self::Params) -> Result<(), G::Error> {
         match self {
-            MuonRanger::R(r) => r.set_params(params.ranger),
+            MuonRanger::R(r) => r.set_params(params.adam),
             MuonRanger::M(mb) => {
                 mb.p = params;
                 Ok(())
@@ -248,7 +248,7 @@ impl<G: Gpu> OptimiserState<G> for MuonRanger<G> {
     }
 
     fn load_from_checkpoint(map: &mut BTreeMap<String, &mut Self>, path: &str) -> Result<(), G::Error> {
-        let mut rmap: BTreeMap<String, &mut Ranger<G>> = BTreeMap::new();
+        let mut rmap: BTreeMap<String, &mut AdamW<G>> = BTreeMap::new();
         for (id, s) in map.iter_mut() {
             match &mut **s {
                 MuonRanger::R(r) => {
@@ -263,11 +263,11 @@ impl<G: Gpu> OptimiserState<G> for MuonRanger<G> {
                 }
             }
         }
-        <Ranger<G> as OptimiserState<G>>::load_from_checkpoint(&mut rmap, path)
+        <AdamW<G> as OptimiserState<G>>::load_from_checkpoint(&mut rmap, path)
     }
 
     fn write_to_checkpoint(map: &BTreeMap<String, &Self>, path: &str) -> Result<(), G::Error> {
-        let mut rmap: BTreeMap<String, &Ranger<G>> = BTreeMap::new();
+        let mut rmap: BTreeMap<String, &AdamW<G>> = BTreeMap::new();
         for (id, s) in map.iter() {
             match s {
                 MuonRanger::R(r) => {
@@ -279,6 +279,6 @@ impl<G: Gpu> OptimiserState<G> for MuonRanger<G> {
                 }
             }
         }
-        <Ranger<G> as OptimiserState<G>>::write_to_checkpoint(&rmap, path)
+        <AdamW<G> as OptimiserState<G>>::write_to_checkpoint(&rmap, path)
     }
 }
