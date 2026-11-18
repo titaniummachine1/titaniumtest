@@ -58,6 +58,7 @@ fn main() -> ExitCode {
         Some("group-diff") => groupdiff::run(&args[1..]),
         Some("arch-locality") => archloc::run(&args[1..]),
         Some("residual-check") => hcetrain::residual_check(&args[1..]),
+        Some("residual-pair") => hcetrain::residual_pair(&args[1..]),
         Some("net-scale") => netscale::run(&args[1..]),
         _ => {
             eprintln!("usage: lab hce-fit ... | lab see-screen ...");

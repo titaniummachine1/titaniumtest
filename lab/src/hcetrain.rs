@@ -205,6 +205,67 @@ pub fn residual_check(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `lab residual-pair --a A_weights.json --b B_weights.json [--block 2000]` (D1188): PAIRED comparison of two finished
+/// residual models on the SAME standard held-out rows: weighted loss of each, the difference (A - B) and its standard
+/// error from blocks of consecutive rows (the held-out tail is in game order, so a block of 2,000 rows = ~20 whole games
+/// and blocks are close to independent; rows inside one game are not). z = difference / SE. Both models must use the
+/// same bucket count (process-global).
+pub fn residual_pair(args: &[String]) -> ExitCode {
+    let (Some(pa), Some(pb)) = (arg(args, "--a"), arg(args, "--b")) else {
+        eprintln!("usage: lab residual-pair --a A_weights.json --b B_weights.json [--block 2000]");
+        return ExitCode::from(2);
+    };
+    let blk: usize = arg(args, "--block").map_or(2000, |v| v.parse().unwrap());
+    let ra = Residual::load(&pa);
+    let nb_a = nbk();
+    let rb = Residual::load(&pb);
+    if nbk() != nb_a {
+        eprintln!("residual-pair: bucket counts differ ({nb_a} vs {})", nbk());
+        return ExitCode::from(2);
+    }
+    let val = match crate::standard::standard_split(args, &["--holdout", "--max-rows", "--data", "--val"]) {
+        Ok((_, _, v)) => v,
+        Err(e) => {
+            eprintln!("residual-pair: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (mut sa, mut sb, mut sw) = (0f64, 0f64, 0f64);
+    let mut blocks: Vec<(f64, f64, f64)> = Vec::new();
+    for (i, row) in val.iter().enumerate() {
+        if i % blk == 0 {
+            blocks.push((0.0, 0.0, 0.0));
+        }
+        let b = board(row);
+        let t = target(row, false);
+        let wt = row.wsum.max(0.0) as f64;
+        let la = wt * ((sig(ra.eval_f(&b) / 400.0) - t).abs() as f64).powf(2.5);
+        let lb = wt * ((sig(rb.eval_f(&b) / 400.0) - t).abs() as f64).powf(2.5);
+        let k = blocks.last_mut().unwrap();
+        k.0 += la;
+        k.1 += lb;
+        k.2 += wt;
+        sa += la;
+        sb += lb;
+        sw += wt;
+    }
+    let (la, lb) = (sa / sw, sb / sw);
+    let d = la - lb;
+    let kn = blocks.len() as f64;
+    let var: f64 = blocks.iter().map(|&(a, b, w)| ((a - b) - d * w).powi(2)).sum::<f64>() * kn / (kn - 1.0).max(1.0);
+    let se = var.sqrt() / sw;
+    println!(
+        "residual-pair: {} held-out rows, {} blocks of {blk}: A {la:.7} | B {lb:.7} | A - B {d:+.7} +- {se:.7} (SE) | z {:+.2} | B vs A {:+.3}% +- {:.3}%",
+        val.len(),
+        blocks.len(),
+        d / se.max(1e-12),
+        100.0 * (lb - la) / la,
+        100.0 * se / la
+    );
+    println!("residual-pair: A = {pa}\nresidual-pair: B = {pb}");
+    ExitCode::SUCCESS
+}
+
 /// --experiment only (D1130): the pre-D1130 data paths (val-split, typed holdout fraction, separate val file, --max-rows).
 fn experiment_split(args: &[String], data: &str, valp: &str, max_rows: usize) -> (Vec<Rec>, Vec<Rec>) {
     let g = |k: &str, d: f64| arg(args, k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
