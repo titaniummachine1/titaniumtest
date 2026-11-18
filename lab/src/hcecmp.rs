@@ -46,6 +46,7 @@ pub(crate) fn block(set: usize) -> usize {
     match set {
         0 => G_N,
         5 => 1, // D1053: bias only (calibration baseline for hce-train --on-nnue)
+        10 => 1 + 4 * 49, // D1185: erosion (inside pieces) planes, depth 1 + 2, own + enemy, per square, per bucket
         9 => 1 + 2 * 49, // D1176: safe-stone COUNTS (stones with no empty neighbour), one-hot own 0..48 + enemy 0..48, per bucket
         6..=8 => O_N, // D1057: parts of "ours" (6 = scalar terms, 7 = dynamic PST, 8 = soft weaknesses), same layout
         1 => F_N,
@@ -190,6 +191,22 @@ pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mu
             push(out, base, 1.0);
             push(out, base + 1 + (me & !be).count_ones() as usize, 1.0);
             push(out, base + 50 + (op & !be).count_ones() as usize, 1.0);
+        }
+        10 => {
+            // D1185 (user): INSIDE pieces = erosion of each side's stones ("inverse BFS": remove every stone that touches a
+            // square not its own; the board edge counts as own); depth 1 = surrounded by its own kind, depth 2 = inside that.
+            // Per square planes: own d1 (1..49), own d2 (50..98), enemy d1 (99..147), enemy d2 (148..196).
+            const FULL: u64 = (1u64 << 49) - 1;
+            let erode = |s: u64| s & !box1(FULL & !s);
+            push(out, base, 1.0);
+            for (k, plane) in [erode(me), erode(erode(me)), erode(op), erode(erode(op))].into_iter().enumerate() {
+                let mut x = plane;
+                while x != 0 {
+                    let q = x.trailing_zeros() as usize;
+                    x &= x - 1;
+                    push(out, base + 1 + k * 49 + q, 1.0);
+                }
+            }
         }
         6..=8 => {
             // D1057 split of "ours": index ranges inside the block (0 = bias kept in all three)
