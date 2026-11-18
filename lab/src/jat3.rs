@@ -27,14 +27,33 @@ use std::process::ExitCode;
 use titanium::nnue::Nnue;
 use titanium::{Board, MoveList};
 
-pub const H: usize = 256;
+/// Zataxx's hidden width (the graft source); a jat3 net's own width is in its file header (D1152: 256 or downscaled)
+pub const ZH: usize = 256;
+pub const MAXH: usize = 256;
 pub const NW: usize = 25;
 pub const NC: usize = 19_683;
 pub const NI: usize = NW * NC;
-pub const FB: usize = NI * H;
-pub const OW: usize = FB + H;
-pub const OB: usize = OW + H;
-pub const P: usize = OB + 1;
+
+/// weight layout of a jat3 net with hidden width h: [NI rows x h][fb h][ow h][ob]
+#[derive(Clone, Copy)]
+pub struct Lay {
+    pub h: usize,
+}
+
+impl Lay {
+    pub fn fb(&self) -> usize {
+        NI * self.h
+    }
+    pub fn ow(&self) -> usize {
+        NI * self.h + self.h
+    }
+    pub fn ob(&self) -> usize {
+        NI * self.h + 2 * self.h
+    }
+    pub fn p(&self) -> usize {
+        NI * self.h + 2 * self.h + 1
+    }
+}
 
 /// base-3 value of one 3-cell window row: TAB[me 3 bits][opp 3 bits]
 fn row_tab() -> [[u16; 8]; 8] {
@@ -73,19 +92,21 @@ pub fn jidx(us: u64, them: u64, t: &[[u16; 8]; 8], out: &mut [u32; NW]) {
     }
 }
 
-fn fwd(w: &[f32], ix: &[u32; NW], h: &mut [f32; H]) -> f32 {
-    h.copy_from_slice(&w[FB..FB + H]);
+fn fwd(w: &[f32], ix: &[u32; NW], h: &mut [f32; MAXH], ly: Lay) -> f32 {
+    let hd = ly.h;
+    let (fb, ow, ob) = (ly.fb(), ly.ow(), ly.ob());
+    h[..hd].copy_from_slice(&w[fb..fb + hd]);
     for &i in ix {
-        let row = &w[i as usize * H..i as usize * H + H];
-        for k in 0..H {
+        let row = &w[i as usize * hd..i as usize * hd + hd];
+        for k in 0..hd {
             h[k] += row[k];
         }
     }
-    let ow = &w[OW..OW + H];
-    let mut s = w[OB];
-    for k in 0..H {
+    let owv = &w[ow..ow + hd];
+    let mut s = w[ob];
+    for k in 0..hd {
         let a = h[k].clamp(0.0, 1.0);
-        s += a * a * ow[k];
+        s += a * a * owv[k];
     }
     s
 }
@@ -94,17 +115,17 @@ fn fwd(w: &[f32], ix: &[u32; NW], h: &mut [f32; H]) -> f32 {
 fn zat_fwd(z: &Zat, us: u64, them: u64) -> f32 {
     let mut ix = [0usize; 36];
     crate::zattrain::zidx_pub(us, them, &mut ix);
-    let mut h = [0f32; H];
-    for k in 0..H {
+    let mut h = [0f32; ZH];
+    for k in 0..ZH {
         h[k] = z.fb[k] as f32 / 255.0;
     }
     for &i in &ix {
-        for k in 0..H {
-            h[k] += z.fw[i * H + k] as f32 / 255.0;
+        for k in 0..ZH {
+            h[k] += z.fw[i * ZH + k] as f32 / 255.0;
         }
     }
     let mut s = z.obias as f32 / (255.0 * 64.0);
-    for k in 0..H {
+    for k in 0..ZH {
         let a = h[k].clamp(0.0, 1.0);
         s += a * a * (z.ow[k] as f32 / 64.0);
     }
@@ -113,8 +134,11 @@ fn zat_fwd(z: &Zat, us: u64, them: u64) -> f32 {
 
 /// exact graft of a Zataxx 2x2 net into the 3x3 first layer (see the module doc)
 fn graft(z: &Zat, w: &mut [f32], threads: usize) {
+    const H: usize = ZH;
+    let zl = Lay { h: ZH };
+    let (fbo, owo, obo) = (zl.fb(), zl.ow(), zl.ob());
     let cnt = |i: usize| if i == 0 || i == 5 { 1.0f32 } else { 2.0 };
-    let wins: Vec<(usize, &mut [f32])> = w[..FB].chunks_mut(NC * H).enumerate().collect();
+    let wins: Vec<(usize, &mut [f32])> = w[..fbo].chunks_mut(NC * H).enumerate().collect();
     let per = wins.len().div_ceil(threads.max(1));
     let mut groups: Vec<Vec<(usize, &mut [f32])>> = Vec::new();
     let mut it = wins.into_iter();
@@ -156,16 +180,198 @@ fn graft(z: &Zat, w: &mut [f32], threads: usize) {
         }
     });
     for k in 0..H {
-        w[FB + k] = z.fb[k] as f32 / 255.0;
-        w[OW + k] = z.ow[k] as f32 / 64.0;
+        w[fbo + k] = z.fb[k] as f32 / 255.0;
+        w[owo + k] = z.ow[k] as f32 / 64.0;
     }
-    w[OB] = z.obias as f32 / (255.0 * 64.0);
+    w[obo] = z.obias as f32 / (255.0 * 64.0);
+}
+
+/// D1152 downscale = the hub's standard `ti train shrink --refit` method (shrink.rs) carried over to jat3: activations
+/// feeding the next layer x_c = clamp(h_c, 0, 1)^2 (SCReLU), next layer = the single output unit; channel choice =
+/// pivoted Cholesky on the downstream-scaled covariance (cov of x times |ow_p| |ow_q|); ridge refit (1e-4 x mean diagonal)
+/// of ow + ob on the kept channels' x, target = the original net's output; fit on the even calibration rows, report on
+/// the odd ones. Returns (new weights, report line).
+fn shrink_refit(net: &Jat3Net, h2: usize, cal: &[(u64, u64)]) -> (Vec<f32>, String) {
+    let (ly, hd) = (net.ly, net.ly.h);
+    assert!(h2 > 0 && h2 < hd, "--shrink must be below the current width {hd}");
+    let mut buf = [0f32; MAXH];
+    let mut ix = [0u32; NW];
+    // activations + original output per calibration position
+    let mut xs: Vec<f32> = Vec::with_capacity(cal.len() * hd);
+    let mut ys: Vec<f64> = Vec::with_capacity(cal.len());
+    for &(me, op) in cal {
+        jidx(me, op, &net.t, &mut ix);
+        ys.push(fwd(&net.w, &ix, &mut buf, ly) as f64);
+        xs.extend(buf[..hd].iter().map(|v| {
+            let a = v.clamp(0.0, 1.0);
+            a * a
+        }));
+    }
+    let owv: Vec<f64> = net.w[ly.ow()..ly.ow() + hd].iter().map(|&v| v as f64).collect();
+    let fit: Vec<usize> = (0..cal.len()).step_by(2).collect();
+    let test: Vec<usize> = (1..cal.len()).step_by(2).collect();
+    // downstream-scaled covariance on the fit rows
+    let mut mean = vec![0f64; hd];
+    for &r in &fit {
+        for c in 0..hd {
+            mean[c] += xs[r * hd + c] as f64;
+        }
+    }
+    mean.iter_mut().for_each(|m| *m /= fit.len() as f64);
+    let mut cov = vec![vec![0f64; hd]; hd];
+    let mut d = vec![0f64; hd];
+    for &r in &fit {
+        for c in 0..hd {
+            d[c] = xs[r * hd + c] as f64 - mean[c];
+        }
+        for p in 0..hd {
+            if d[p] != 0.0 {
+                for q in p..hd {
+                    cov[p][q] += d[p] * d[q];
+                }
+            }
+        }
+    }
+    for p in 0..hd {
+        for q in p..hd {
+            let v = cov[p][q] / fit.len() as f64 * owv[p].abs() * owv[q].abs();
+            cov[p][q] = v;
+            cov[q][p] = v;
+        }
+    }
+    // pivoted Cholesky (same as shrink.rs::pivots)
+    let mut diag: Vec<f64> = (0..hd).map(|i| cov[i][i]).collect();
+    let total: f64 = diag.iter().sum();
+    let mut lcols: Vec<Vec<f64>> = Vec::new();
+    let mut used = vec![false; hd];
+    let mut keep = Vec::new();
+    for _ in 0..h2 {
+        let (mut p, mut best) = (usize::MAX, -1.0);
+        for i in 0..hd {
+            if !used[i] && diag[i] > best {
+                best = diag[i];
+                p = i;
+            }
+        }
+        if p == usize::MAX || best <= 1e-18 {
+            break;
+        }
+        used[p] = true;
+        keep.push(p);
+        let mut col = vec![0f64; hd];
+        for i in 0..hd {
+            let mut s = cov[i][p];
+            for lj in &lcols {
+                s -= lj[i] * lj[p];
+            }
+            col[i] = s / best.sqrt();
+        }
+        for i in 0..hd {
+            diag[i] = (diag[i] - col[i] * col[i]).max(0.0);
+        }
+        lcols.push(col);
+    }
+    assert_eq!(keep.len(), h2, "only {} usable channels", keep.len());
+    let unexplained: f64 = (0..hd).filter(|i| !used[*i]).map(|i| diag[i]).sum::<f64>() / total.max(1e-18);
+    keep.sort_unstable();
+    // ridge refit of ow + ob (target = original output) on the fit rows
+    let n = h2 + 1;
+    let mut gm = vec![vec![0f64; n]; n];
+    let mut hv = vec![0f64; n];
+    let mut xr = vec![0f64; n];
+    for &r in &fit {
+        for (j, &c) in keep.iter().enumerate() {
+            xr[j] = xs[r * hd + c] as f64;
+        }
+        xr[h2] = 1.0;
+        for p in 0..n {
+            if xr[p] != 0.0 {
+                for q in p..n {
+                    gm[p][q] += xr[p] * xr[q];
+                }
+                hv[p] += xr[p] * ys[r];
+            }
+        }
+    }
+    for p in 0..n {
+        for q in 0..p {
+            gm[p][q] = gm[q][p];
+        }
+    }
+    let tr: f64 = (0..n).map(|i| gm[i][i]).sum::<f64>() / n as f64;
+    let ridge = 1e-4 * tr.max(1e-9);
+    for i in 0..n {
+        gm[i][i] += ridge;
+    }
+    // Gaussian elimination with partial pivoting (shrink.rs::solve_multi, one right-hand side)
+    let mut b: Vec<f64> = hv;
+    for c in 0..n {
+        let p = (c..n).max_by(|&x, &y| gm[x][c].abs().partial_cmp(&gm[y][c].abs()).unwrap()).unwrap();
+        gm.swap(c, p);
+        b.swap(c, p);
+        let dv = gm[c][c];
+        for k in c..n {
+            gm[c][k] /= dv;
+        }
+        b[c] /= dv;
+        for r in 0..n {
+            if r != c {
+                let f = gm[r][c];
+                if f != 0.0 {
+                    for k in c..n {
+                        let t = gm[c][k];
+                        gm[r][k] -= f * t;
+                    }
+                    let t = b[c];
+                    b[r] -= f * t;
+                }
+            }
+        }
+    }
+    // held-out (odd rows) error of: plain prune (kept channels, original ow/ob) and the refit, in cp
+    let obv = net.w[ly.ob()] as f64;
+    let (mut ep, mut er) = (0f64, 0f64);
+    for &r in &test {
+        let (mut sp, mut sr) = (obv, b[h2]);
+        for (j, &c) in keep.iter().enumerate() {
+            let x = xs[r * hd + c] as f64;
+            sp += owv[c] * x;
+            sr += b[j] * x;
+        }
+        ep += ((sp - ys[r]) * 400.0).powi(2);
+        er += ((sr - ys[r]) * 400.0).powi(2);
+    }
+    let (ep, er) = ((ep / test.len() as f64).sqrt(), (er / test.len() as f64).sqrt());
+    // new weights: kept columns of every first-layer row and of fb, refit ow / ob
+    let nl = Lay { h: h2 };
+    let mut w2 = vec![0f32; nl.p()];
+    for row in 0..NI {
+        let src = &net.w[row * hd..row * hd + hd];
+        let dst = &mut w2[row * h2..row * h2 + h2];
+        for (j, &c) in keep.iter().enumerate() {
+            dst[j] = src[c];
+        }
+    }
+    for (j, &c) in keep.iter().enumerate() {
+        w2[nl.fb() + j] = net.w[ly.fb() + c];
+        w2[nl.ow() + j] = b[j] as f32;
+    }
+    w2[nl.ob()] = b[h2] as f32;
+    let rep = format!(
+        "downscale {hd} -> {h2} (ti train shrink --refit method): {} calibration positions (fit {} even / test {} odd); downstream-weighted variance NOT explained by the kept channels {:.3}%; held-out output RMSE vs the {hd} net: plain prune {ep:.1} cp, ridge refit {er:.1} cp",
+        cal.len(),
+        fit.len(),
+        test.len(),
+        100.0 * unexplained
+    );
+    (w2, rep)
 }
 
 /// a trained jat3 net for eval-gate (`*_jat3.json` -> its `_jat3.bin`)
 pub struct Jat3Net {
     w: Vec<f32>,
     t: [[u16; 8]; 8],
+    ly: Lay,
 }
 
 impl Jat3Net {
@@ -175,15 +381,18 @@ impl Jat3Net {
         let mut b = Vec::new();
         f.read_to_end(&mut b).expect("read jat3 bin");
         assert_eq!(&b[..4], b"JAT3", "{bin}: not a JAT3 file");
+        let h = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+        assert!(h > 0 && h <= MAXH, "{bin}: hidden width {h}");
+        let ly = Lay { h };
         let w: Vec<f32> = b[8..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        assert_eq!(w.len(), P, "{bin}: {} weights, expected {P}", w.len());
-        Jat3Net { w, t: row_tab() }
+        assert_eq!(w.len(), ly.p(), "{bin}: {} weights, expected {} for width {h}", w.len(), ly.p());
+        Jat3Net { w, t: row_tab(), ly }
     }
     pub fn eval(&self, b: &Board) -> i32 {
         let mut ix = [0u32; NW];
         jidx(b.me(), b.opp(), &self.t, &mut ix);
-        let mut h = [0f32; H];
-        (fwd(&self.w, &ix, &mut h) * 400.0).round().clamp(-30000.0, 30000.0) as i32
+        let mut h = [0f32; MAXH];
+        (fwd(&self.w, &ix, &mut h, self.ly) * 400.0).round().clamp(-30000.0, 30000.0) as i32
     }
 }
 
@@ -417,10 +626,10 @@ pub fn compare(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn save(out: &str, w: &[f32]) {
+fn save(out: &str, w: &[f32], h: usize) {
     let mut bytes = Vec::with_capacity(8 + w.len() * 4);
     bytes.extend_from_slice(b"JAT3");
-    bytes.extend_from_slice(&(H as u32).to_le_bytes());
+    bytes.extend_from_slice(&(h as u32).to_le_bytes());
     for x in w {
         bytes.extend_from_slice(&x.to_le_bytes());
     }
@@ -485,22 +694,33 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // init (C14): exact graft of the Zataxx 2x2 net, or a previous jat3 run (--init, resume)
     let z = Zat::load(&zp);
-    let mut w = vec![0f32; P];
-    let init_label;
-    if let Some(ip) = arg(args, "--init") {
+    // D1152: --shrink H2 (with --init) = downscale the previous net to H2 hidden units by the standard shrink --refit method
+    let shrink_to = arg(args, "--shrink").and_then(|v| v.parse::<usize>().ok());
+    let (mut w, ly, init_label) = if let Some(ip) = arg(args, "--init") {
         let prev = Jat3Net::load(&ip.replace("_jat3.bin", "_jat3.json"));
-        w.copy_from_slice(&prev.w);
-        init_label = format!("previous jat3 run {ip}");
+        if let Some(h2) = shrink_to {
+            let cal: Vec<(u64, u64)> = train.iter().step_by((train.len() / 200_000).max(1)).take(200_000).map(own_opp).collect();
+            let (w2, rep) = shrink_refit(&prev, h2, &cal);
+            say(rep, &mut log);
+            (w2, Lay { h: h2 }, format!("{ip} downscaled {} -> {h2} (standard shrink --refit method, C14)", prev.ly.h))
+        } else {
+            (prev.w.clone(), prev.ly, format!("previous jat3 run {ip}"))
+        }
     } else {
+        let zl = Lay { h: ZH };
+        let mut w = vec![0f32; zl.p()];
         graft(&z, &mut w, threads);
-        init_label = format!("exact graft of Zataxx 2x2 net {zp}");
-    }
-    // step-0 parity with the Zataxx net (graft only)
+        (w, zl, format!("exact graft of Zataxx 2x2 net {zp}"))
+    };
+    let hd = ly.h;
+    let (fbo, owo) = (ly.fb(), ly.ow());
+    let pn = ly.p();
+    // step-0 parity with the Zataxx net (meaningful for a fresh graft only)
     let mut maxd = 0f32;
-    let mut hh = [0f32; H];
+    let mut hh = [0f32; MAXH];
     for (r, ix) in val.iter().zip(&vix).step_by((val.len() / 20_000).max(1)) {
         let (me, op) = own_opp(r);
-        let d = (fwd(&w, ix, &mut hh) - zat_fwd(&z, me, op)).abs() * 400.0;
+        let d = (fwd(&w, ix, &mut hh, ly) - zat_fwd(&z, me, op)).abs() * 400.0;
         maxd = maxd.max(d);
     }
     let vloss = |w: &[f32]| -> f64 {
@@ -510,10 +730,10 @@ pub fn run(args: &[String]) -> ExitCode {
                 .zip(vix.chunks(chunk))
                 .map(|(vs, xs)| {
                     sc.spawn(move || {
-                        let mut h = [0f32; H];
+                        let mut h = [0f32; MAXH];
                         let (mut l, mut ws) = (0f64, 0f64);
                         for (r, ix) in vs.iter().zip(xs) {
-                            let p = sig(fwd(w, ix, &mut h));
+                            let p = sig(fwd(w, ix, &mut h, ly));
                             let wt = r.wsum.max(0.0) as f64;
                             l += wt * ((p - target(r, false)).abs() as f64).powf(2.5);
                             ws += wt;
@@ -542,18 +762,18 @@ pub fn run(args: &[String]) -> ExitCode {
         l / ws
     };
     let i_l = vloss(&w);
-    say(format!("jat3-train: 3x3 tuple NETWORK 25 windows x {NC} codes = {NI} input rows -> {H} SCReLU -> 1 ({P} weights), {} train rows, {} val rows, {threads} threads, bs {bs}, lr {lr0}, D4 augmentation always on ({:.0}s)", train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
+    say(format!("jat3-train: 3x3 tuple NETWORK 25 windows x {NC} codes = {NI} input rows -> {hd} SCReLU -> 1 ({pn} weights), {} train rows, {} val rows, {threads} threads, bs {bs}, lr {lr0}, D4 augmentation always on ({:.0}s)", train.len(), val.len(), t0.elapsed().as_secs_f64()), &mut log);
     say(format!("init = {init_label}: step-0 max |jat3 - zataxx| on 20k val positions {maxd:.4} cp (0 = exact graft); val loss {i_l:.6}; champion NNUE on the same rows {champ:.6}"), &mut log);
 
-    let mut mo = vec![0f32; P];
-    let mut ve = vec![0f32; P];
-    let mut gfirst = vec![0f32; FB];
+    let mut mo = vec![0f32; pn];
+    let mut ve = vec![0f32; pn];
+    let mut gfirst = vec![0f32; fbo];
     let mut last = vec![0u32; NI];
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
     let mut step = 0u32; // global batch counter (lazy-row bookkeeping)
     let mut astep = 0i32; // Adam bias-correction counter, reset with the moments at every restart
     let mut best = (i_l, w.clone(), 0usize);
-    save(&out, &best.1);
+    save(&out, &best.1, hd);
     let mut lr = lr0;
     let mut bad = 0usize;
     let mut cycle_gain = false;
@@ -561,9 +781,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut cycle = 0usize;
     let mut order: Vec<usize> = (0..train.len()).collect();
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-    let mut gh = vec![0f32; bs * H];
+    let mut gh = vec![0f32; bs * hd];
     let mut ixb = vec![0u32; bs * NW];
-    let mut small: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; 2 * H + 1]).collect();
+    let mut small: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; 2 * hd + 1]).collect();
     let nbatch = train.len().div_ceil(bs);
     for epoch in 1.. {
         let (mut tl, mut tw) = (0f64, 0f64);
@@ -582,12 +802,12 @@ pub fn run(args: &[String]) -> ExitCode {
             let res: Vec<(f64, f64)> = std::thread::scope(|sc| {
                 batch
                     .chunks(chunk)
-                    .zip(gh.chunks_mut(chunk * H))
+                    .zip(gh.chunks_mut(chunk * hd))
                     .zip(ixb.chunks_mut(chunk * NW))
                     .zip(small.iter_mut())
                     .map(|(((idx, ghs), ixs), sg)| {
                         sc.spawn(move || {
-                            let mut h = [0f32; H];
+                            let mut h = [0f32; MAXH];
                             let mut ix = [0u32; NW];
                             let (mut l, mut ws) = (0f64, 0f64);
                             for (s, &kk) in idx.iter().enumerate() {
@@ -599,24 +819,24 @@ pub fn run(args: &[String]) -> ExitCode {
                                 let (me, op) = own_opp(r);
                                 jidx(sym(me, m), sym(op, m), tb, &mut ix);
                                 ixs[s * NW..s * NW + NW].copy_from_slice(&ix);
-                                let g = &mut ghs[s * H..s * H + H];
+                                let g = &mut ghs[s * hd..s * hd + hd];
                                 if wt == 0.0 {
                                     g.iter_mut().for_each(|v| *v = 0.0);
                                     continue;
                                 }
-                                let y = fwd(wr, &ix, &mut h);
+                                let y = fwd(wr, &ix, &mut h, ly);
                                 let p = sig(y);
                                 let diff = p - target(r, true);
                                 let ad = diff.abs();
                                 l += (wt * ad.powf(2.5)) as f64;
                                 ws += wt as f64;
                                 let dy = wt * 2.5 * diff.signum() * ad.powf(1.5) * p * (1.0 - p);
-                                sg[2 * H] += dy;
-                                for k in 0..H {
+                                sg[2 * hd] += dy;
+                                for k in 0..hd {
                                     let hk = h[k];
                                     let a = hk.clamp(0.0, 1.0);
-                                    sg[H + k] += dy * a * a;
-                                    let gk = if hk > 0.0 && hk < 1.0 { dy * wr[OW + k] * 2.0 * hk } else { 0.0 };
+                                    sg[hd + k] += dy * a * a;
+                                    let gk = if hk > 0.0 && hk < 1.0 { dy * wr[owo + k] * 2.0 * hk } else { 0.0 };
                                     g[k] = gk;
                                     sg[k] += gk;
                                 }
@@ -640,11 +860,11 @@ pub fn run(args: &[String]) -> ExitCode {
             // batch gradient of each touched row, then lazy Adam on exactly those rows
             {
                 let mut per: Vec<Vec<(usize, &mut [f32], &mut [f32], &mut [f32], &mut [f32], &mut [u32])>> = (0..threads).map(|_| Vec::new()).collect();
-                for (wi, ((((ws_, ms), vs), gs), ls)) in w[..FB]
-                    .chunks_mut(NC * H)
-                    .zip(mo[..FB].chunks_mut(NC * H))
-                    .zip(ve[..FB].chunks_mut(NC * H))
-                    .zip(gfirst.chunks_mut(NC * H))
+                for (wi, ((((ws_, ms), vs), gs), ls)) in w[..fbo]
+                    .chunks_mut(NC * hd)
+                    .zip(mo[..fbo].chunks_mut(NC * hd))
+                    .zip(ve[..fbo].chunks_mut(NC * hd))
+                    .zip(gfirst.chunks_mut(NC * hd))
                     .zip(last.chunks_mut(NC))
                     .enumerate()
                 {
@@ -664,8 +884,8 @@ pub fn run(args: &[String]) -> ExitCode {
                                         seen[row] = true;
                                         touched.push(row);
                                     }
-                                    let gr = &mut gsl[row * H..row * H + H];
-                                    for (a, b) in gr.iter_mut().zip(&ghr[s * H..s * H + H]) {
+                                    let gr = &mut gsl[row * hd..row * hd + hd];
+                                    for (a, b) in gr.iter_mut().zip(&ghr[s * hd..s * hd + hd]) {
                                         *a += *b;
                                     }
                                 }
@@ -674,7 +894,7 @@ pub fn run(args: &[String]) -> ExitCode {
                                     let delta = (step - lsl[row]) as i32;
                                     lsl[row] = step;
                                     let (d1, d2) = (b1.powi(delta - 1) * b1, b2.powi(delta - 1) * b2);
-                                    for k in row * H..row * H + H {
+                                    for k in row * hd..row * hd + hd {
                                         let gi = gsl[k] * inv;
                                         gsl[k] = 0.0;
                                         msl[k] = d1 * msl[k] + (1.0 - b1) * gi;
@@ -688,14 +908,14 @@ pub fn run(args: &[String]) -> ExitCode {
                 });
             }
             // phase C: head (fb, ow, ob), dense Adam
-            for j in 0..2 * H + 1 {
+            for j in 0..2 * hd + 1 {
                 let mut gi = 0f32;
                 for sg in small.iter_mut() {
                     gi += sg[j];
                     sg[j] = 0.0;
                 }
                 gi *= inv;
-                let p = FB + j;
+                let p = fbo + j;
                 mo[p] = b1 * mo[p] + (1.0 - b1) * gi;
                 ve[p] = b2 * ve[p] + (1.0 - b2) * gi * gi;
                 w[p] -= lr * (mo[p] / c1) / ((ve[p] / c2).sqrt() + eps);
@@ -709,7 +929,7 @@ pub fn run(args: &[String]) -> ExitCode {
         let improved = vl < best.0 - 1e-7;
         if improved {
             best = (vl, w.clone(), epoch);
-            save(&out, &best.1);
+            save(&out, &best.1, hd);
             bad = 0;
             cycle_gain = true;
         } else {
@@ -743,7 +963,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
     // agreement with the champion on sibling best moves (2,000 val positions), best weights
-    let bn = Jat3Net { w: best.1.clone(), t: tab };
+    let bn = Jat3Net { w: best.1.clone(), t: tab, ly };
     let (mut ag, mut nn) = (0f64, 0f64);
     let mut ml = MoveList::new();
     for r in val.iter().step_by((val.len() / 2000).max(1)).take(2000) {
@@ -773,7 +993,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some(n) => format!("\"standard\":false,\"experiment\":\"{n}\""),
     };
     let js = format!(
-        "{{{stamp},\"model\":\"jat3\",\"hidden\":{H},\"inputs\":{NI},\"train_rows\":{},\"val_rows\":{},\"best_epoch\":{},\"val_loss\":{},\"champion_val_loss\":{champ},\"init\":\"{}\"}}",
+        "{{{stamp},\"model\":\"jat3\",\"hidden\":{hd},\"inputs\":{NI},\"train_rows\":{},\"val_rows\":{},\"best_epoch\":{},\"val_loss\":{},\"champion_val_loss\":{champ},\"init\":\"{}\"}}",
         train.len(),
         val.len(),
         best.2,
