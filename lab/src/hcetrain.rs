@@ -262,7 +262,15 @@ pub fn run(args: &[String]) -> ExitCode {
     let bs = g("--bs", 16384.0) as usize;
     let mut lr = g("--lr", 2.0) as f32;
     let max_rows = g("--max-rows", 1e12) as usize;
-    let out = arg(args, "--out").unwrap_or_else(|| "C:/gitProjects/titanium-ataxx/logs/hce/d977_hcetrain".into());
+    // D1176: no default output (a bare call overwrote logs/hce/d977_hcetrain.*) and never overwrite an existing run
+    let Some(out) = arg(args, "--out") else {
+        eprintln!("hce-train: --out STEM is required (no default; an existing STEM.log is never overwritten)");
+        std::process::exit(2);
+    };
+    if std::path::Path::new(&format!("{out}.log")).exists() {
+        eprintln!("hce-train: {out}.log already exists; refusing to overwrite (pick a new --out)");
+        std::process::exit(2);
+    }
     set_nbk(g("--buckets", 16.0) as usize);
     let d_base = nbk() * block(set);
     // --pairs 1 (D991): gataxx's pair-pattern residual + mobility table, appended after the bucketed HCE, init 0

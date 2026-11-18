@@ -46,6 +46,7 @@ pub(crate) fn block(set: usize) -> usize {
     match set {
         0 => G_N,
         5 => 1, // D1053: bias only (calibration baseline for hce-train --on-nnue)
+        9 => 1 + 2 * 49, // D1176: safe-stone COUNTS (stones with no empty neighbour), one-hot own 0..48 + enemy 0..48, per bucket
         6..=8 => O_N, // D1057: parts of "ours" (6 = scalar terms, 7 = dynamic PST, 8 = soft weaknesses), same layout
         1 => F_N,
         2 => A_N,
@@ -183,6 +184,13 @@ pub(crate) fn feats(set: usize, b: &Board, ring: &[u64; 49], m: &Masks, out: &mu
             }
         }
         5 => push(out, base, 1.0),
+        9 => {
+            // D1176 (D1169/D1170): the champion under-values safe stones; a GLOBAL count x phase, non-linear (one-hot)
+            let be = box1(e);
+            push(out, base, 1.0);
+            push(out, base + 1 + (me & !be).count_ones() as usize, 1.0);
+            push(out, base + 50 + (op & !be).count_ones() as usize, 1.0);
+        }
         6..=8 => {
             // D1057 split of "ours": index ranges inside the block (0 = bias kept in all three)
             let (lo, hi) = match set { 6 => (0, 7), 7 => (7, 187), _ => (187, O_N) };
