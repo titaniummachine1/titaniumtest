@@ -98,8 +98,8 @@ pub struct GpuCfg {
     pub max_drops: usize,
     /// proven rows train on blend*proof + (1-blend)*sigmoid(cp5k); 1.0 = exact proofs (default, D162)
     pub proof_blend: f32,
-    /// game-result weight by phase [<=6 empties, 7..12, >=13] instead of the fixed 0.25 (engine D310); val rows follow it
-    pub result_weight: Option<[f32; 3]>,
+    /// game-result weight per NNUE phase bucket (16; the 3-value `--result-weight-phase` is expanded, engine D310 / D1275); val rows follow it
+    pub result_weight: Option<crate::targets::Rw>,
     /// keep every checkpoint (ckpt_<step>.tnn) so a strength-vs-step curve can be gated afterwards
     pub keep_all: bool,
     /// D1181: Some((muon_lr, momentum)) = `--opt muon`: Muon on the l1w / l2w bucket blocks, Ranger on the rest; None = Ranger only (default)
@@ -107,7 +107,7 @@ pub struct GpuCfg {
 }
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32, rw: Option<[f32; 3]>) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32, rw: Option<crate::targets::Rw>) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     let nb = net.buckets;
     let map_id = net.groups >> 8; // bucket map id (copied: the sampler closure must be 'static)
@@ -285,7 +285,7 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     let mut val = trainer::load_val(&mut valf, c.val_rows)?;
     if let Some(rw) = c.result_weight {
         val = val.into_iter().map(|r| rw_val_row(r, rw)).collect();
-        println!("[result-weight] {rw:?} by empties (<=6, 7..12, >=13): val MSE is measured on this run's own target");
+        println!("[result-weight] {rw:?} by NNUE bucket (16; empties*16/50): val MSE is measured on this run's own target");
     }
     let sb = c.eval_every.max(1);
     let total_sb = (c.steps + sb - 1) / sb;

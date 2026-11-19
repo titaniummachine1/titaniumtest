@@ -118,7 +118,7 @@ pub fn refit_dis(net: &mut TrainableNet, train: &mut Tdat, rows: usize, l2: f64)
 /// Texel-style output calibration: per phase bucket fit `y' = s*y + c` so that `sigmoid(y')` best matches the training
 /// target (squared error in probability space), then fold it EXACTLY into out_w / out_b / psqt (y is linear in those).
 /// No trunk change, no games. The dis head must be refit afterwards (it predicts |400 y - cp5k|).
-pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize, rw: Option<[f32; 3]>) -> Result<(), String> {
+pub fn calibrate(net: &mut TrainableNet, train: &mut Tdat, rows: usize, rw: Option<crate::targets::Rw>) -> Result<(), String> {
     let nb = net.buckets;
     let out_in = net.out_in();
     let nblk = (train.rows / BLOCK).max(1);
@@ -206,13 +206,7 @@ fn run_export_inner(args: &[String]) -> Result<(), String> {
     };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     // a `--result-weight-phase` run recorded val on its own target and calibrates to it (engine D310)
-    let rw: Option<[f32; 3]> = match f("--result-weight-phase") {
-        Some(v) => {
-            let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
-            Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values")?)
-        }
-        None => None,
-    };
+    let rw: Option<crate::targets::Rw> = crate::targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
     let val = {
         let mut vf = Tdat::open(&val_stem)?;
         let v = crate::trainer::load_val(&mut vf, val_rows)?;

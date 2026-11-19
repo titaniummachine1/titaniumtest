@@ -243,13 +243,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
                 max_drops: g("--max-drops", 3),
                 proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
-                result_weight: match f("--result-weight-phase") {
-                    Some(v) => {
-                        let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
-                        Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values: <=6,7..12,>=13 empties")?)
-                    }
-                    None => None,
-                },
+                result_weight: targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?,
                 keep_all: crate::has_flag(args, "--keep-all"),
                 muon: if f("--opt").as_deref() == Some("muon") {
                     Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
@@ -262,13 +256,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         return Err("this ti was built without --features cuda".into());
     }
     // engine D427: the champion recipe (rwphase9 0.55/0.55/0.25) now also trains on the CPU backend
-    let result_weight: Option<[f32; 3]> = match f("--result-weight-phase") {
-        Some(v) => {
-            let w: Vec<f32> = v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad --result-weight-phase '{v}'"))).collect::<Result<_, _>>()?;
-            Some(<[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values: <=6,7..12,>=13 empties")?)
-        }
-        None => None,
-    };
+    let result_weight: Option<targets::Rw> = targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
     let out = f("--out").ok_or("--out <dir> required")?;
