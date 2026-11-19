@@ -100,6 +100,8 @@ pub struct GpuCfg {
     pub proof_blend: f32,
     /// game-result weight per NNUE phase bucket (16; the 3-value `--result-weight-phase` is expanded, engine D310 / D1275); val rows follow it
     pub result_weight: Option<crate::targets::Rw>,
+    /// D1282: per-NNUE-bucket sample loss multiplier (16 values)
+    pub loss_weight: Option<crate::targets::Rw>,
     /// keep every checkpoint (ckpt_<step>.tnn) so a strength-vs-step curve can be gated afterwards
     pub keep_all: bool,
     /// D1181: Some((muon_lr, momentum)) = `--opt muon`: Muon on the l1w / l2w bucket blocks, Ranger on the rest; None = Ranger only (default)
@@ -107,7 +109,7 @@ pub struct GpuCfg {
 }
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
-fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32, rw: Option<crate::targets::Rw>) -> (ModelInputsMapper<Rec>, ModelDefinition) {
+fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, proof_blend: f32, rw: Option<crate::targets::Rw>, lw: Option<crate::targets::Rw>) -> (ModelInputsMapper<Rec>, ModelDefinition) {
     let (w, l1, l2, oi) = (net.width, net.l1, net.l2, net.out_in());
     let nb = net.buckets;
     let map_id = net.groups >> 8; // bucket map id (copied: the sampler closure must be 'static)
@@ -146,7 +148,11 @@ fn build(net: &TrainableNet, d4: bool, holdout: Option<usize>, wsum_clip: f32, p
         }
         bk[0] = s.bucket as i32;
         target[0] = target_train_rw(r, proof_blend, rw).target;
-        wt[0] = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
+        let w = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
+        wt[0] = match lw {
+            Some(a) => w * a[crate::targets::rw_bucket(r)],
+            None => w,
+        };
     });
 
     let defn = ModelDefinition::build(&inputs, move |b, ((((stm, ntm), bucket), target), wt)| {
@@ -236,7 +242,7 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
         }
         println!("[holdout] DIAGNOSTIC RUN: D4 orientation {k} is never trained, it is validated separately");
     }
-    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend, c.result_weight);
+    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend, c.result_weight, c.loss_weight);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -286,6 +292,9 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     if let Some(rw) = c.result_weight {
         val = val.into_iter().map(|r| rw_val_row(r, rw)).collect();
         println!("[result-weight] {rw:?} by NNUE bucket (16; empties*16/50): val MSE is measured on this run's own target");
+    }
+    if let Some(lw) = c.loss_weight {
+        println!("[loss-weight] {lw:?} by NNUE bucket (16)");
     }
     let sb = c.eval_every.max(1);
     let total_sb = (c.steps + sb - 1) / sb;
@@ -423,7 +432,7 @@ fn parity_on<G: Gpu>(device: Arc<Device<G>>, init: &str, stem: &str, n: usize) -
     use bullet_trainer::model::ModelEvaluator;
     use bullet_trainer::run::{HostPool, Step};
     let net = load_init(init)?;
-    let (mapper, defn) = build(&net, false, None, 0.0, 1.0, None);
+    let (mapper, defn) = build(&net, false, None, 0.0, 1.0, None, None);
     let mut w = ModelWeights::new(&defn, 1);
     load_into(&mut w, &net);
     let mut ev = ModelEvaluator::new(&defn, device.clone()).map_err(|e| format!("{e:?}"))?;

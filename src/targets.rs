@@ -79,27 +79,39 @@ pub fn rw_from_phase(w: [f32; 3]) -> Rw {
     o
 }
 
+fn parse_csv_f32(v: &str, flag: &str) -> Result<Vec<f32>, String> {
+    v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad {flag} '{v}'"))).collect()
+}
+
 /// `--result-weight-buckets w0,..,w15` (16 values, one per NNUE bucket) or the legacy `--result-weight-phase a,b,c`.
 pub fn parse_rw(phase: Option<String>, buckets: Option<String>) -> Result<Option<Rw>, String> {
-    let nums = |v: &str, flag: &str| -> Result<Vec<f32>, String> {
-        v.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad {flag} '{v}'"))).collect()
-    };
     if let Some(v) = buckets {
-        let w = nums(&v, "--result-weight-buckets")?;
+        let w = parse_csv_f32(&v, "--result-weight-buckets")?;
         let a = Rw::try_from(w.as_slice()).map_err(|_| format!("--result-weight-buckets needs {RW_B} values (one per NNUE bucket)"))?;
-        if a.iter().any(|x| !(0.0..=1.0).contains(x)) {
+        if a.iter().any(|x| !x.is_finite() || !(0.0..=1.0).contains(x)) {
             return Err("--result-weight-buckets values must be in 0..=1".into());
         }
         return Ok(Some(a));
     }
     match phase {
         Some(v) => {
-            let w = nums(&v, "--result-weight-phase")?;
+            let w = parse_csv_f32(&v, "--result-weight-phase")?;
             let a = <[f32; 3]>::try_from(w.as_slice()).map_err(|_| "--result-weight-phase needs 3 values: <=6,7..12,>=13 empties".to_string())?;
             Ok(Some(rw_from_phase(a)))
         }
         None => Ok(None),
     }
+}
+
+/// D1282: per-NNUE-bucket sample loss multiplier `--loss-weight-buckets w0,..,w15` (16 finite values in 0..=10).
+pub fn parse_lw(buckets: Option<String>) -> Result<Option<Rw>, String> {
+    let Some(v) = buckets else { return Ok(None) };
+    let w = parse_csv_f32(&v, "--loss-weight-buckets")?;
+    let a = Rw::try_from(w.as_slice()).map_err(|_| format!("--loss-weight-buckets needs {RW_B} values (one per NNUE bucket)"))?;
+    if a.iter().any(|x| !x.is_finite() || !(0.0..=10.0).contains(x)) {
+        return Err("--loss-weight-buckets values must be finite in 0..=10".into());
+    }
+    Ok(Some(a))
 }
 
 /// Val rows for a `--result-weight-phase` run: rewrites `outcome` so that `target_of` (0.75*sig + 0.25*outcome) equals the
@@ -174,6 +186,18 @@ mod proof_blend_tests {
         assert!(parse_rw(None, Some("0.1,0.2".into())).is_err());
         assert!(parse_rw(None, Some("2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0".into())).is_err());
         assert_eq!(parse_rw(Some("0.55,0.55,0.25".into()), None).unwrap().unwrap()[5], 0.25);
+    }
+
+    #[test]
+    fn loss_weight_buckets_parse_and_bounds() {
+        assert_eq!(parse_lw(None).unwrap(), None);
+        let lw = parse_lw(Some("1.2,1.25,1.4,1.25,1.02,1.02,1.05,1.05,1.05,1.0,0.82,0.75,0.75,0.75,0.75,0.95".into())).unwrap().unwrap();
+        assert_eq!(lw[2], 1.4);
+        assert_eq!(lw[14], 0.75);
+        assert!(parse_lw(Some("1.0,2.0".into())).is_err());
+        assert!(parse_lw(Some("-0.1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1".into())).is_err());
+        assert!(parse_lw(Some("11.0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1".into())).is_err());
+        assert!(parse_lw(Some("NaN,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1".into())).is_err());
     }
 }
 

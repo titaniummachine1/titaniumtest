@@ -244,6 +244,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 max_drops: g("--max-drops", 3),
                 proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
                 result_weight: targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?,
+                loss_weight: targets::parse_lw(f("--loss-weight-buckets"))?,
                 keep_all: crate::has_flag(args, "--keep-all"),
                 muon: if f("--opt").as_deref() == Some("muon") {
                     Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
@@ -257,6 +258,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     }
     // engine D427: the champion recipe (rwphase9 0.55/0.55/0.25) now also trains on the CPU backend
     let result_weight: Option<targets::Rw> = targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
+    let loss_weight: Option<targets::Rw> = targets::parse_lw(f("--loss-weight-buckets"))?;
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
     let out = f("--out").ok_or("--out <dir> required")?;
@@ -297,6 +299,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     println!("[train] rows {} val {} bs {bs} steps {steps} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len());
     let v0 = evaluate(&net, &val, threads);
     println!("[val step {step0}] mse {:.6} proven {:.6} (n={}) other {:.6}   {}", v0.mse, v0.mse_proven, v0.n_proven, v0.mse_other, tensor_report(&net));
+    if let Some(lw) = loss_weight {
+        println!("[loss-weight] {lw:?} by NNUE bucket (16)");
+    }
 
     let mut opt = SparseAdamW::new(&net);
     // D1162 (user: "same trainer, only the optimiser changed"): --opt muonadamw = Muon on the l1 / l2 bucket blocks
@@ -348,7 +353,10 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                         let (mut l, mut wsum) = (0f64, 0f64);
                         for (r, &m) in rs.iter().zip(ms) {
                             let t = targets::target_train_rw(r, 1.0, result_weight);
-                            let w = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
+                            let mut w = if wsum_clip > 0.0 { r.wsum.clamp(0.0, wsum_clip) } else { r.wsum.max(0.0) };
+                            if let Some(lw) = loss_weight {
+                                w *= lw[targets::rw_bucket(r)];
+                            }
                             if w == 0.0 {
                                 continue;
                             }
