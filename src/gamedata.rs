@@ -472,6 +472,11 @@ pub fn run_append(args: &[String]) -> ExitCode {
     match r() {
         Ok((nb, na)) => {
             println!("data append: {out}.tdat = {nb} base rows + {na} new rows = {} rows (base and add files untouched)", nb + na);
+            // D1450 (LAWS D1): fingerprint of the result, compared with the PC file when the append runs on Modal
+            match fnv_file(&format!("{out}.tdat")) {
+                Ok((h, n)) => println!("data append: {out}.tdat {n} bytes, fnv1a64 {h:016X}"),
+                Err(e) => eprintln!("data append: fingerprint failed: {e}"),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

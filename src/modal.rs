@@ -42,6 +42,28 @@ pub fn run_modal(args: &[String]) -> ExitCode {
             };
             let dest = f("--dest").unwrap_or_else(|| "data".into());
             let listing = out(&mut modal(&["volume", "ls", VOLUME, &format!("/{dest}")]));
+            // D1450 / LAWS D1 (user D1257, D1448: 'we diff datasets, we do not upload the same thing over and over'): a dataset
+            // file above 512 MB is never uploaded whole while the volume folder already holds a dataset (a base version).
+            const BIG: u64 = 512 << 20;
+            let has_base = listing.lines().any(|l| l.trim_end().ends_with(".tdat"));
+            for p in files.split(',').filter(|s| !s.is_empty()) {
+                let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                if p.ends_with(".tdat") && size > BIG {
+                    if has_base {
+                        eprintln!(
+                            "refused (LAWS D1): {p} is {:.2} GB and /{dest} already holds a .tdat (a base version). Upload only the \
+                             difference: changed rows -> `ti data diff` + `ti data patch` on Modal; appended rows -> their own small \
+                             .tdat + `ti data append` on Modal; then compare the fingerprint with the PC file.",
+                            size as f64 / 1e9
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    if !crate::has_flag(args, "--allow-full-upload") {
+                        eprintln!("refused (LAWS D1): {p} is {:.2} GB; /{dest} has no .tdat yet, so a full upload is allowed only with --allow-full-upload", size as f64 / 1e9);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             for p in files.split(',').filter(|s| !s.is_empty()) {
                 let name = std::path::Path::new(p).file_name().unwrap().to_string_lossy().into_owned();
                 if listing.contains(&name) && !crate::has_flag(args, "--force") {
