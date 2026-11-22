@@ -96,6 +96,9 @@ pub struct GpuCfg {
     pub plateau: usize,
     pub lr_factor: f32,
     pub max_drops: usize,
+    /// D1553/D1554 (LAWS C15 + D5): epochs counted from the train rows; 4 epochs in a row without a val gain >= min_delta
+    /// stop the run (the LR itself comes from the optimiser, never a hand rule; patience / plateau / max_drops / steps unused)
+    pub epoch_rule: bool,
     /// proven rows train on blend*proof + (1-blend)*sigmoid(cp5k); 1.0 = exact proofs (default, D162)
     pub proof_blend: f32,
     /// game-result weight per NNUE phase bucket (16; the 3-value `--result-weight-phase` is expanded, engine D310 / D1275); val rows follow it
@@ -106,6 +109,8 @@ pub struct GpuCfg {
     pub keep_all: bool,
     /// D1181: Some((muon_lr, momentum)) = `--opt muon`: Muon on the l1w / l2w bucket blocks, Ranger on the rest; None = Ranger only (default)
     pub muon: Option<(f32, f32)>,
+    /// D1554: `--opt sfadamw` = Schedule-Free AdamW on every tensor (validated / exported on the averaged iterate x)
+    pub sf: bool,
 }
 
 /// Inputs, mapper and graph. Weight ids: ftw/ftb, psqw/psqb (psqb cancels in stm-ntm), l1w/l1b, l2w/l2b, outw/outb.
@@ -246,11 +251,19 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
+    if c.sf {
+        // D1554: Schedule-Free AdamW (Defazio et al. 2024) on every tensor; the averaged iterate x is validated and exported
+        let reg = crate::gpusf::SfReg::<G>::default();
+        let p = crate::gpusf::SfParams { reg: reg.clone(), ..Default::default() };
+        println!("[opt] SCHEDULE-FREE ADAMW (D1554): beta1 {} beta2 {} eps {} decay {} clip +-{}; lr {} constant after warmup {} (no schedule); eval/export on the averaged iterate x", p.beta1, p.beta2, p.eps, p.decay, p.max_weight, c.lr, c.warmup);
+        let opt = Optimiser::<G, crate::gpusf::SfAdamW<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
+        return train_with(opt, c, base, mapper, Some(reg));
+    }
     match c.muon {
         // default (no --opt): Ranger on every tensor, exactly as before D1181
         None => {
             let opt = Optimiser::<G, Ranger<G>>::new(defn, weights, device, params).map_err(|e| format!("{e:?}"))?;
-            train_with(opt, c, base, mapper)
+            train_with(opt, c, base, mapper, None)
         }
         Some((muon_lr, mom)) => {
             // D1181: Muon on the dense hidden matrices, recognised by size (refused unless each size is unique)
@@ -270,13 +283,13 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
             println!("[opt] MUON-ADAMW (D1181/D1262): Muon lr {muon_lr} (x the lr schedule factor), momentum {mom}, Nesterov, NS5 on {nb} blocks of l1w {l1}x{din} and l2w {l2}x{l1}; AdamW (beta1=0.9, beta2=0.999, decay=0.0, clip +-1.98) on every other tensor");
             let p = crate::gpumuon::MuonRangerParams { adam, shapes, muon_lr, lr0: c.lr, mom };
             let opt = Optimiser::<G, crate::gpumuon::MuonRanger<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
-            train_with(opt, c, base, mapper)
+            train_with(opt, c, base, mapper, None)
         }
     }
 }
 
 /// the training loop of `run_on`, generic over the optimiser state (Ranger by default, Muon + Ranger with --opt muon)
-fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: Optimiser<G, S>, c: GpuCfg, base: TrainableNet, mapper: ModelInputsMapper<Rec>) -> Result<(), String> {
+fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: Optimiser<G, S>, c: GpuCfg, base: TrainableNet, mapper: ModelInputsMapper<Rec>, sf_reg: Option<crate::gpusf::SfReg<G>>) -> Result<(), String> {
     std::fs::create_dir_all(&c.out).map_err(|e| e.to_string())?;
     let ckpt = format!("{}/bullet_ckpt", c.out);
     let mut start_sb = 1;
@@ -318,6 +331,14 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     let (val_stem, val_rows) = (c.val.clone(), c.val_rows);
     let mut since_best = 0usize;
     let mut drops = 0usize;
+    // D1553 epoch rule: batches since the last val gain >= min_delta, and how many flat epochs already halved the LR
+    let epoch_rule = c.epoch_rule;
+    let epoch_batches = if epoch_rule { Tdat::open(&c.data)?.rows.div_ceil(c.bs).max(1) } else { 0 };
+    if epoch_rule {
+        println!("[epoch rule] LAWS C15/D5 (D1553): 1 epoch = {epoch_batches} batches of {} ({} rows); STOP after 4 epochs without a val gain >= {:e}", c.bs, epoch_batches * c.bs, c.min_delta);
+    }
+    let mut batches_flat = 0usize;
+    let mut flat_epochs_done = 0usize;
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
     let mut ema_net: Option<TrainableNet> = None;
@@ -330,7 +351,11 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     println!("[init] val mse {init_mse:.6} (guard {})", if guard > 0.0 { format!("{:.0}% of init", guard * 100.0) } else { "off".into() });
     train(&mut opt, schedule, loader, |_, _, _| {}, move |o, step| {
         let cpu = o.cpu_weights().expect("sync weights");
-        let net = extract(&cpu, &base);
+        // D1554: under Schedule-Free the averaged iterate x is the model (validated, checkpointed, exported); y is only the gradient point
+        let net = match &sf_reg {
+            Some(r) => extract(&crate::gpusf::averaged_weights(r, &cpu).expect("sfadamw averaged weights"), &base),
+            None => extract(&cpu, &base),
+        };
         drop(cpu);
         let sbn = step.total_batches() / sb;
         let v = trainer::evaluate(&net, &val, threads);
@@ -375,6 +400,7 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
                 let _ = std::fs::remove_file(p);
             }
         }
+        let improved = pick_mse < best - min_delta;
         if pick_mse < best {
             // a gain smaller than min_delta is saved but does not reset the patience counter
             since_best = if pick_mse < best - min_delta { 0 } else { since_best + 1 };
@@ -393,6 +419,26 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
             eprintln!("{msg}");
             let _ = std::fs::write(format!("{out}/GUARD_TRIPPED.txt"), &msg);
             std::process::exit(3);
+        }
+        // D1553 epoch rule (default): per-epoch adaptive LR + stop after 4 epochs of data without a val gain >= min_delta
+        if epoch_rule {
+            if improved {
+                batches_flat = 0;
+                flat_epochs_done = 0;
+            } else {
+                batches_flat += sb;
+            }
+            let flat_epochs = batches_flat / epoch_batches;
+            if flat_epochs >= 4 {
+                let msg = format!("SATURATED (LAWS C15, D1553) at superbatch {sbn}: 4 epochs of data ({batches_flat} batches) without a val gain >= {min_delta:e}; best val mse {best:.6} in best.tnn.");
+                println!("{msg}");
+                let _ = std::fs::write(format!("{out}/EARLY_STOP.txt"), &msg);
+                std::process::exit(0);
+            }
+            if flat_epochs > flat_epochs_done {
+                flat_epochs_done = flat_epochs;
+                println!("[epoch rule] {flat_epochs} epoch(s) of data without a val gain >= {min_delta:e} (val {pick_mse:.6}, best {best:.6}); stop at 4");
+            }
         }
         // reduce-on-plateau: `plateau` checkpoints without a val gain -> lr x factor; after `max_drops` drops that still do not
         // help, stop (best.tnn keeps the best weights)

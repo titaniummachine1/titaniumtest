@@ -210,9 +210,29 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
     if f("--backend").as_deref() == Some("cuda") {
         // D1181: the GPU optimiser is Ranger; `--opt muon` = Muon on the dense hidden blocks + Ranger on the rest
-        if f("--opt").is_some_and(|o| o != "muon") {
-            return Err("--backend cuda: --opt takes only muon (default = Ranger; adamw / muonadamw are the CPU backend)".into());
+        if f("--opt").is_some_and(|o| o != "muon" && o != "sfadamw") {
+            return Err("--backend cuda: --opt takes muon or sfadamw (default = Ranger; adamw / muonadamw are the CPU backend)".into());
         }
+        // D1553/D1554 (user, LAWS C15 + D5): the run stops after 4 consecutive epochs of data without a val gain >= 1e-5; the LR
+        // comes from the optimiser (best adaptive method), never a hand rule: no step cap, no cosine horizon, no checkpoint patience, no
+        // 'stop after N drops'. Other schedules only with --experiment NAME (output under an experiments/ folder).
+        let exp = f("--experiment");
+        let legacy: Vec<&str> = ["--patience", "--plateau", "--max-drops", "--lr-min", "--steps", "--min-delta"]
+            .into_iter()
+            .filter(|k| f(k).is_some())
+            .collect();
+        if exp.is_none() && !legacy.is_empty() {
+            return Err(format!(
+                "{legacy:?} refused (LAWS C15/D5, user D1553): the run stops after 4 epochs of data without a val gain >= 1e-5 and the LR comes from the optimiser; another schedule needs --experiment NAME with --out under experiments/"
+            ));
+        }
+        if let Some(n) = &exp {
+            let under = f("--out").unwrap_or_default().replace('\\', "/").split('/').any(|c| c.eq_ignore_ascii_case("experiments"));
+            if !under {
+                return Err(format!("--experiment {n}: --out must be under a folder named 'experiments'"));
+            }
+        }
+        let epoch_rule = exp.is_none();
         #[cfg(feature = "gpu")]
         {
             let g = |n: &str, d: u64| crate::flag_u64(args, n).unwrap_or(d) as usize;
@@ -222,9 +242,13 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 out: f("--out").ok_or("--out required")?,
                 init: f("--init").unwrap_or_else(|| "bundled".into()),
                 bs: g("--bs", 16384),
-                steps: g("--steps", 1000),
+                steps: if epoch_rule { 1usize << 40 } else { g("--steps", 1000) },
                 lr: crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32,
-                lr_min: crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32,
+                lr_min: if epoch_rule {
+                    crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32
+                } else {
+                    crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32
+                },
                 warmup: g("--warmup", 200),
                 eval_every: g("--eval-every", 500),
                 val_rows: g("--val-rows", 65536),
@@ -237,15 +261,17 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
                 ema: crate::flag_f64(args, "--ema").unwrap_or(0.0) as f32,
                 guard: crate::flag_f64(args, "--guard").unwrap_or(1.15) as f32,
-                patience: g("--patience", 0),
-                min_delta: crate::flag_f64(args, "--min-delta").unwrap_or(2e-6),
-                plateau: g("--plateau", 0),
+                patience: if epoch_rule { 0 } else { g("--patience", 0) },
+                min_delta: if epoch_rule { 1e-5 } else { crate::flag_f64(args, "--min-delta").unwrap_or(2e-6) },
+                plateau: if epoch_rule { 0 } else { g("--plateau", 0) },
                 lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
-                max_drops: g("--max-drops", 3),
+                max_drops: if epoch_rule { 0 } else { g("--max-drops", 3) },
+                epoch_rule,
                 proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
                 result_weight: targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?,
                 loss_weight: targets::parse_lw(f("--loss-weight-buckets"))?,
                 keep_all: crate::has_flag(args, "--keep-all"),
+                sf: f("--opt").as_deref() == Some("sfadamw"),
                 muon: if f("--opt").as_deref() == Some("muon") {
                     Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
                 } else {

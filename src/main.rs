@@ -24,6 +24,8 @@ mod shrink;
 mod gpu;
 #[cfg(feature = "gpu")]
 mod gpumuon;
+#[cfg(feature = "gpu")]
+mod gpusf;
 mod trainer;
 mod targets;
 mod gate;
