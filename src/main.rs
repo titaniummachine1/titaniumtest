@@ -39,6 +39,8 @@ mod spsa;
 mod train;
 mod policy;
 mod policy2;
+mod ordfit;
+mod proofline; // D1590-D1596: Botzone-exact proof lines (Zataxx with the whole game history, lines played out)
 mod smallnet;
 mod snarch;
 mod bzupload;
@@ -80,6 +82,8 @@ fn main() -> ExitCode {
         // "proof-hunt" disabled with `mod proof` 2026-11-21 (D1410, see above)
         "policy" => policy::run_policy(&args[1..]),
         "policy2" => policy2::run(&args[1..]),
+        "ordfit" => ordfit::run(&args[1..]),
+        "proof-lines" => proofline::run(&args[1..]),
         "policy-rl" => policy2::run_rl(&args[1..]),
         "botzone-upload" => bzupload::run(&args[1..]),
         "botzone" => botzone::run_botzone(&args[1..]),
