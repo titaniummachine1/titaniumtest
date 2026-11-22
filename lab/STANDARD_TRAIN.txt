@@ -8,12 +8,13 @@
 #   head 54,680,997 rows [train_v13 + Zataxx proof relabels, D1258] + 3,404,185 rows of 33,994 self-play games datagenpc_run15_5k
 #   batches 1-17 [main 77072fd, old-count 5k] + the unchanged held-out tail; sha256 head+new == train_v15h bc22866806f56b6d,
 #   tail == val_v13tail 008613886aed23ad).
+# 2026-11-22 23:57 D1616 (user order 'update what is necessary so training never uses a stale data set'): train_v15 -> train_v17b (= train_v16 + 332,265 new D4 proof classes before the held-out tail + 50,044 rows upgraded to proofs, D1615; tail byte-identical sha 008613886aed23ad; hub check ti data proof-check ALL PASS).
 #
 # data: the WHOLE dataset. rows: its exact row count (48-byte records); a different count = the file changed -> refuse.
 # holdout_rows: the last N rows (whole self-play games of main, the same rows as every screen since D1053) are the only
 # rows not trained on; they are the validation set. target: the champion recipe (hub targets.rs, D330/D427).
-data = C:/gitProjects/titanium-ataxx/data/nnue/packed/train_v15.tdat
-rows = 59613273
+data = C:/gitProjects/titanium-ataxx/data/nnue/packed/train_v17b.tdat
+rows = 63400975
 holdout_rows = 1528091
 target = champion
 
