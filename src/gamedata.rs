@@ -3528,6 +3528,193 @@ pub fn run_patch(args: &[String]) -> ExitCode {
     }
 }
 
+/// D1611 (user order: 'merge new rows from the proof hunt and upgrade existing ones'): `ti data proof-upgrade`.
+/// `--proofs P.tdat` = every position of the proof lines (`ti data games-tdat` over the hunt's `.tgam`, no dedup).
+/// `--check-only --report R`: positions proven both ways across the given proofs -> `R.contradictions.keys` (isolated, D16).
+/// Full mode `--base X.tdat --preserve-tail N --out D.tdif --report R [--exclude-keys K]`: a TDIF (apply with `ti data
+/// patch`) in which every copy of a proven position in rows [0, rows - N) gets outcome 1 / 0 for its side to move and
+/// proof_kind 6 (= D1604 zataxx-bz proof line with the game history); cp becomes the proof's mate score unless the row
+/// already holds a proof of the same sign (kept); cp5k and every other field stay. An older proof of the opposite sign is
+/// overwritten (latest proof wins, D1607) and listed in `R.old_conflicts.tsv`. The held-out tail is never changed.
+/// Keys in `--exclude-keys` (one hex key per line, files comma-separated) and contradicting keys change nothing.
+pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
+    let (Some(proofs), Some(report)) = (crate::flag_str(args, "--proofs"), crate::flag_str(args, "--report")) else {
+        eprintln!("usage: ti data proof-upgrade --proofs P.tdat --report STEM (--check-only | --base X.tdat --preserve-tail N --out D.tdif) [--exclude-keys K[,K2]]");
+        return ExitCode::FAILURE;
+    };
+    let check_only = args.iter().any(|a| a == "--check-only");
+    let r = || -> Result<String, String> {
+        let mut excl: HashSet<u64> = HashSet::new();
+        if let Some(list) = crate::flag_str(args, "--exclude-keys") {
+            for p in list.split(',').filter(|s| !s.is_empty()) {
+                let txt = fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
+                for l in txt.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    excl.insert(u64::from_str_radix(l, 16).map_err(|e| format!("{p}: bad key {l}: {e}"))?);
+                }
+            }
+        }
+        let pb = fs::read(&proofs).map_err(|e| format!("{proofs}: {e}"))?;
+        if pb.len() % REC != 0 {
+            return Err(format!("{proofs}: size {} is not a multiple of {REC}", pb.len()));
+        }
+        // key -> (proven 1/0 for the side to move, mate score of the shortest proof seen)
+        let mut map: std::collections::HashMap<u64, (i32, f32)> = std::collections::HashMap::new();
+        let mut contra: HashSet<u64> = HashSet::new();
+        let (mut n_rows, mut unproven, mut out_mismatch) = (0u64, 0u64, 0u64);
+        for c in pb.chunks_exact(REC) {
+            let r = Rec::from_bytes(c);
+            n_rows += 1;
+            let t = crate::targets::target_of(&r);
+            let k = pos_key(r.occ0, r.occ1, r.stm);
+            if t.proven < 0 {
+                unproven += 1;
+                continue;
+            }
+            if r.outcome == 0.5 || (r.outcome > 0.5) != (t.proven == 1) {
+                out_mismatch += 1; // the line's final count disagrees with its own score: never trusted
+                contra.insert(k);
+                continue;
+            }
+            match map.entry(k) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((t.proven as i32, r.cp));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if e.get().0 != t.proven as i32 {
+                        contra.insert(k);
+                    } else if r.cp.abs() > e.get().1.abs() {
+                        e.get_mut().1 = r.cp;
+                    }
+                }
+            }
+        }
+        let mut ck: Vec<u64> = contra.iter().copied().collect();
+        ck.sort_unstable();
+        fs::write(format!("{report}.contradictions.keys"), ck.iter().map(|k| format!("{k:016x}\n")).collect::<String>()).map_err(|e| e.to_string())?;
+        for k in contra.iter().chain(excl.iter()) {
+            map.remove(k);
+        }
+        let head = format!(
+            "proof rows {n_rows} ({unproven} not proven, ignored; {out_mismatch} with an outcome against their score, isolated); distinct proven positions usable {}; contradicting keys isolated {} -> {report}.contradictions.keys; excluded keys {}",
+            map.len(),
+            contra.len(),
+            excl.len()
+        );
+        if check_only {
+            fs::write(format!("{report}.summary.txt"), format!("{head}\n")).map_err(|e| e.to_string())?;
+            return Ok(head);
+        }
+        let (Some(base), Some(tail), Some(out)) = (crate::flag_str(args, "--base"), crate::flag_u64(args, "--preserve-tail"), crate::flag_str(args, "--out")) else {
+            return Err("full mode needs --base X.tdat --preserve-tail N --out D.tdif".into());
+        };
+        if std::path::Path::new(&out).exists() {
+            return Err(format!("{out} already exists; refusing to overwrite"));
+        }
+        let la = fs::metadata(&base).map(|m| m.len()).map_err(|e| format!("{base}: {e}"))?;
+        if la % REC as u64 != 0 {
+            return Err(format!("{base}: size {la} is not a multiple of {REC}"));
+        }
+        let rows = la / REC as u64;
+        if tail >= rows {
+            return Err(format!("--preserve-tail {tail} >= rows {rows}"));
+        }
+        let cut = rows - tail;
+        let mut ra = BufReader::with_capacity(1 << 22, File::open(&base).map_err(|e| e.to_string())?);
+        let (mut ha, mut hb) = (0xcbf2_9ce4_8422_2325u64, 0xcbf2_9ce4_8422_2325u64);
+        let mut body: Vec<u8> = Vec::new();
+        let mut conflicts = String::from("row\tkey\told_cp\told_outcome\tnew_cp\n");
+        let mut hit: HashSet<u64> = HashSet::new();
+        let (mut matched, mut upgraded, mut agree_old, mut conflict_old, mut outcome_flip, mut changed, mut tail_hits) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut buf = vec![0u8; REC * 65536];
+        let mut row = 0u64;
+        while row < rows {
+            let n = ((rows - row) as usize).min(65536);
+            ra.read_exact(&mut buf[..n * REC]).map_err(|e| e.to_string())?;
+            ha = fnv_step(ha, &buf[..n * REC]);
+            for i in 0..n {
+                let ri = row + i as u64;
+                let x = &mut buf[i * REC..(i + 1) * REC];
+                let r = Rec::from_bytes(x);
+                let k = pos_key(r.occ0, r.occ1, r.stm);
+                let Some(&(sign, pcp)) = map.get(&k) else { continue };
+                if ri >= cut {
+                    tail_hits += 1;
+                    continue;
+                }
+                matched += 1;
+                hit.insert(k);
+                let old = crate::targets::target_of(&r).proven as i32;
+                let orig: Vec<u8> = x.to_vec();
+                let new_out: f32 = if sign == 1 { 1.0 } else { 0.0 };
+                if old == sign {
+                    agree_old += 1;
+                } else {
+                    if old >= 0 {
+                        conflict_old += 1;
+                        conflicts.push_str(&format!("{ri}\t{k:016x}\t{}\t{}\t{pcp}\n", r.cp, r.outcome));
+                    } else {
+                        upgraded += 1;
+                        if r.outcome != 0.5 && (r.outcome > 0.5) != (sign == 1) {
+                            outcome_flip += 1;
+                        }
+                    }
+                    x[20..24].copy_from_slice(&pcp.to_le_bytes());
+                }
+                x[16..20].copy_from_slice(&new_out.to_le_bytes());
+                x[42] = 6;
+                if x[..] != orig[..] {
+                    let mut mask = 0u16;
+                    for w in 0..WORDS {
+                        if orig[w * 4..w * 4 + 4] != x[w * 4..w * 4 + 4] {
+                            mask |= 1 << w;
+                        }
+                    }
+                    body.extend_from_slice(&(ri as u32).to_le_bytes());
+                    body.extend_from_slice(&mask.to_le_bytes());
+                    for w in 0..WORDS {
+                        if mask & (1 << w) != 0 {
+                            body.extend_from_slice(&x[w * 4..w * 4 + 4]);
+                        }
+                    }
+                    changed += 1;
+                }
+            }
+            hb = fnv_step(hb, &buf[..n * REC]);
+            row += n as u64;
+        }
+        let tmp = format!("{out}.tmp");
+        {
+            let mut f = BufWriter::new(File::create(&tmp).map_err(|e| format!("{tmp}: {e}"))?);
+            f.write_all(TDIF_MAGIC).map_err(|e| e.to_string())?;
+            for v in [1u32.to_le_bytes().to_vec(), rows.to_le_bytes().to_vec(), ha.to_le_bytes().to_vec(), hb.to_le_bytes().to_vec(), changed.to_le_bytes().to_vec()] {
+                f.write_all(&v).map_err(|e| e.to_string())?;
+            }
+            f.write_all(&body).map_err(|e| e.to_string())?;
+            f.flush().map_err(|e| e.to_string())?;
+        }
+        fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+        fs::write(format!("{report}.old_conflicts.tsv"), &conflicts).map_err(|e| e.to_string())?;
+        let s = format!(
+            "{head}\nbase {base} [fnv {ha:016X}] {rows} rows; held-out tail {tail} rows untouched ({tail_hits} tail rows hold a proven position, left as they are)\nproven positions found in the head {} of {} ({} not in the head); rows matched {matched}: upgraded {upgraded} (game outcome was the opposite {outcome_flip}), already proven same sign {agree_old}, OLDER PROOF OVERWRITTEN (latest wins, D1607) {conflict_old} -> {report}.old_conflicts.tsv\ndiff {out}: {changed} rows changed, result fnv {hb:016X} (apply: ti data patch --base {base} --diff {out} --out NEW.tdat)",
+            hit.len(),
+            map.len(),
+            map.len() - hit.len()
+        );
+        fs::write(format!("{report}.summary.txt"), format!("{s}\n")).map_err(|e| e.to_string())?;
+        Ok(s)
+    };
+    match r() {
+        Ok(s) => {
+            println!("data proof-upgrade: {s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("data proof-upgrade: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `ti data fp --tdat X.tdat [--rows A..B]`: FNV-1a 64 fingerprint of a file (or of rows [A, B) via a temp-free stream)
 pub fn run_fp(args: &[String]) -> ExitCode {
     let Some(p) = crate::flag_str(args, "--tdat") else {
