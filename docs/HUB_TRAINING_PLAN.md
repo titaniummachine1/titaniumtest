@@ -89,7 +89,7 @@ local runs use the hub CPU backend).
 - **H8** CUDA backend (I9): bullet graph of the same arch; warm start = load the TNN3 weights into the graph;
   test: step-0 output == hub CPU forward to 1e-4 on 10k positions; 1 superbatch loss matches CPU within noise.
 - **H9** Modal runner (I9): image with CUDA devel + rust, build `ti --features cuda`, upload `.tdat` with sha
-  check, `ti train modal launch|status|fetch|stop`, hard timeout + cost cap from docs/MODAL.md, writes the
+  check, `ti train modal launch|status|fetch|stop`, hard timeout + cost cap from docs/runbooks/MODAL.md, writes the
   DECISIONS/HANDOFFS run row itself (docs in real time).
 - **H10** `ti train check` preflight (all of the above, refuses on red): data sha + counts, targets self-test,
   init net hash + parity, RAM headroom, Modal budget left, branch/commit clean (gate law 8).

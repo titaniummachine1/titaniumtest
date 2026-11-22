@@ -432,7 +432,10 @@ fn insight_phases(games: &[Game]) -> String {
 /// the 16 buckets for the NNUE and the search'): the same paired value-lost diff as insight_phases, but bucketed by the
 /// NNUE bucket of the position the move was played in (empties * 16 / 50, 14 = start, 0 = full board), so a per-bucket
 /// search knob can be kept exactly in the buckets where the candidate loses less value.
-fn insight_nnue_buckets(games: &[Game]) -> String {
+/// Per NNUE bucket (empties*16/50), per complete pair (both seats averaged): baseline minus candidate value lost per move
+/// (cp, + = the candidate loses less), plus the number of moves seen. Shared by `ti insight --by-bucket` and the per-stage
+/// SPSA fitness (D1326), so both read the games the same way.
+pub fn bucket_value_lost_diffs(games: &[Game]) -> Vec<(Vec<f64>, u32)> {
     use std::collections::HashMap;
     const NB: usize = 16;
     type G = [(f64, u32, f64, u32); NB];
@@ -460,11 +463,8 @@ fn insight_nnue_buckets(games: &[Game]) -> String {
         pairs.entry((g.pair, g.book)).or_default().push(a);
     }
     let full: Vec<&Vec<G>> = pairs.values().filter(|v| v.len() == 2).collect();
-    if full.len() < 50 {
-        return String::new();
-    }
-    let mut out = String::from("\n  by NNUE bucket (empties*16/50; per-move diff = baseline minus candidate value lost, + = candidate better):\n");
-    for b in (0..NB).rev() {
+    let mut res = Vec::with_capacity(NB);
+    for b in 0..NB {
         let (mut diff, mut moves) = (Vec::new(), 0u32);
         for v in &full {
             let (mut d, mut nd) = (0.0, 0.0);
@@ -480,12 +480,45 @@ fn insight_nnue_buckets(games: &[Game]) -> String {
                 diff.push(d / nd);
             }
         }
+        res.push((diff, moves));
+    }
+    res
+}
+
+pub(crate) fn mean_z_pub(v: &[f64]) -> (f64, f64) {
+    mean_z(v)
+}
+
+fn insight_nnue_buckets(games: &[Game]) -> String {
+    const NB: usize = 16;
+    let per = bucket_value_lost_diffs(games);
+    let mut npairs = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<(u64, u64), u32> = std::collections::HashMap::new();
+    for g in games {
+        if replay(g).is_ok() {
+            *seen.entry((g.pair, g.book)).or_default() += 1;
+        }
+    }
+    for (k, n) in seen {
+        if n == 2 {
+            npairs.insert(k);
+        }
+    }
+    if npairs.len() < 50 {
+        return String::new();
+    }
+    let mut out = String::from("
+  by NNUE bucket (empties*16/50; per-move diff = baseline minus candidate value lost, + = candidate better):
+");
+    for b in (0..NB).rev() {
+        let (diff, moves) = (&per[b].0, per[b].1);
         if diff.len() < 10 {
             continue;
         }
-        let (md, zd) = mean_z(&diff);
+        let (md, zd) = mean_z(diff);
         let (lo, hi) = ((b * 50 + 15) / 16, ((b + 1) * 50 + 15) / 16 - 1);
-        out += &format!("    b{b:<2} empties {lo:2}-{hi:<2} value lost diff {md:+7.2} cp/move (z {zd:+5.2}) | {} pairs, {moves} moves\n", diff.len());
+        out += &format!("    b{b:<2} empties {lo:2}-{hi:<2} value lost diff {md:+7.2} cp/move (z {zd:+5.2}) | {} pairs, {moves} moves
+", diff.len());
     }
     out.trim_end().to_string()
 }
@@ -1036,6 +1069,7 @@ pub fn run_pool(args: &[String]) -> ExitCode {
         st.upper_bound,
         100.0 * st.seat_split,
     );
+    println!("{}", tally.report_block(elo0, elo1, 0.05, 0.05));
     ExitCode::SUCCESS
 }
 

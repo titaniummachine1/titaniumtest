@@ -23,11 +23,15 @@ mod win;
 mod archloc;
 mod netscale;
 mod standard;
+mod stopctl;
 mod jat3;
 mod jat3x;
 mod featbench;
 mod tfbench;
 mod levatt;
+mod wsprobe;
+mod blendspsa;
+mod siblingcorr;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -51,6 +55,10 @@ fn main() -> ExitCode {
         Some("feat-bench") => featbench::run(&args[1..]),
         Some("tf-bench") => tfbench::run(&args[1..]),
         Some("levatt-train") => levatt::run(&args[1..]),
+        Some("ws-probe") => wsprobe::run(&args[1..]),
+        Some("loss-elo-corr") => blendspsa::run_corr(&args[1..]),
+        Some("spsa-blend") => blendspsa::run_spsa(&args[1..]),
+        Some("sibling-corr") => siblingcorr::run(&args[1..]),
         Some("hce-eval") => hceeval::cli(&args[1..]),
         Some("node-cost") => nodecost::run(&args[1..]),
         Some("incr-stats") => nodecost::incr_stats(&args[1..]),

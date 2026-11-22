@@ -107,6 +107,12 @@ pub(crate) fn feats(b: &Board, m: Move, ring: &[u64; 49]) -> [u8; 5] {
 }
 
 pub fn run_policy(args: &[String]) -> ExitCode {
+    // LAWS A14 + C15 (user D1307 / D868): this trainer has fixed epochs and no checkpoint / stop / resume, so it is
+    // refused; `ti policy2` is the policy trainer (best snapshot, per-epoch checkpoint, STOP file, --resume, early stop).
+    eprintln!("ti policy: REFUSED (LAWS A14: no checkpoint / stop / resume; C15: fixed epochs). Use `ti policy2` (it saves the best head, checkpoints every epoch, stops on STOP, resumes with --resume).");
+    if !args.is_empty() || args.is_empty() {
+        return ExitCode::from(2);
+    }
     let net_path = match arg(args, "--net") {
         Some(p) => p,
         None => {

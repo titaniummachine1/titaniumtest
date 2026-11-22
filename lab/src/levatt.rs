@@ -272,6 +272,51 @@ fn fwd(c: &Champ, p: &[f32], ly: Lay, attn: bool, b: &Board, ws: &mut Ws) -> f32
     o + 0.5 * (ws.ps[0] - ws.ps[1])
 }
 
+/// D1200/D1267: Playable wrapper around trained `*_levatt.bin` attention head + champion trunk.
+pub struct LevAttNet {
+    c: Champ,
+    prm: Vec<f32>,
+    ly: Lay,
+    attn: bool,
+}
+
+impl LevAttNet {
+    pub fn load(path: &str) -> Self {
+        let (c, mut prm, ly) = parse(BUNDLED_NNUE);
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert_eq!(
+            bytes.len(),
+            ly.n * 4,
+            "{path}: size {} != expected {} bytes",
+            bytes.len(),
+            ly.n * 4
+        );
+        for (dst, ch) in prm.iter_mut().zip(bytes.chunks_exact(4)) {
+            *dst = f32::from_le_bytes(ch.try_into().unwrap());
+        }
+        let attn = prm[ly.u..ly.ub + NT].iter().any(|&v| v != 0.0);
+        Self { c, prm, ly, attn }
+    }
+
+    pub fn eval_f(&self, b: &Board) -> f32 {
+        thread_local! {
+            static TL_WS: std::cell::RefCell<Option<Ws>> = const { std::cell::RefCell::new(None) };
+        }
+        TL_WS.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ws = slot.get_or_insert_with(|| Ws::new(&self.c));
+            if ws.a.len() != NT * self.c.w {
+                *ws = Ws::new(&self.c);
+            }
+            400.0 * fwd(&self.c, &self.prm, self.ly, self.attn, b, ws)
+        })
+    }
+
+    pub fn eval(&self, b: &Board) -> i32 {
+        self.eval_f(b).round().clamp(-30000.0, 30000.0) as i32
+    }
+}
+
 /// backward of dy (dL/dy) into the gradient vector g (same layout as the parameters)
 fn bwd(c: &Champ, p: &[f32], ly: Lay, attn: bool, ws: &mut Ws, dy: f32, g: &mut [f32]) {
     let (w, l1, l2, bk) = (c.w, c.l1, c.l2, ws.bucket);
@@ -416,27 +461,46 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("levatt-train: --out PREFIX is required");
         return ExitCode::from(2);
     };
-    if std::path::Path::new(&format!("{out}.log")).exists() {
-        eprintln!("levatt-train: {out}.log exists; refusing to overwrite");
+    if std::path::Path::new(&format!("{out}.log")).exists() && !args.iter().any(|a| a == "--resume") {
+        eprintln!("levatt-train: {out}.log exists; refusing to overwrite (or --resume to continue that run)");
+        return ExitCode::from(2);
+    }
+    // D1130 / A13: the standard trains on the whole dataset; --experiment NAME (output under experiments/) is the only
+    // way to train on less (stamped EXPERIMENT, never a result); used for the LAWS A14 stop / resume proof (D1310)
+    let exp = crate::standard::experiment(args);
+    if let Err(e) = crate::standard::check_out(&out, &exp) {
+        eprintln!("levatt-train: {e}");
         return ExitCode::from(2);
     }
     let t0 = std::time::Instant::now();
-    let mut log = String::new();
+    // LAWS A14: a --resume keeps the earlier log and appends to it
+    let mut log = if args.iter().any(|a| a == "--resume") { std::fs::read_to_string(format!("{out}.log")).unwrap_or_default() } else { String::new() };
     let say = |s: String, log: &mut String| {
         println!("{s}");
         log.push_str(&s);
         log.push('\n');
         let _ = std::fs::write(format!("{out}.log"), log.as_bytes());
     };
-    let (train, val): (Vec<Rec>, Vec<Rec>) = match crate::standard::standard_split(args, &["--max-rows", "--val", "--data", "--holdout"]) {
-        Ok((st, tr, va)) => {
-            say(crate::standard::stamp(&None::<String>, &st, tr.len(), va.len()), &mut log);
-            (tr, va)
+    let (train, val): (Vec<Rec>, Vec<Rec>) = if exp.is_none() {
+        match crate::standard::standard_split(args, &["--max-rows", "--val", "--data", "--holdout"]) {
+            Ok((st, tr, va)) => {
+                say(crate::standard::stamp(&None::<String>, &st, tr.len(), va.len()), &mut log);
+                (tr, va)
+            }
+            Err(e) => {
+                eprintln!("levatt-train: {e}");
+                return ExitCode::from(2);
+            }
         }
-        Err(e) => {
-            eprintln!("levatt-train: {e}");
+    } else {
+        let (Some(data), Some(valp)) = (arg(args, "--data"), arg(args, "--val")) else {
+            eprintln!("levatt-train --experiment: needs --data X --val V");
             return ExitCode::from(2);
-        }
+        };
+        let mr = g("--max-rows", 1e12) as usize;
+        let (tr, va) = (crate::hcetrain::read_rows(&data, mr), crate::hcetrain::read_rows(&valp, 600_000));
+        say(format!("EXPERIMENT {}: NOT the standard: {} train rows, {} val rows (data {data})", exp.clone().unwrap_or_default(), tr.len(), va.len()), &mut log);
+        (tr, va)
     };
     let (c, mut prm, ly) = parse(BUNDLED_NNUE);
     if args.iter().any(|a| a == "--gradcheck") {
@@ -548,17 +612,72 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut best = (i_l, prm.clone(), 0usize);
     let save = |p: &[f32]| {
         let b: Vec<u8> = p.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let _ = std::fs::write(format!("{out}_levatt.bin"), b);
+        let _ = crate::stopctl::write_atomic(&format!("{out}_levatt.bin"), &b);
     };
-    save(&best.1);
     let mut lr = lr0;
     let (mut bad, mut cycle_gain, mut zero_cycles, mut cycle) = (0usize, false, 0usize, 0usize);
-    let mut order: Vec<usize> = (0..train.len()).collect();
-    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; pn]).collect();
     let nbatch = train.len().div_ceil(bs);
-    for epoch in 1.. {
-        let (mut tl, mut tw) = (0f64, 0f64);
+    // LAWS A14 (user D1307): best weights `{out}_levatt.bin` (atomic, from the start and on every new best), a full
+    // checkpoint `{out}.ckpt` after every epoch and on STOP (STOP in the out folder or C:/gitProjects/STOP_ALL, checked
+    // before every batch: exact state saved, exit); `--resume` continues exactly. The epoch order is a pure function of
+    // the epoch number.
+    let ck_path = format!("{out}.ckpt");
+    let run_dir = std::path::Path::new(&out).parent().map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }).unwrap_or_else(|| ".".into());
+    let (mut ep_start, mut b_start, mut tl0, mut tw0) = (1usize, 0usize, 0f64, 0f64);
+    if args.iter().any(|a| a == "--resume") {
+        let dd = match std::fs::read(&ck_path) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("levatt-train --resume: {ck_path}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut r = crate::stopctl::Rd::new(&dd);
+        let ok = (|| -> Result<(), String> {
+            if r.str()? != "LCK1" || r.u64()? != pn as u64 {
+                return Err("not a levatt-train checkpoint of this net".into());
+            }
+            ep_start = r.u64()? as usize;
+            b_start = r.u64()? as usize;
+            astep = r.u64()? as i32;
+            lr = r.f64()? as f32;
+            bad = r.u64()? as usize;
+            cycle_gain = r.u64()? == 1;
+            zero_cycles = r.u64()? as usize;
+            cycle = r.u64()? as usize;
+            tl0 = r.f64()?;
+            tw0 = r.f64()?;
+            best.0 = r.f64()?;
+            best.2 = r.u64()? as usize;
+            best.1 = r.f32s()?;
+            prm = r.f32s()?;
+            mo = r.f32s()?;
+            ve = r.f32s()?;
+            Ok(())
+        })();
+        if let Err(e) = ok {
+            eprintln!("levatt-train --resume: {ck_path}: {e}");
+            return ExitCode::from(2);
+        }
+        say(format!("RESUMED from {ck_path}: epoch {ep_start} batch {b_start}, best epoch {} = {:.6}", best.2, best.0), &mut log);
+    } else {
+        if std::path::Path::new(&ck_path).exists() {
+            eprintln!("levatt-train: {ck_path} exists: continue it with --resume, or delete it to start over");
+            return ExitCode::from(2);
+        }
+        save(&best.1);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn save_ck(path: &str, pn: usize, ep: usize, bi: usize, astep: i32, lr: f32, bad: usize, cg: bool, zc: usize, cy: usize, tl: f64, tw: f64, best: &(f64, Vec<f32>, usize), p: &[f32], mo: &[f32], ve: &[f32]) -> Result<(), String> {
+        let mut x = crate::stopctl::Wr::default();
+        x.str("LCK1").u64(pn as u64).u64(ep as u64).u64(bi as u64).u64(astep as u64).f64(lr as f64).u64(bad as u64).u64(cg as u64).u64(zc as u64).u64(cy as u64).f64(tl).f64(tw).f64(best.0).u64(best.2 as u64).f32s(&best.1).f32s(p).f32s(mo).f32s(ve);
+        crate::stopctl::write_atomic(path, &x.0)
+    }
+    for epoch in ep_start.. {
+        let (mut tl, mut tw) = if epoch == ep_start { (tl0, tw0) } else { (0f64, 0f64) };
+        let mut order: Vec<usize> = (0..train.len()).collect();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
         for i in (1..order.len()).rev() {
             rng ^= rng << 13;
             rng ^= rng >> 7;
@@ -566,7 +685,16 @@ pub fn run(args: &[String]) -> ExitCode {
             order.swap(i, (rng % (i as u64 + 1)) as usize);
         }
         let te = std::time::Instant::now();
-        for (bi, batch) in order.chunks(bs).enumerate() {
+        let first = if epoch == ep_start { b_start } else { 0 };
+        for (bi, batch) in order.chunks(bs).enumerate().skip(first) {
+            if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+                if let Err(e) = save_ck(&ck_path, pn, epoch, bi, astep, lr, bad, cycle_gain, zero_cycles, cycle, tl, tw, &best, &prm, &mo, &ve) {
+                    eprintln!("levatt-train: checkpoint: {e}");
+                    return ExitCode::from(1);
+                }
+                say(format!("STOPPED by {f} at epoch {epoch} batch {bi}: state {ck_path}, best (epoch {}) {out}_levatt.bin; the same command + --resume continues", best.2), &mut log);
+                return ExitCode::SUCCESS;
+            }
             let chunk = batch.len().div_ceil(threads);
             let (pr, trr, mp, cr) = (&prm, &train, &maps, &c);
             let res: Vec<(f64, f64)> = std::thread::scope(|sc| {
@@ -661,6 +789,10 @@ pub fn run(args: &[String]) -> ExitCode {
             bad = 0;
             cycle_gain = false;
             say(format!("RESTART {cycle}: from the best weights (epoch {}, {:.6}) with fresh lr {lr} and fresh Adam moments", best.2, best.0), &mut log);
+        }
+        if let Err(e) = save_ck(&ck_path, pn, epoch + 1, 0, astep, lr, bad, cycle_gain, zero_cycles, cycle, 0.0, 0.0, &best, &prm, &mo, &ve) {
+            eprintln!("levatt-train: checkpoint: {e}");
+            return ExitCode::from(1);
         }
     }
     ExitCode::SUCCESS

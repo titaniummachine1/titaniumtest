@@ -329,8 +329,9 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("hce-train: --out STEM is required (no default; an existing STEM.log is never overwritten)");
         std::process::exit(2);
     };
-    if std::path::Path::new(&format!("{out}.log")).exists() {
-        eprintln!("hce-train: {out}.log already exists; refusing to overwrite (pick a new --out)");
+    // LAWS A14: --resume continues the run of this --out (its log is kept and appended to)
+    if std::path::Path::new(&format!("{out}.log")).exists() && !args.iter().any(|a| a == "--resume") {
+        eprintln!("hce-train: {out}.log already exists; refusing to overwrite (pick a new --out, or --resume to continue that run)");
         std::process::exit(2);
     }
     set_nbk(g("--buckets", 16.0) as usize);
@@ -394,7 +395,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let m = masks();
     let net = Nnue::bundled();
     let t0 = std::time::Instant::now();
-    let mut log = String::new();
+    // LAWS A14: a --resume keeps the earlier log and appends to it
+    let mut log = if args.iter().any(|a| a == "--resume") { std::fs::read_to_string(format!("{out}.log")).unwrap_or_default() } else { String::new() };
     let mut say = |s: String, log: &mut String| {
         println!("{s}");
         log.push_str(&s);
@@ -572,17 +574,94 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut step = 0i32;
     let mut best = (i_l, w.clone(), 0usize);
     let mut bad = 0usize;
-    let mut order: Vec<usize> = (0..train.len()).collect();
-    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-    for epoch in 1.. {
+    // LAWS A14 (user D1307): the best weights JSON is written (atomically) from the start and on every new best; a full
+    // checkpoint `{out}.ckpt` after every epoch; STOP in the out folder or C:/gitProjects/STOP_ALL is checked before every
+    // batch: the exact state is saved and the run exits; `--resume` continues it. The epoch order is a pure function of the
+    // epoch number, so a resume replays it and skips the batches done.
+    let mk_js = |bw: &[f32], be: usize, bl: f64| -> String {
+        format!(
+            "{{{stamp_json},\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"win\":\"{}\",\"win_dims\":{wn_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
+            nbk(),
+            pr.is_some(),
+            pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),
+            pr.is_none_or(|p| p.mob),
+            SP.get().map_or(String::new(), |s| s.0.bands.clone()),
+            WN.get().map_or(String::new(), |w| w.0.spec.clone()),
+            be,
+            bl,
+            bw
+        )
+    };
+    let best_path = format!("{out}_weights.json");
+    let ck_path = format!("{out}.ckpt");
+    let run_dir = std::path::Path::new(&out).parent().map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }).unwrap_or_else(|| ".".into());
+    let resume = args.iter().any(|a| a == "--resume");
+    let (mut ep_start, mut b_start, mut tl0, mut tw0) = (1usize, 0usize, 0f64, 0f64);
+    if resume {
+        let dd = match std::fs::read(&ck_path) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("hce-train --resume: {ck_path}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut r = crate::stopctl::Rd::new(&dd);
+        let ok = (|| -> Result<(), String> {
+            if r.str()? != "HCK1" || r.u64()? != d as u64 {
+                return Err("not an hce-train checkpoint of this model".into());
+            }
+            ep_start = r.u64()? as usize;
+            b_start = r.u64()? as usize;
+            step = r.u64()? as i32;
+            lr = r.f64()? as f32;
+            bad = r.u64()? as usize;
+            tl0 = r.f64()?;
+            tw0 = r.f64()?;
+            best.0 = r.f64()?;
+            best.2 = r.u64()? as usize;
+            best.1 = r.f32s()?;
+            w = r.f32s()?;
+            mo = r.f32s()?;
+            ve = r.f32s()?;
+            Ok(())
+        })();
+        if let Err(e) = ok {
+            eprintln!("hce-train --resume: {ck_path}: {e}");
+            return ExitCode::from(2);
+        }
+        say(format!("RESUMED from {ck_path}: epoch {ep_start} batch {b_start}, best epoch {} = {:.6}", best.2, best.0), &mut log);
+    } else {
+        if std::path::Path::new(&ck_path).exists() {
+            eprintln!("hce-train: {ck_path} exists: continue it with --resume, or delete it to start over");
+            return ExitCode::from(2);
+        }
+        let _ = crate::stopctl::write_atomic(&best_path, mk_js(&best.1, best.2, best.0).as_bytes());
+    }
+    let save_ck = |ep: usize, bi: usize, step: i32, lr: f32, bad: usize, tl: f64, tw: f64, best: &(f64, Vec<f32>, usize), w: &[f32], mo: &[f32], ve: &[f32]| {
+        let mut x = crate::stopctl::Wr::default();
+        x.str("HCK1").u64(d as u64).u64(ep as u64).u64(bi as u64).u64(step as u64).f64(lr as f64).u64(bad as u64).f64(tl).f64(tw).f64(best.0).u64(best.2 as u64).f32s(&best.1).f32s(w).f32s(mo).f32s(ve);
+        crate::stopctl::write_atomic(&ck_path, &x.0)
+    };
+    for epoch in ep_start.. {
+        let mut order: Vec<usize> = (0..train.len()).collect();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
         for i in (1..order.len()).rev() {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             order.swap(i, (rng % (i as u64 + 1)) as usize);
         }
-        let (mut tl, mut tw) = (0f64, 0f64);
-        for batch in order.chunks(bs) {
+        let (mut tl, mut tw) = if epoch == ep_start { (tl0, tw0) } else { (0f64, 0f64) };
+        let first = if epoch == ep_start { b_start } else { 0 };
+        for (bi, batch) in order.chunks(bs).enumerate().skip(first) {
+            if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+                if let Err(e) = save_ck(epoch, bi, step, lr, bad, tl, tw, &best, &w, &mo, &ve) {
+                    eprintln!("hce-train: checkpoint: {e}");
+                    return ExitCode::from(1);
+                }
+                say(format!("STOPPED by {f} at epoch {epoch} batch {bi}: state {ck_path}, best (epoch {}) {best_path}; the same command + --resume continues", best.2), &mut log);
+                return ExitCode::SUCCESS;
+            }
             let chunk = batch.len().div_ceil(threads);
             let wr = &w;
             let trr = &train;
@@ -655,9 +734,14 @@ pub fn run(args: &[String]) -> ExitCode {
         if improved {
             best = (vl, w.clone(), epoch);
             bad = 0;
+            let _ = crate::stopctl::write_atomic(&best_path, mk_js(&best.1, best.2, best.0).as_bytes());
         } else {
             bad += 1;
             lr *= 0.5;
+        }
+        if let Err(e) = save_ck(epoch + 1, 0, step, lr, bad, 0.0, 0.0, &best, &w, &mo, &ve) {
+            eprintln!("hce-train: checkpoint: {e}");
+            return ExitCode::from(1);
         }
         say(format!(
             "epoch {epoch}: train loss {:.6} | val loss {vl:.6} (mse {vq:.6}) | best {:.6} @ {} | lr {lr:.3} | NNUE {nn_l:.6} | {:.0}s",
@@ -701,19 +785,8 @@ pub fn run(args: &[String]) -> ExitCode {
         100.0 * ag / n
     };
     say(format!("sibling best-move agreement with the NNUE: init ({init_label}) {:.2}%, trained like the NNUE {:.2}%", agree(&init_w), agree(&best.1)), &mut log);
-    let js = format!(
-        "{{{stamp_json},\"set\":{set},\"buckets\":{},\"base_dims\":{d_base},\"pairs\":{},\"pair_keep\":{:?},\"mob\":{},\"spairs\":\"{}\",\"spairs_dims\":{sp_dims},\"win\":\"{}\",\"win_dims\":{wn_dims},\"on_nnue\":{on_nnue},\"val_target\":{val_tgt},\"dims\":{d},\"best_epoch\":{},\"val_loss\":{},\"weights\":{:?}}}",
-        nbk(),
-        pr.is_some(),
-        pr.map_or(Vec::new(), |p| (0..crate::pairs::PLACEMENTS).filter(|&q| p.keep[q]).collect::<Vec<_>>()),
-        pr.is_none_or(|p| p.mob),
-        SP.get().map_or(String::new(), |s| s.0.bands.clone()),
-        WN.get().map_or(String::new(), |w| w.0.spec.clone()),
-        best.2,
-        best.0,
-        best.1
-    );
-    let _ = File::create(format!("{out}_weights.json")).and_then(|mut f| f.write_all(js.as_bytes()));
+    let js = mk_js(&best.1, best.2, best.0);
+    let _ = crate::stopctl::write_atomic(&best_path, js.as_bytes());
     let _ = phase(0);
     ExitCode::SUCCESS
 }

@@ -298,6 +298,13 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let val = load_val(&mut valf, val_rows)?;
     println!("[train] rows {} val {} bs {bs} steps {steps} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len());
     let v0 = evaluate(&net, &val, threads);
+    if !std::path::Path::new(&format!("{out}/best.tnn")).exists() {
+        // a best snapshot exists from the first second on (the init), however short the run (LAWS A14)
+        crate::stopctl::write_atomic(&format!("{out}/best.tnn"), &net.to_tnn_bytes())?;
+    }
+    if let Some(f) = crate::stopctl::requested(Some(std::path::Path::new(&out))) {
+        return Err(format!("stop file {f} exists: remove it to train"));
+    }
     println!("[val step {step0}] mse {:.6} proven {:.6} (n={}) other {:.6}   {}", v0.mse, v0.mse_proven, v0.n_proven, v0.mse_other, tensor_report(&net));
     if let Some(lw) = loss_weight {
         println!("[loss-weight] {lw:?} by NNUE bucket (16)");
@@ -386,6 +393,14 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         run_w += wsum;
         run_n += 1;
         let done = step + 1;
+        // LAWS A14 (user D1307): STOP in --out or C:/gitProjects/STOP_ALL: save the exact step as a checkpoint and exit
+        if let Some(f) = crate::stopctl::requested(Some(std::path::Path::new(&out))) {
+            let p = format!("{out}/ckpt_{done}.tnn");
+            crate::stopctl::write_atomic(&p, &net.to_tnn_bytes())?;
+            crate::stopctl::write_atomic(&state, format!("{done} {p}").as_bytes())?;
+            println!("[train] STOPPED by {f} after step {done}: checkpoint {p}, best {out}/best.tnn; the same command + --resume continues (optimizer moments restart)");
+            return Ok(());
+        }
         if done % 50 == 0 {
             println!("[step {done}/{steps}] loss {:.6} lr {:.2e} {:.0} rows/s", run_loss / run_w.max(1.0), lr_at(step, steps, lr, lr_min, warmup), (done - step0) as f64 * bs as f64 / t0.elapsed().as_secs_f64());
             run_loss = 0.0;
@@ -401,14 +416,14 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             if v.mse < best {
                 best = v.mse;
                 let b = net.to_tnn_bytes();
-                std::fs::write(format!("{out}/best.tnn"), &b).map_err(|e| e.to_string())?;
+                crate::stopctl::write_atomic(&format!("{out}/best.tnn"), &b)?;
                 crate::prov::record(&out, "best.tnn", &b, v.mse, &val_stem, val_rows, done);
             }
         }
         if done % save_every == 0 || done == steps {
             let p = format!("{out}/ckpt_{done}.tnn");
-            std::fs::write(&p, net.to_tnn_bytes()).map_err(|e| e.to_string())?;
-            std::fs::write(&state, format!("{done} {p}")).map_err(|e| e.to_string())?;
+            crate::stopctl::write_atomic(&p, &net.to_tnn_bytes())?;
+            crate::stopctl::write_atomic(&state, format!("{done} {p}").as_bytes())?;
         }
     }
     let _ = run_n;

@@ -129,7 +129,8 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let out = arg(args, "--out").unwrap_or_else(|| "C:/gitProjects/titanium-ataxx/logs/hce/d996_zattrain".into());
     let t0 = std::time::Instant::now();
-    let mut log = String::new();
+    // LAWS A14: a --resume keeps the earlier log and appends to it
+    let mut log = if args.iter().any(|a| a == "--resume") { std::fs::read_to_string(format!("{out}.log")).unwrap_or_default() } else { String::new() };
     let say = |s: String, log: &mut String| {
         println!("{s}");
         log.push_str(&s);
@@ -224,22 +225,87 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut step = 0i32;
     let mut best = (i_l, w.clone(), 0usize);
     let mut bad = 0usize;
-    let mut order: Vec<usize> = (0..train.len()).collect();
-    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; P]).collect();
     let cs = P.div_ceil(threads);
-    for epoch in 1.. {
-        let (mut tl, mut tw) = (0f64, 0f64);
+    // LAWS A14 (user D1307): best float weights `{out}_best.f32` (atomic, from the start and on every new best), full
+    // checkpoint `{out}.ckpt` after every epoch, STOP in the out folder or C:/gitProjects/STOP_ALL checked before every
+    // batch (exact state saved, exit), `--resume` continues. Each pass order is a pure function of (epoch, pass).
+    let best_path = format!("{out}_best.f32");
+    let ck_path = format!("{out}.ckpt");
+    let run_dir = std::path::Path::new(&out).parent().map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }).unwrap_or_else(|| ".".into());
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let (mut ep_start, mut pass_start, mut b_start, mut tl0, mut tw0) = (1usize, 0usize, 0usize, 0f64, 0f64);
+    if args.iter().any(|a| a == "--resume") {
+        let dd = match std::fs::read(&ck_path) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("zataxx-train --resume: {ck_path}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut r = crate::stopctl::Rd::new(&dd);
+        let ok = (|| -> Result<(), String> {
+            if r.str()? != "ZCK1" || r.u64()? != P as u64 || r.u64()? != passes as u64 {
+                return Err("not a zataxx-train checkpoint of this setup".into());
+            }
+            ep_start = r.u64()? as usize;
+            pass_start = r.u64()? as usize;
+            b_start = r.u64()? as usize;
+            step = r.u64()? as i32;
+            lr = r.f64()? as f32;
+            bad = r.u64()? as usize;
+            tl0 = r.f64()?;
+            tw0 = r.f64()?;
+            best.0 = r.f64()?;
+            best.2 = r.u64()? as usize;
+            best.1 = r.f32s()?;
+            w = r.f32s()?;
+            mo = r.f32s()?;
+            ve = r.f32s()?;
+            Ok(())
+        })();
+        if let Err(e) = ok {
+            eprintln!("zataxx-train --resume: {ck_path}: {e}");
+            return ExitCode::from(2);
+        }
+        say(format!("RESUMED from {ck_path}: epoch {ep_start} pass {pass_start} batch {b_start}, best epoch {} = {:.6}", best.2, best.0), &mut log);
+    } else {
+        if std::path::Path::new(&ck_path).exists() {
+            eprintln!("zataxx-train: {ck_path} exists: continue it with --resume, or delete it to start over");
+            return ExitCode::from(2);
+        }
+        let _ = crate::stopctl::write_atomic(&best_path, &f32_bytes(&best.1));
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn save_ck(path: &str, passes: usize, ep: usize, pass: usize, bi: usize, step: i32, lr: f32, bad: usize, tl: f64, tw: f64, best: &(f64, Vec<f32>, usize), w: &[f32], mo: &[f32], ve: &[f32]) -> Result<(), String> {
+        let mut x = crate::stopctl::Wr::default();
+        x.str("ZCK1").u64(P as u64).u64(passes as u64).u64(ep as u64).u64(pass as u64).u64(bi as u64).u64(step as u64).f64(lr as f64).u64(bad as u64).f64(tl).f64(tw).f64(best.0).u64(best.2 as u64).f32s(&best.1).f32s(w).f32s(mo).f32s(ve);
+        crate::stopctl::write_atomic(path, &x.0)
+    }
+    for epoch in ep_start.. {
+        let (mut tl, mut tw) = if epoch == ep_start { (tl0, tw0) } else { (0f64, 0f64) };
         // --sym-per-epoch 8 (D1005): one epoch = 8 shuffled passes, row k gets symmetry (s_k + pass) & 7, i.e. every row in
         // all 8 orientations per epoch; validation (and the lr-halving / saturation rule) once per epoch
-        for pass in 0..passes {
+        let p_first = if epoch == ep_start { pass_start } else { 0 };
+        for pass in p_first..passes {
+        let mut order: Vec<usize> = (0..train.len()).collect();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ ((epoch * 8 + pass) as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
         for i in (1..order.len()).rev() {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             order.swap(i, (rng % (i as u64 + 1)) as usize);
         }
-        for batch in order.chunks(bs) {
+        let first = if epoch == ep_start && pass == p_first { b_start } else { 0 };
+        for (bi, batch) in order.chunks(bs).enumerate().skip(first) {
+            if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+                if let Err(e) = save_ck(&ck_path, passes, epoch, pass, bi, step, lr, bad, tl, tw, &best, &w, &mo, &ve) {
+                    eprintln!("zataxx-train: checkpoint: {e}");
+                    return ExitCode::from(1);
+                }
+                say(format!("STOPPED by {f} at epoch {epoch} pass {pass} batch {bi}: state {ck_path}, best (epoch {}) {best_path}; the same command + --resume continues", best.2), &mut log);
+                return ExitCode::SUCCESS;
+            }
             let chunk = batch.len().div_ceil(threads);
             let wr = &w;
             let trr = &train;
@@ -342,9 +408,14 @@ pub fn run(args: &[String]) -> ExitCode {
         if vl < best.0 - 1e-7 {
             best = (vl, w.clone(), epoch);
             bad = 0;
+            let _ = crate::stopctl::write_atomic(&best_path, &f32_bytes(&best.1));
         } else {
             bad += 1;
             lr *= 0.5;
+        }
+        if let Err(e) = save_ck(&ck_path, passes, epoch + 1, 0, 0, step, lr, bad, 0.0, 0.0, &best, &w, &mo, &ve) {
+            eprintln!("zataxx-train: checkpoint: {e}");
+            return ExitCode::from(1);
         }
         say(format!(
             "epoch {epoch}: train loss {:.6} | val loss {vl:.6} | best {:.6} @ {} | lr {lr:.6} | NNUE 0.008978 | {:.0}s",
@@ -370,7 +441,7 @@ pub fn run(args: &[String]) -> ExitCode {
         bytes.extend_from_slice(&qi.to_le_bytes());
     }
     let np2 = format!("{out}_net.bin");
-    let _ = std::fs::File::create(&np2).and_then(|mut f| f.write_all(&bytes));
+    let _ = crate::stopctl::write_atomic(&np2, &bytes);
     let mut zq = Zat::load(&np2);
     zq.trunc = true; // score exactly what Zataxx's AVX2 build computes (D1021)
     let net = Nnue::bundled();

@@ -1,4 +1,4 @@
-﻿//! TitaniumTest â€” Distributed & Multi-Threaded SPRT Gate + Teacher Relabeling System (Fishtest / Fishnet style).
+//! TitaniumTest â€” Distributed & Multi-Threaded SPRT Gate + Teacher Relabeling System (Fishtest / Fishnet style).
 //!
 //! Subcommands:
 //!   titaniumtest sprt --candidate <CMD|self> --baseline <CMD> --book <FILE>
@@ -46,6 +46,8 @@ use sprt::{SprtTally, SprtVerdict};
 mod hash;
 mod prov;
 mod repro;
+// mod proof; // DISABLED 2026-11-21 (D1410): untracked src/proof.rs calls Searcher::pv which does not exist -> breaks the whole hub build (gen/analyze/botzone all dead). Restore by uncommenting once the engine exposes a read-only PV accessor.
+mod stopctl;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -73,8 +75,10 @@ fn main() -> ExitCode {
         "data" => data::run_data(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
+        // "proof-hunt" disabled with `mod proof` 2026-11-21 (D1410, see above)
         "policy" => policy::run_policy(&args[1..]),
         "policy2" => policy2::run(&args[1..]),
+        "policy-rl" => policy2::run_rl(&args[1..]),
         "botzone-upload" => bzupload::run(&args[1..]),
         "botzone" => botzone::run_botzone(&args[1..]),
         "analyze" => games::run_analyze(&args[1..]),
@@ -227,16 +231,49 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
             }
         }
         let tmp = format!("{tdat_out}.tdat.tmp");
-        let mut w = std::io::BufWriter::with_capacity(
-            1 << 20,
+        // LAWS A14 (user D1307): after every finished block the output is flushed and `<out>.tdat.progress` records the
+        // rows done (atomic); STOP in the output folder or C:/gitProjects/STOP_ALL stops within a few positions (the
+        // unfinished block is discarded, everything before it is kept); --resume continues after the last finished block.
+        let progress = format!("{tdat_out}.tdat.progress");
+        let run_dir = Path::new(&tdat_out).parent().map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }).unwrap_or_else(|| ".".into());
+        if let Some(f) = stopctl::requested(Some(&run_dir)) {
+            eprintln!("relabel: stop file {f} exists: remove it to run");
+            return ExitCode::FAILURE;
+        }
+        let resume = has_flag(args, "--resume");
+        let mut done = 0usize;
+        let file = if resume && Path::new(&tmp).exists() && Path::new(&progress).exists() {
+            done = fs::read_to_string(&progress).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+            let f = match fs::OpenOptions::new().write(true).open(&tmp) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("relabel --resume: open {tmp}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // drop a half-written block: the file keeps exactly the rows the progress file names
+            if let Err(e) = f.set_len((done * data::REC) as u64) {
+                eprintln!("relabel --resume: truncate {tmp}: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("relabel: RESUMED {tmp} at row {done}");
+            let mut f = f;
+            let _ = std::io::Seek::seek(&mut f, std::io::SeekFrom::End(0));
+            f
+        } else {
+            if Path::new(&tmp).exists() {
+                eprintln!("relabel: {tmp} exists (an unfinished run): continue it with --resume, or delete it to start over");
+                return ExitCode::FAILURE;
+            }
             match fs::File::create(&tmp) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("relabel: create {tmp}: {e}");
                     return ExitCode::FAILURE;
                 }
-            },
-        );
+            }
+        };
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
         let total = t.rows;
         println!(
             "=== TitaniumTest Persistent .tdat Relabeler ===\n\
@@ -246,9 +283,15 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
             (total * data::REC) as f64 / 1_048_576.0
         );
         let t0 = Instant::now();
-        let mut done = 0usize;
         let mut batch: Vec<data::Rec> = Vec::with_capacity(1 << 16);
+        let aborted = std::sync::atomic::AtomicBool::new(false);
         while done < total {
+            if let Some(f) = stopctl::requested(Some(&run_dir)) {
+                let _ = w.flush();
+                let _ = stopctl::write_atomic(&progress, done.to_string().as_bytes());
+                println!("relabel: STOPPED by {f} at row {done} of {total}: {tmp} + {progress} kept; the same command + --resume continues");
+                return ExitCode::SUCCESS;
+            }
             batch.clear();
             let take = (total - done).min(1 << 16);
             if let Err(e) = t.read_block(done, take, &mut batch) {
@@ -265,6 +308,7 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                     let batch_ref = &batch;
                     let scores_ref = &scores;
                     let next_ref = &next_idx;
+                    let (aborted, run_dir) = (&aborted, &run_dir);
                     sc.spawn(move || {
                         let mut searcher = Searcher::with_tt_bits_unconfigured(tt_bits);
                         searcher.set_nnue(Some(nn));
@@ -274,6 +318,10 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                             max_depth: u8::MAX,
                         };
                         loop {
+                            if aborted.load(Ordering::Relaxed) || stopctl::requested(Some(run_dir)).is_some() {
+                                aborted.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             let i = next_ref.fetch_add(16, Ordering::Relaxed);
                             if i >= batch_ref.len() {
                                 break;
@@ -292,6 +340,13 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                     });
                 }
             });
+            if aborted.load(Ordering::Relaxed) {
+                // the block is unfinished: discard it, keep everything before it
+                let _ = w.flush();
+                let _ = stopctl::write_atomic(&progress, done.to_string().as_bytes());
+                println!("relabel: STOPPED at row {done} of {total} (unfinished block discarded): {tmp} + {progress} kept; the same command + --resume continues");
+                return ExitCode::SUCCESS;
+            }
             for (r, s_at) in batch.iter_mut().zip(scores.iter()) {
                 r.cp = s_at.load(Ordering::Relaxed) as f32;
                 r.relabel_src = 3;
@@ -301,6 +356,14 @@ fn run_relabel_local(args: &[String]) -> ExitCode {
                 }
             }
             done += batch.len();
+            if let Err(e) = w.flush() {
+                eprintln!("relabel: flush: {e}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = stopctl::write_atomic(&progress, done.to_string().as_bytes()) {
+                eprintln!("relabel: {e}");
+                return ExitCode::FAILURE;
+            }
             let dt = t_b.elapsed().as_secs_f64();
             println!(
                 "[tdat {done:>8}/{total} ({:.1}%)] {} pos in {dt:.1}s ({:.0} pos/s, total {:.1}m)",
@@ -1287,6 +1350,15 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
     let stop_flag = AtomicBool::new(false);
     let tally = Mutex::new(SprtTally::default());
     let t0 = Instant::now();
+    // LAWS A14 (user D1307): `<log dir>/STOP` or C:/gitProjects/STOP_ALL stops the gate safely: no new pair starts, a pair
+    // whose second game has not started is dropped, every finished pair stays in the log + games.jsonl, the summary below
+    // is still written.
+    let run_dir: Option<std::path::PathBuf> = out_path.as_ref().and_then(|p| Path::new(p).parent().map(|d| d.to_path_buf()));
+    let stopped_by: Mutex<Option<String>> = Mutex::new(None);
+    if let Some(f) = stopctl::requested(run_dir.as_deref()) {
+        eprintln!("sprt: stop file {f} exists: remove it to run a gate");
+        return ExitCode::FAILURE;
+    }
 
     std::thread::scope(|sc| {
         for tid in 0..threads {
@@ -1297,13 +1369,27 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             let stop_flag = &stop_flag;
             let tally = &tally;
             let out_path = &out_path;
+            let run_dir = &run_dir;
+            let stopped_by = &stopped_by;
             sc.spawn(move || {
                 let mut cand = PlayerSlot::create(cand_spec)
                     .unwrap_or_else(|e| panic!("worker {tid}: candidate init failed: {e}"));
                 let mut base = PlayerSlot::create(base_spec)
                     .unwrap_or_else(|e| panic!("worker {tid}: baseline init failed: {e}"));
+                let user_stop = || -> bool {
+                    if let Some(f) = stopctl::requested(run_dir.as_deref()) {
+                        let mut s = stopped_by.lock().unwrap();
+                        if s.is_none() {
+                            println!("\n>>> STOP requested by {f}: no new pair starts; finished pairs are kept <<<");
+                            *s = Some(f);
+                        }
+                        stop_flag.store(true, Ordering::Relaxed);
+                        return true;
+                    }
+                    false
+                };
                 loop {
-                    if stop_flag.load(Ordering::Relaxed) {
+                    if stop_flag.load(Ordering::Relaxed) || user_stop() {
                         break;
                     }
                     let pair_idx = next_pair.fetch_add(1, Ordering::Relaxed);
@@ -1327,7 +1413,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
                         &mut mv1,
                     )
                     .unwrap_or_else(|e| panic!("worker {tid} pair {pair_idx} game 1 failed: {e}"));
-                    if stop_flag.load(Ordering::Relaxed) {
+                    if stop_flag.load(Ordering::Relaxed) || user_stop() {
                         break;
                     }
                     let (g2, b2, w2, p2) = play_single_game(
@@ -1403,12 +1489,16 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
 
     let final_tally = tally.lock().unwrap();
     let st = final_tally.compute(elo0, elo1, 0.05, 0.05);
+    let stop_note = stopped_by.lock().unwrap().clone().map(|f| format!(" STOPPED by {f} (finished pairs kept)")).unwrap_or_default();
+    if !stop_note.is_empty() {
+        println!("\n>>> gate stopped on request:{stop_note}; extend later with --book0 {} (every book line before it was started) <<<", book0 + next_pair.load(Ordering::Relaxed).min(max_pairs));
+    }
     repro::log_run(
         engine_root.as_deref(),
         "DONE",
         &run_log_name,
         &format!(
-            "+{} -{} ={} ({} g) Elo {:+.1} +- {:.1} LOS {:.1}% LLR {:+.2} {:?}",
+            "+{} -{} ={} ({} g) Elo {:+.1} +- {:.1} LOS {:.1}% LLR {:+.2} {:?}{stop_note}",
             final_tally.wins, final_tally.losses, final_tally.draws, st.games, st.elo, st.elo_ci95, st.los * 100.0, st.llr, st.verdict
         ),
     );
@@ -1444,6 +1534,7 @@ fn run_sprt_cli(args: &[String]) -> ExitCode {
             ""
         }
     );
+    println!("{}", final_tally.report_block(elo0, elo1, 0.05, 0.05));
     if let Some(p) = &out_path {
         if let Ok(text) = fs::read_to_string(format!("{p}.games.jsonl")) {
             let gs: Vec<games::Game> = text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| games::parse_game(l).ok()).collect();

@@ -195,6 +195,8 @@ struct Scratch {
     z: Vec<f32>,
     dz: Vec<f32>,
     qg: Vec<f32>,
+    /// D1320 phase bucket of the sample: base offsets into (bias, g, td, tor); all 0 with --buckets 1
+    off: [usize; 4],
 }
 
 /// Rebuild moves / features / pattern rows / labels of a sample. Returns the hard label index (hard samples) or
@@ -212,7 +214,23 @@ fn see_n(mode: u8) -> usize {
     }
 }
 
+/// D1320 (user D1312/D1313): --buckets N = one policy head per phase bucket, bucket = empties * N / 50 (the NNUE's and the
+/// engine's formula); per-bucket sizes [N, bias, g, td, tor] (unset = 1 bucket, every offset 0 = the old trainer exactly)
+static PB: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
+
+fn bucket_off(s: &S) -> [usize; 4] {
+    match PB.get() {
+        Some(&[nb, sl, gl, tdl, tol]) if nb > 1 => {
+            let e = 49 - (s.own | s.opp).count_ones() as usize;
+            let k = (e * nb / 50).min(nb - 1);
+            [k * sl, k * gl, k * tdl, k * tol]
+        }
+        _ => [0; 4],
+    }
+}
+
 fn expand(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bool, x: &mut Scratch) -> Option<usize> {
+    x.off = bucket_off(s);
     let rb = RING_BASE.load(std::sync::atomic::Ordering::Relaxed);
     let sm = SEE_MODE.load(std::sync::atomic::Ordering::Relaxed);
     let b = Board::from_occ(s.own, s.opp, 0, 0);
@@ -360,34 +378,35 @@ struct Grad {
 }
 
 fn new_scratch() -> Scratch {
-    Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] }
+    Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![], off: [0; 4] }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bool, prm: (&[f32], &[f32], &[f32], &[f32]), w: (f32, f32), inv_n: f32, gr: &mut Grad) {
     let (bias, g, td, tor) = prm;
     let Some(lab) = expand(s, kpool, ring, k3c, use_pat, &mut gr.sc) else { return };
+    let [ob, og, otd, oto] = gr.sc.off;
     let x = &mut gr.sc;
     let z = &mut gr.z;
     z.clear();
     for (i, m) in x.mv.iter().enumerate() {
-        let mut v = bias[m[0] as usize] + g[m[1] as usize] + g[m[2] as usize];
+        let mut v = bias[ob + m[0] as usize] + g[og + m[1] as usize] + g[og + m[2] as usize];
         if m[3] != 255 {
-            v += g[m[3] as usize];
+            v += g[og + m[3] as usize];
         }
         if let Some(&si) = x.sv.get(i) {
-            v += g[si as usize];
+            v += g[og + si as usize];
         }
         if !td.is_empty() {
             let [d, o] = x.pv[i];
-            v += td[d as usize];
+            v += td[otd + d as usize];
             if o != NONE {
-                v += tor[o as usize];
+                v += tor[oto + o as usize];
             }
         }
         if let Some(rr) = x.rv.get(i) {
             for &q in rr {
-                v += tor[q as usize];
+                v += tor[oto + q as usize];
             }
         }
         z.push(v);
@@ -426,28 +445,28 @@ fn grad_one(s: &S, kpool: &[(u8, u16)], ring: &[u64; 49], k3c: bool, use_pat: bo
         if d == 0.0 {
             continue;
         }
-        gr.gb[m[0] as usize] += d;
-        gr.gg[m[1] as usize] += d;
-        gr.gg[m[2] as usize] += d;
+        gr.gb[ob + m[0] as usize] += d;
+        gr.gg[og + m[1] as usize] += d;
+        gr.gg[og + m[2] as usize] += d;
         if m[3] != 255 {
-            gr.gg[m[3] as usize] += d;
+            gr.gg[og + m[3] as usize] += d;
         }
         if let Some(&si) = x.sv.get(i) {
-            gr.gg[si as usize] += d;
+            gr.gg[og + si as usize] += d;
         }
         if use_pat {
             let [pd, po] = x.pv[i];
-            gr.touched.push(pd);
-            gr.gtd[pd as usize] += d;
+            gr.touched.push(otd as u32 + pd);
+            gr.gtd[otd + pd as usize] += d;
             if po != NONE {
-                gr.touched_o.push(po);
-                gr.gto[po as usize] += d;
+                gr.touched_o.push(oto as u32 + po);
+                gr.gto[oto + po as usize] += d;
             }
         }
         if let Some(rr) = x.rv.get(i) {
             for &q in rr {
-                gr.touched_o.push(q);
-                gr.gto[q as usize] += d;
+                gr.touched_o.push(oto as u32 + q);
+                gr.gto[oto + q as usize] += d;
             }
         }
     }
@@ -507,6 +526,23 @@ fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn head_bytes(k3c: bool, use_pat: bool, parts: [&[f32]; 4]) -> Vec<u8> {
+    if let Some(&[nb, sl, gl, tdl, tol]) = PB.get() {
+        if nb > 1 {
+            // D1320 TPOL6: magic, u32 dim 0, u32 nb, then per bucket [bias, g, td, tor] (the engine's policy.rs)
+            let mut o = b"TPOL6".to_vec();
+            o.extend_from_slice(&[0, 0, 0]);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&(nb as u32).to_le_bytes());
+            for k in 0..nb {
+                for (part, n) in parts.iter().zip([sl, gl, tdl, tol]) {
+                    for v in &part[k * n..(k + 1) * n] {
+                        o.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            return o;
+        }
+    }
     let ring = RING_BASE.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX;
     let see = SEE_MODE.load(std::sync::atomic::Ordering::Relaxed) != 0;
     let mut o = if see {
@@ -823,11 +859,23 @@ pub fn run(args: &[String]) -> ExitCode {
     if use_ring {
         RING_BASE.store((no_slots * P3) as u32, std::sync::atomic::Ordering::Relaxed);
     }
+    // D1323: a TPOL6 (phase-bucket) head as --init: kept aside, written into the buckets after --buckets sized them
+    let mut pending6: Option<(usize, Vec<f32>)> = None;
     if let Some(ip) = arg(args, "--init") {
         let Ok(d) = fs::read(&ip) else {
             eprintln!("{ip}: cannot read");
             return ExitCode::from(1);
         };
+        if d.len() >= 16 && &d[0..5] == b"TPOL6" {
+            let fnb = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
+            let per = SLOTS + NSCAL + 27 * P3;
+            if fnb == 0 || d.len() != 16 + 4 * per * fnb || !k3c || !use_pat || nsee > 0 || use_ring {
+                eprintln!("--init {ip}: bad TPOL6 file, or this run is not --pat k3c without --see / --ring");
+                return ExitCode::from(2);
+            }
+            pending6 = Some((fnb, d[16..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()));
+            println!("init from {ip}: TPOL6 with {fnb} phase buckets");
+        } else {
         let idim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
         let v5 = &d[0..5] == b"TPOL5";
         let v4 = &d[0..5] == b"TPOL4";
@@ -855,34 +903,73 @@ pub fn run(args: &[String]) -> ExitCode {
             tor[..rest.len()].copy_from_slice(rest); // a TPOL3 init leaves the ring block at 0 (step-0 parity, C14)
         }
         println!("init from {ip} (file dim {idim}{}, tables {}, see {see_arg})", if idim > 0 { ", U dropped as in the engine" } else { "" }, if v2 || v3 { "loaded" } else { "zero" });
+        }
     }
 
+    // D1320: --buckets N copies the (init) head into N phase buckets = exact step-0 parity (C14); TPOL6 export
+    let nbk: usize = arg(args, "--buckets").and_then(|v| v.parse().ok()).unwrap_or(1);
+    if nbk > 1 {
+        if nsee > 0 || use_ring || !k3c || !use_pat {
+            eprintln!("--buckets {nbk} needs --pat k3c without --see / --ring (the engine's TPOL6 holds TPOL3-style heads)");
+            return ExitCode::from(2);
+        }
+        let _ = PB.set([nbk, bias.len(), g.len(), td.len(), tor.len()]);
+        bias = bias.repeat(nbk);
+        g = g.repeat(nbk);
+        td = td.repeat(nbk);
+        tor = tor.repeat(nbk);
+        println!("phase buckets: {nbk} (bucket = empties * {nbk} / 50, as the NNUE); every bucket starts as the init head (step-0 parity)");
+        if let Some((fnb, f)) = pending6.take() {
+            // run bucket b starts as file bucket b / (nbk / fnb): the same head on the same positions, since
+            // floor(e * fnb / 50) == floor(floor(e * nbk / 50) / (nbk / fnb))
+            if nbk % fnb != 0 {
+                eprintln!("--init TPOL6 with {fnb} buckets cannot seed --buckets {nbk} (needs a whole multiple)");
+                return ExitCode::from(2);
+            }
+            let (sl, gl, tdl, tol) = (bias.len() / nbk, g.len() / nbk, td.len() / nbk, tor.len() / nbk);
+            let per = sl + gl + tdl + tol;
+            for b in 0..nbk {
+                let s = b / (nbk / fnb);
+                let blk = &f[s * per..(s + 1) * per];
+                bias[b * sl..(b + 1) * sl].copy_from_slice(&blk[..sl]);
+                g[b * gl..(b + 1) * gl].copy_from_slice(&blk[sl..sl + gl]);
+                td[b * tdl..(b + 1) * tdl].copy_from_slice(&blk[sl + gl..sl + gl + tdl]);
+                tor[b * tol..(b + 1) * tol].copy_from_slice(&blk[sl + gl + tdl..per]);
+            }
+            println!("phase buckets: seeded from the {fnb}-bucket head (bucket b <- b / {}): exact step-0 parity", nbk / fnb);
+        }
+    }
+    if pending6.is_some() {
+        eprintln!("--init TPOL6 needs --buckets N (a whole multiple of the file's buckets)");
+        return ExitCode::from(2);
+    }
     let logits = |x: &Scratch, bias: &[f32], g: &[f32], td: &[f32], tor: &[f32], out: &mut Vec<f32>| {
         out.clear();
+        let [ob, og, otd, oto] = x.off;
         for (i, m) in x.mv.iter().enumerate() {
-            let mut z = bias[m[0] as usize] + g[m[1] as usize] + g[m[2] as usize];
+            let mut z = bias[ob + m[0] as usize] + g[og + m[1] as usize] + g[og + m[2] as usize];
             if m[3] != 255 {
-                z += g[m[3] as usize];
+                z += g[og + m[3] as usize];
             }
             if let Some(&si) = x.sv.get(i) {
-                z += g[si as usize];
+                z += g[og + si as usize];
             }
             if !td.is_empty() {
                 let [d, o] = x.pv[i];
-                z += td[d as usize];
+                z += td[otd + d as usize];
                 if o != NONE {
-                    z += tor[o as usize];
+                    z += tor[oto + o as usize];
                 }
             }
             if let Some(rr) = x.rv.get(i) {
                 for &q in rr {
-                    z += tor[q as usize];
+                    z += tor[oto + q as usize];
                 }
             }
             out.push(z);
         }
     };
-    let mut sc = Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![] };
+    let mut sc = Scratch { ml: MoveList::new(), mv: vec![], pv: vec![], rv: vec![], sv: vec![], kg: vec![], ky: vec![], keys: vec![], z: vec![], dz: vec![], qg: vec![], off: [0; 4] };
     // validation: (game CE, top1, top3, top5, n) and (kata soft CE, top1 most-visited group, n)
     // (top1 hits, n) on validation game moves with a positive advantage, then the same for a negative one
     let split = std::cell::Cell::new([0f64; 4]);
@@ -971,7 +1058,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Adam (dense on bias/g, lazy sparse on the tables)
     let mut tr: Vec<u32> = (0..ss.len() as u32).filter(|&i| !ss[i as usize].val && ss[i as usize].kind == 0).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; SLOTS], vec![0f32; SLOTS], vec![0f32; g.len()], vec![0f32; g.len()]);
+    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; bias.len()], vec![0f32; bias.len()], vec![0f32; g.len()], vec![0f32; g.len()]);
     let (mut mtd, mut vtd, mut mto, mut vto) = (vec![0f32; td.len()], vec![0f32; td.len()], vec![0f32; tor.len()], vec![0f32; tor.len()]);
     let (mut gtd, mut gto) = (vec![0f32; td.len()], vec![0f32; tor.len()]);
     let (mut touched, mut touched_o): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
@@ -982,6 +1069,18 @@ pub fn run(args: &[String]) -> ExitCode {
     // D535: crash safety: --out-bin is rewritten (atomically) after every improving epoch, a full checkpoint
     // <out>.ckpt after every epoch, --resume continues from it, <out>.stop ends the run after the current epoch
     let out_bin = arg(args, "--out-bin");
+    // LAWS A14 (user D1307): no run without a best snapshot + checkpoint, and a stop file (STOP in the --out-bin folder or
+    // C:/gitProjects/STOP_ALL) is checked every 64 batches: the partial epoch is discarded, the last epoch's checkpoint and
+    // the best snapshot stay, the same command + --resume restarts that epoch
+    let Some(ob) = out_bin.clone() else {
+        eprintln!("policy2: --out-bin FILE is required (LAWS A14: best snapshot + <FILE>.ckpt checkpoint)");
+        return ExitCode::from(2);
+    };
+    let run_dir = std::path::Path::new(&ob).parent().map(|d| if d.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { d.to_path_buf() }).unwrap_or_else(|| ".".into());
+    if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+        eprintln!("policy2: stop file {f} exists: remove it to train");
+        return ExitCode::from(2);
+    }
     let ckpt_path = out_bin.as_ref().map(|p| format!("{p}.ckpt"));
     let stop_path = out_bin.as_ref().map(|p| format!("{p}.stop"));
     let mut ep0 = 0usize;
@@ -1009,6 +1108,14 @@ pub fn run(args: &[String]) -> ExitCode {
             _ => println!("--resume: no usable checkpoint, starting fresh"),
         }
     }
+    if ep0 == 0 {
+        // a best snapshot exists from the first second on (the start weights), however short the run (LAWS A14)
+        if let Err(e) = write_atomic(&ob, &head_bytes(k3c, use_pat, [&best.1, &best.2, &best.3, &best.4])) {
+            eprintln!("policy2: {ob}: {e}");
+            return ExitCode::from(1);
+        }
+    }
+    let mut abort: Option<String> = None;
     for ep in ep0.. {
         let lr = lr0 * (0.85f32).powi(ep as i32);
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ (ep as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1019,7 +1126,7 @@ pub fn run(args: &[String]) -> ExitCode {
             tr.swap(i, (x % (i as u64 + 1)) as usize);
         }
         let t0 = std::time::Instant::now();
-        let (mut gb, mut gg) = (vec![0f32; SLOTS], vec![0f32; g.len()]);
+        let (mut gb, mut gg) = (vec![0f32; bias.len()], vec![0f32; g.len()]);
         let mut forder: Vec<usize> = (0..train_files.len()).collect();
         for i in (1..forder.len()).rev() {
             x ^= x << 13;
@@ -1063,7 +1170,7 @@ pub fn run(args: &[String]) -> ExitCode {
         // D526: PERSISTENT workers (one spawn per epoch, two barriers per batch) instead of 8 spawns per batch.
         // Workers read the parameters only between `start` and `done`; the main thread updates them only outside.
         let grs: Vec<std::sync::Mutex<Grad>> = (0..threads)
-            .map(|_| std::sync::Mutex::new(Grad { gb: vec![0f32; SLOTS], gg: vec![0f32; g.len()], gtd: vec![0f32; td.len()], gto: vec![0f32; tor.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] }))
+            .map(|_| std::sync::Mutex::new(Grad { gb: vec![0f32; bias.len()], gg: vec![0f32; g.len()], gtd: vec![0f32; td.len()], gto: vec![0f32; tor.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] }))
             .collect();
         let bt = bs * threads;
         let nb = btr.len().div_ceil(bt);
@@ -1107,6 +1214,12 @@ pub fn run(args: &[String]) -> ExitCode {
                 });
             }
             for bi in 0..nb {
+                if bi % 64 == 0 {
+                    if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+                        abort = Some(f);
+                        break;
+                    }
+                }
                 gb.iter_mut().for_each(|v| *v = 0.0);
                 gg.iter_mut().for_each(|v| *v = 0.0);
                 cur.store(bi, std::sync::atomic::Ordering::Release);
@@ -1176,8 +1289,20 @@ pub fn run(args: &[String]) -> ExitCode {
             cur.store(usize::MAX, std::sync::atomic::Ordering::Release);
             start_b.wait();
         });
+        if abort.is_some() {
+            break;
+        }
         }
         });
+        if let Some(f) = &abort {
+            println!(
+                "STOPPED by {f} during epoch {}: that partial epoch is discarded; kept: checkpoint {} (end of epoch {ep}) and best snapshot {ob} (epoch {}); the same command + --resume continues",
+                ep + 1,
+                ckpt_path.as_deref().unwrap_or(""),
+                best.5
+            );
+            return ExitCode::SUCCESS;
+        }
         eprintln!(" {} rows trained this epoch", rows_seen);
         let r = evaluate(&bias, &g, &td, &tor, &mut sc);
         show(&format!("epoch {} lr {:.5} ({:.0} s)", ep + 1, lr, t0.elapsed().as_secs_f64()), &r);
@@ -1317,4 +1442,424 @@ mod tests {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// D1462 (user): `ti policy-rl` = the policy head plays ITSELF (pure policy, no search, Botzone rules) and learns after
+// every batch of games, like a normal training run: Adam on the head (bias, scalars, 3x3 tables, per phase bucket),
+// policy gradient loss = -(z - 0.5) ln pi(a) for every move a, z = the mover's game result (1 / 0.5 / 0; 0.5 is the
+// exact self-play baseline), plus an optional decoupled pull toward the start head (--anchor, AdamW-style decay toward
+// the init weights instead of toward 0). Muon is not used: the head has no weight matrices, only lookup tables.
+// Openings: --open-plies uniformly random plies, then moves sampled from softmax(logits / --temp): games do not repeat.
+// Every --arena-every steps: greedy current head vs the start head on fixed paired random openings (fixed seeds).
+// Experiment only (--experiment NAME, outputs under experiments/); games go to <out dir>/games.bin, never the DAG.
+//   ti policy-rl --experiment NAME --init POL.bin (TPOL6) --out-bin experiments/X/pol_rl.bin [--threads 4]
+//     [--games-per-step 256] [--lr 0.001] [--temp 1.0] [--anchor 0.0] [--open-plies 4] [--arena-every 20]
+//     [--arena-games 400] [--resume]
+// Outputs: --out-bin (latest head, TPOL6, engine-loadable), <out>_best.bin (best arena score), <out>.ckpt (resume),
+// <dir>/games.bin (u16 plies, u8 result 0 black / 1 white / 2 draw, then plies x (from, to)). STOP / STOP_ALL honoured.
+
+struct RlRng(u64);
+impl RlRng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+type Prm<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [f32]);
+
+/// logits of every legal move of `b` (side to move = own) into `z`; the moves are `x.ml` (same order as the trainer)
+fn rl_logits(b: &Board, ring: &[u64; 49], prm: Prm, x: &mut Scratch, z: &mut Vec<f32>) -> usize {
+    let s = S { own: b.me(), opp: b.opp(), from: 255, to: 255, kind: 0, sel: 255, kn: 0, val: false, ko: 0, aw: 1.0, up: 0 };
+    let _ = expand(&s, &[], ring, true, true, x);
+    let n = x.ml.len();
+    z.clear();
+    if n < 2 {
+        return n;
+    }
+    let (bias, g, td, tor) = prm;
+    let [ob, og, otd, oto] = x.off;
+    for (i, m) in x.mv.iter().enumerate() {
+        let mut v = bias[ob + m[0] as usize] + g[og + m[1] as usize] + g[og + m[2] as usize];
+        if m[3] != 255 {
+            v += g[og + m[3] as usize];
+        }
+        let [d, o] = x.pv[i];
+        v += td[otd + d as usize];
+        if o != NONE {
+            v += tor[oto + o as usize];
+        }
+        z.push(v);
+    }
+    n
+}
+
+/// pick a move: temp <= 0 = argmax, else a sample of softmax(z / temp). Returns (index, entropy of softmax(z)).
+fn rl_pick(z: &[f32], temp: f32, rng: &mut RlRng) -> (usize, f32) {
+    let mx = z.iter().cloned().fold(f32::MIN, f32::max);
+    let den: f32 = z.iter().map(|v| (v - mx).exp()).sum();
+    let ent: f32 = -z
+        .iter()
+        .map(|v| {
+            let p = (v - mx).exp() / den;
+            if p > 0.0 { p * p.ln() } else { 0.0 }
+        })
+        .sum::<f32>();
+    if temp <= 0.0 {
+        let i = z.iter().enumerate().fold((0, f32::MIN), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
+        return (i, ent);
+    }
+    let w: Vec<f32> = z.iter().map(|v| ((v - mx) / temp).exp()).collect();
+    let tot: f32 = w.iter().sum();
+    let mut r = rng.unit() * tot;
+    for (i, wi) in w.iter().enumerate() {
+        r -= wi;
+        if r <= 0.0 {
+            return (i, ent);
+        }
+    }
+    (w.len() - 1, ent)
+}
+
+fn rl_random_opening(plies: usize, rng: &mut RlRng) -> Board {
+    let mut b = Board::start();
+    let mut ml = MoveList::new();
+    for _ in 0..plies {
+        if b.bz_over() {
+            break;
+        }
+        b.legal_moves_dedup_into(&mut ml);
+        if ml.is_empty() {
+            break;
+        }
+        let m = ml.move_at((rng.next() % ml.len() as u64) as usize);
+        b = b.make(m);
+    }
+    b
+}
+
+/// one game from `start`; side 0 (black) uses prm[0], side 1 prm[1]. Returns (result 0 black / 1 white / 2 draw, the
+/// scored plies (own, opp, from, to, mover), entropy sum, scored plies count).
+#[allow(clippy::type_complexity)]
+fn rl_game(start: Board, ring: &[u64; 49], prm: [Prm; 2], temp: f32, rng: &mut RlRng, x: &mut Scratch, z: &mut Vec<f32>) -> (u8, Vec<(u64, u64, u8, u8, u8)>, f64, u32) {
+    let mut b = start;
+    let mut rec = Vec::new();
+    let (mut ent, mut ne) = (0f64, 0u32);
+    while b.ply < 400 && !b.bz_over() {
+        let n = rl_logits(&b, ring, prm[b.turn as usize], x, z);
+        if n == 0 {
+            b = b.make_pass();
+            continue;
+        }
+        let i = if n == 1 {
+            0
+        } else {
+            let (i, e) = rl_pick(z, temp, rng);
+            ent += e as f64;
+            ne += 1;
+            i
+        };
+        let m = x.ml.move_at(i);
+        if n >= 2 {
+            rec.push((b.me(), b.opp(), m.from, m.to, b.turn));
+        }
+        b = b.make(m);
+    }
+    let (c0, c1) = if b.bz_over() { b.bz_counts() } else { b.counts() };
+    let res = match c0.cmp(&c1) {
+        std::cmp::Ordering::Greater => 0,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+    };
+    (res, rec, ent, ne)
+}
+
+pub fn run_rl(args: &[String]) -> ExitCode {
+    let exp = crate::genguard::experiment(args);
+    let (Some(_), Some(init), Some(out)) = (&exp, arg(args, "--init"), arg(args, "--out-bin")) else {
+        eprintln!("usage: ti policy-rl --experiment NAME --init POL.bin (TPOL6) --out-bin experiments/X/pol_rl.bin [--threads 4] [--games-per-step 256] [--lr 0.001] [--temp 1.0] [--anchor 0.0] [--open-plies 4] [--arena-every 20] [--arena-games 400] [--resume]");
+        return ExitCode::from(2);
+    };
+    crate::genguard::announce("policy-rl", &exp);
+    if let Err(e) = crate::genguard::check_output("policy-rl", &exp, &out) {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    let num = |n: &str, d: f64| arg(args, n).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let threads = num("--threads", 4.0).max(1.0) as usize;
+    let gps = (num("--games-per-step", 256.0) as usize).max(threads);
+    let lr = num("--lr", 0.001) as f32;
+    let temp = num("--temp", 1.0) as f32;
+    let anchor = num("--anchor", 0.0) as f32;
+    let open_plies = num("--open-plies", 4.0) as usize;
+    let arena_every = (num("--arena-every", 20.0) as usize).max(1);
+    let arena_games = ((num("--arena-games", 400.0) as usize) / 2 * 2).max(2);
+
+    // the start head: TPOL6 (phase buckets), file layout per bucket [bias, g, td, tor]
+    let Ok(d) = fs::read(&init) else {
+        eprintln!("{init}: cannot read");
+        return ExitCode::from(1);
+    };
+    let per = SLOTS + NSCAL + 27 * P3;
+    if d.len() < 16 || &d[0..5] != b"TPOL6" {
+        eprintln!("{init}: not a TPOL6 policy head");
+        return ExitCode::from(2);
+    }
+    let nb = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
+    if nb == 0 || d.len() != 16 + 4 * per * nb {
+        eprintln!("{init}: TPOL6 size does not match {nb} buckets of a --pat k3c head");
+        return ExitCode::from(2);
+    }
+    let f: Vec<f32> = d[16..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let (sl, gl, tdl, tol) = (SLOTS, NSCAL, 18 * P3, 9 * P3);
+    let _ = PB.set([nb, sl, gl, tdl, tol]);
+    let (mut bias, mut g, mut td, mut tor) = (vec![0f32; sl * nb], vec![0f32; gl * nb], vec![0f32; tdl * nb], vec![0f32; tol * nb]);
+    for k in 0..nb {
+        let blk = &f[k * per..(k + 1) * per];
+        bias[k * sl..(k + 1) * sl].copy_from_slice(&blk[..sl]);
+        g[k * gl..(k + 1) * gl].copy_from_slice(&blk[sl..sl + gl]);
+        td[k * tdl..(k + 1) * tdl].copy_from_slice(&blk[sl + gl..sl + gl + tdl]);
+        tor[k * tol..(k + 1) * tol].copy_from_slice(&blk[sl + gl + tdl..per]);
+    }
+    let (b0, g0, td0, tor0) = (bias.clone(), g.clone(), td.clone(), tor.clone());
+    let ring = ring1();
+    let run_dir = std::path::Path::new(&out).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
+    let _ = fs::create_dir_all(&run_dir);
+    if let Some(s) = crate::stopctl::requested(Some(&run_dir)) {
+        eprintln!("policy-rl: stop file {s} exists: remove it to run");
+        return ExitCode::from(2);
+    }
+    let best_path = format!("{}_best.bin", out.trim_end_matches(".bin"));
+    let ckpt_path = format!("{out}.ckpt");
+    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; bias.len()], vec![0f32; bias.len()], vec![0f32; g.len()], vec![0f32; g.len()]);
+    let (mut mtd, mut vtd, mut mto, mut vto) = (vec![0f32; td.len()], vec![0f32; td.len()], vec![0f32; tor.len()], vec![0f32; tor.len()]);
+    let (mut step0, mut t, mut best_score, mut best_step) = (0usize, 0i32, f64::MIN, 0usize);
+    if args.iter().any(|a| a == "--resume") {
+        match ckpt_read(&ckpt_path) {
+            Some((h, vs)) if vs[0].len() == bias.len() && vs[3].len() == tor.len() => {
+                bias.copy_from_slice(&vs[0]);
+                g.copy_from_slice(&vs[1]);
+                td.copy_from_slice(&vs[2]);
+                tor.copy_from_slice(&vs[3]);
+                mb.copy_from_slice(&vs[4]);
+                vb.copy_from_slice(&vs[5]);
+                mg.copy_from_slice(&vs[6]);
+                vg.copy_from_slice(&vs[7]);
+                mtd.copy_from_slice(&vs[8]);
+                vtd.copy_from_slice(&vs[9]);
+                mto.copy_from_slice(&vs[10]);
+                vto.copy_from_slice(&vs[11]);
+                (step0, t, best_score, best_step) = (h.0 as usize, h.1, h.2, h.3 as usize);
+                println!("resumed from {ckpt_path} at step {step0} (best arena {best_score:.4} at step {best_step})");
+            }
+            _ => println!("--resume: no usable checkpoint, starting fresh"),
+        }
+    }
+    if step0 == 0 {
+        let _ = write_atomic(&out, &head_bytes(true, true, [&bias, &g, &td, &tor]));
+        let _ = write_atomic(&best_path, &head_bytes(true, true, [&bias, &g, &td, &tor]));
+    }
+    println!(
+        "policy-rl: init {init} ({nb} buckets, {} params), {threads} threads, {gps} games/step, lr {lr}, temp {temp}, anchor {anchor}, open plies {open_plies}, arena {arena_games} g every {arena_every} steps",
+        bias.len() + g.len() + td.len() + tor.len()
+    );
+    let mut games_f = fs::OpenOptions::new().create(true).append(true).open(run_dir.join("games.bin")).ok();
+    let t_start = std::time::Instant::now();
+    let mut games_total = (step0 * gps) as u64;
+    let games_at_start = games_total;
+    let (beta1, beta2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+
+    // greedy arena of `cur` vs `base` on fixed paired openings; returns (score of cur, wins, losses, draws)
+    let arena = |cur: Prm, base: Prm| -> (f64, u32, u32, u32) {
+        let pairs = arena_games / 2;
+        let per_t = pairs.div_ceil(threads);
+        let rs: Vec<(u32, u32, u32)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|ti| {
+                    let ring = &ring;
+                    sc.spawn(move || {
+                        let (mut x, mut z) = (new_scratch(), Vec::new());
+                        let (mut w, mut l, mut dr) = (0u32, 0u32, 0u32);
+                        for k in ti * per_t..((ti + 1) * per_t).min(pairs) {
+                            let mut orng = RlRng(0xA5A5_0000_0000_0001 ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                            let start = rl_random_opening(open_plies.max(2), &mut orng);
+                            for cur_side in 0..2u8 {
+                                let prm = if cur_side == 0 { [cur, base] } else { [base, cur] };
+                                let mut r = RlRng(1);
+                                let (res, ..) = rl_game(start, ring, prm, 0.0, &mut r, &mut x, &mut z);
+                                if res == 2 {
+                                    dr += 1;
+                                } else if res == cur_side {
+                                    w += 1;
+                                } else {
+                                    l += 1;
+                                }
+                            }
+                        }
+                        (w, l, dr)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (w, l, dr) = rs.iter().fold((0, 0, 0), |a, r| (a.0 + r.0, a.1 + r.1, a.2 + r.2));
+        let n = (w + l + dr).max(1) as f64;
+        ((w as f64 + 0.5 * dr as f64) / n, w, l, dr)
+    };
+    let elo = |s: f64| if s <= 0.0 || s >= 1.0 { f64::NAN } else { -400.0 * (1.0 / s - 1.0).log10() };
+
+    for step in step0.. {
+        if let Some(s) = crate::stopctl::requested(Some(&run_dir)) {
+            println!("policy-rl: stop file {s}: saving and exiting at step {step}");
+            let hdr = (step as u32, t, best_score, best_step as u32, 0u32);
+            let _ = write_atomic(&ckpt_path, &ckpt_bytes(hdr, [&bias, &g, &td, &tor, &mb, &vb, &mg, &vg, &mtd, &vtd, &mto, &vto, &b0, &g0, &td0, &tor0]));
+            break;
+        }
+        let per_t = gps.div_ceil(threads);
+        let prm: Prm = (&bias, &g, &td, &tor);
+        #[allow(clippy::type_complexity)]
+        let outs: Vec<(Grad, [u64; 4], f64, u64, u64, Vec<u8>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|ti| {
+                    let ring = &ring;
+                    sc.spawn(move || {
+                        let mut rng = RlRng(0x1234_5678_9ABC_DEF1 ^ (((step as u64) << 8) | ti as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                        let mut gr = Grad { gb: vec![0f32; prm.0.len()], gg: vec![0f32; prm.1.len()], gtd: vec![0f32; prm.2.len()], gto: vec![0f32; prm.3.len()], touched: vec![], touched_o: vec![], sc: new_scratch(), z: vec![] };
+                        let (mut x, mut z) = (new_scratch(), Vec::new());
+                        let mut res_n = [0u64; 4]; // black wins, white wins, draws, scored plies
+                        let (mut ent, mut ne, mut nmoves) = (0f64, 0u64, 0u64);
+                        let mut gbytes = Vec::new();
+                        for _ in 0..per_t {
+                            let start = rl_random_opening(open_plies, &mut rng);
+                            let (res, rec, e, n) = rl_game(start, ring, [prm, prm], temp, &mut rng, &mut x, &mut z);
+                            res_n[res as usize] += 1;
+                            res_n[3] += rec.len() as u64;
+                            ent += e;
+                            ne += n as u64;
+                            gbytes.extend_from_slice(&(rec.len() as u16).to_le_bytes());
+                            gbytes.push(res);
+                            for &(own, opp, from, to, turn) in &rec {
+                                gbytes.push(from);
+                                gbytes.push(to);
+                                let zr = if res == 2 { 0.5 } else if res == turn { 1.0 } else { 0.0 };
+                                let s = S { own, opp, from, to, kind: 0, sel: 255, kn: 0, val: false, ko: 0, aw: zr - 0.5, up: 0 };
+                                if s.aw != 0.0 {
+                                    grad_one(&s, &[], ring, true, true, prm, (1.0, 0.0), 1.0, &mut gr);
+                                    gr.touched.clear();
+                                    gr.touched_o.clear();
+                                }
+                                nmoves += 1;
+                            }
+                        }
+                        (gr, res_n, ent, ne, nmoves, gbytes)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut it = outs.into_iter();
+        let (mut gsum, mut res_n, mut ent, mut ne, mut nmoves, mut gbytes) = it.next().unwrap();
+        for (gr, r, e, n, nm, gb) in it {
+            for (a, b) in gsum.gb.iter_mut().zip(&gr.gb) {
+                *a += b;
+            }
+            for (a, b) in gsum.gg.iter_mut().zip(&gr.gg) {
+                *a += b;
+            }
+            for (a, b) in gsum.gtd.iter_mut().zip(&gr.gtd) {
+                *a += b;
+            }
+            for (a, b) in gsum.gto.iter_mut().zip(&gr.gto) {
+                *a += b;
+            }
+            for k in 0..4 {
+                res_n[k] += r[k];
+            }
+            ent += e;
+            ne += n;
+            nmoves += nm;
+            gbytes.extend_from_slice(&gb);
+        }
+        if let Some(fh) = games_f.as_mut() {
+            let _ = std::io::Write::write_all(fh, &gbytes);
+        }
+        let ngames = res_n[0] + res_n[1] + res_n[2];
+        games_total += ngames;
+        // Adam step on the mean gradient (+ decoupled pull toward the start head)
+        t += 1;
+        let inv = 1.0 / nmoves.max(1) as f32;
+        let (bc1, bc2) = (1.0 - beta1.powi(t), 1.0 - beta2.powi(t));
+        let mut gnorm = 0f64;
+        let mut adam = |p: &mut [f32], p0: &[f32], gr: &[f32], m: &mut [f32], v: &mut [f32]| {
+            for i in 0..p.len() {
+                let gi = gr[i] * inv;
+                if gi == 0.0 && m[i] == 0.0 {
+                    continue;
+                }
+                gnorm += (gi * gi) as f64;
+                m[i] = beta1 * m[i] + (1.0 - beta1) * gi;
+                v[i] = beta2 * v[i] + (1.0 - beta2) * gi * gi;
+                p[i] -= lr * ((m[i] / bc1) / ((v[i] / bc2).sqrt() + eps) + anchor * (p[i] - p0[i]));
+            }
+        };
+        adam(&mut bias, &b0, &gsum.gb, &mut mb, &mut vb);
+        adam(&mut g, &g0, &gsum.gg, &mut mg, &mut vg);
+        adam(&mut td, &td0, &gsum.gtd, &mut mtd, &mut vtd);
+        adam(&mut tor, &tor0, &gsum.gto, &mut mto, &mut vto);
+        let drift: f64 = bias
+            .iter()
+            .zip(&b0)
+            .chain(g.iter().zip(&g0))
+            .chain(td.iter().zip(&td0))
+            .chain(tor.iter().zip(&tor0))
+            .map(|(a, b)| ((a - b) * (a - b)) as f64)
+            .sum::<f64>()
+            .sqrt();
+        let el = t_start.elapsed().as_secs_f64();
+        let pc = |k: usize| 100.0 * res_n[k] as f64 / ngames.max(1) as f64;
+        println!(
+            "[step {}] games {} (+{}) | black {:.1}% white {:.1}% draw {:.1}% | plies/game {:.1} | entropy {:.3} | grad {:.2e} | drift {:.3} | {:.0} games/s",
+            step + 1,
+            games_total,
+            ngames,
+            pc(0),
+            pc(1),
+            pc(2),
+            res_n[3] as f64 / ngames.max(1) as f64,
+            ent / ne.max(1) as f64,
+            gnorm.sqrt(),
+            drift,
+            (games_total - games_at_start) as f64 / el.max(1e-9)
+        );
+        let _ = write_atomic(&out, &head_bytes(true, true, [&bias, &g, &td, &tor]));
+        if (step + 1) % arena_every == 0 {
+            let (s, w, l, dr) = arena((&bias, &g, &td, &tor), (&b0, &g0, &td0, &tor0));
+            let mark = if s > best_score {
+                best_score = s;
+                best_step = step + 1;
+                let _ = write_atomic(&best_path, &head_bytes(true, true, [&bias, &g, &td, &tor]));
+                " NEW BEST"
+            } else {
+                ""
+            };
+            println!(
+                "[arena step {}] greedy vs start head: +{w} -{l} ={dr} score {:.1}% Elo {:+.1}{mark} (best {:.1}% at step {best_step})",
+                step + 1,
+                100.0 * s,
+                elo(s),
+                100.0 * best_score
+            );
+            let hdr = ((step + 1) as u32, t, best_score, best_step as u32, 0u32);
+            let _ = write_atomic(&ckpt_path, &ckpt_bytes(hdr, [&bias, &g, &td, &tor, &mb, &vb, &mg, &vg, &mtd, &vtd, &mto, &vto, &b0, &g0, &td0, &tor0]));
+        }
+    }
+    ExitCode::SUCCESS
 }

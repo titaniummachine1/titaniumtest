@@ -1,8 +1,8 @@
-﻿"""The ONE Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs a
+"""The ONE Modal launcher for `ti` (H9). Modal's SDK is Python-only, so this file only builds the image and runs a
 `ti` command line in it; all logic (training, export, parity, preflight) is in the Rust hub. A new job = new `ti`
 arguments or a new `ti` subcommand, never a new script. Drive it with `ti train modal ...` (src/modal.rs), not by hand.
 
-Cost rules (engine repo docs/MODAL.md): one container, hard `timeout` around the command, GPU fallback list, $30/month cap.
+Cost rules (engine repo docs/runbooks/MODAL.md): one container, hard `timeout` around the command, GPU fallback list, $30/month cap.
 
 Layout on the Volume `ti-data`:   /vol/data/*.tdat|.manifest.json   packed datasets (uploaded ONCE, `ti train modal put`)
                                   /vol/nets/*.tnn                    init nets
@@ -18,7 +18,7 @@ import os
 import modal
 
 HUB_REPO = r"C:\gitProjects\titaniumtest"
-ENGINE = r"C:\gitProjects\mainpromo-ataxx"  # engine crate the hub is patched to locally (see .cargo/config.toml)
+ENGINE = r"C:\gitProjects\mainpromo-ataxx"  # D1520: back to main 33d6ea1 (the committed hub compiles against it); engine crate the hub is patched to locally (see .cargo/config.toml)
 SNAP_ROOT = r"C:\gitProjects\logs\ti_snap"
 PATCH = '[patch."https://github.com/titaniummachine1/titanium-ataxx"]\ntitanium = { path = "/src/engine/crates/titanium" }\n'
 CPU = float(os.environ.get("TI_CPU", "4"))  # vCPUs of the container (loader threads); the loader may be the cap, see REVIEW_NOTES N4

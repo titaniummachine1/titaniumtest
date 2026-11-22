@@ -32,6 +32,9 @@ bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "da426a49b2a4b79a
 [features]
 gpu = ["dep:bullet-trainer", "dep:bullet-compiler", "dep:bullet-gpu"]
 cuda = ["gpu", "bullet-trainer/cuda"]
+# D1304: build against an engine whose smallnet module is the ZX (TSN2) design, so `snarch --export-zx` can score the
+# exported blob through the engine code
+zxengine = []
 
 [profile.release]
 opt-level = 3

@@ -324,7 +324,7 @@ pub fn run_gen(args: &[String]) -> ExitCode {
                             return Ok(());
                         }
                         // D1174: STOP file -> start no new game (games in flight on other threads finish and are written)
-                        if stopped.load(Ordering::Relaxed) || std::path::Path::new(&stop_file).exists() {
+                        if stopped.load(Ordering::Relaxed) || std::path::Path::new(&stop_file).exists() || crate::stopctl::stop_all_path().exists() {
                             stopped.store(true, Ordering::Relaxed);
                             return Ok(());
                         }

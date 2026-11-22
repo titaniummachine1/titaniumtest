@@ -77,8 +77,13 @@ struct Ext {
     /// (role clone-dest / jump-dest / jump-source) x (offset from that square) x (mover / side to move / empty / blocked);
     /// 0 = off, "+rel" = radius 2 (the Ataxx move range), "+relf" = radius 6 (the whole board)
     rel: u8,
+    /// D1295 (user): ZX head = the Zataxx net's SHAPE doing the SmallNet job: ONE accumulator of 256 (the side to move's
+    /// view), SCReLU, per-bucket linear output + the same skips. Only with the w2 rows; start from a trained ZX net (--zx-init).
+    zx: u16,
 }
 
+const ZX_W: usize = 256;
+const NB_ZX: usize = 8;
 const HMAX: usize = 48;
 const REL_ROLES: usize = 3;
 const REL_ST: usize = 4;
@@ -157,6 +162,8 @@ impl Ext {
                 "src" => e.src = true,
                 "rel" => e.rel = 2,
                 "relf" => e.rel = 6,
+                "zx" => e.zx = 256,
+                p if p.starts_with("zx") => e.zx = p[2..].parse::<u16>().map_err(|_| format!("bad +{p} in {s}"))?,
                 _ => return Err(format!("unknown input group +{p} in {s}")),
             }
         }
@@ -164,6 +171,11 @@ impl Ext {
     }
     fn suffix(self) -> String {
         let mut s = String::new();
+        match self.zx {
+            0 => {}
+            256 => s.push_str("+zx"),
+            w => s.push_str(&format!("+zx{w}")),
+        }
         for (on, n) in [(self.pol, "+pol"), (self.dis, "+dis"), (self.mv, "+mv"), (self.ent, "+ent"), (self.h1, "+h1"), (self.src, "+src")] {
             if on {
                 s.push_str(n);
@@ -500,6 +512,9 @@ struct Model {
     /// h1: dense [2 halves][HMAX][W] projection of the parent's big-net hidden layers into the accumulator
     o_wh: usize,
     np: usize,
+    /// accumulator width (W = 32 for the engine's head, ZX_W for the ZX head) and the head kind (D1295)
+    w: usize,
+    zx: bool,
 }
 
 struct Fwd {
@@ -510,6 +525,8 @@ struct Fwd {
     bk: usize,
     fu: Vec<u32>,
     ft: Vec<u32>,
+    /// ZX head only: the clamped accumulator (before squaring)
+    xz: Vec<f32>,
 }
 
 struct Rng(u64);
@@ -536,11 +553,14 @@ impl Model {
         let o_rel = o_src + if ext.src { SRC_NF } else { 0 };
         let nf = pol_off + ext.nf();
         debug_assert_eq!(o_rel + if ext.rel > 0 { 2 * rel_half(ext.rel) } else { 0 }, nf);
-        let o_ftb = nf * W;
-        let o_l1w = o_ftb + W;
-        let o_l1b = o_l1w + nb * H * D2;
-        let o_ow = o_l1b + nb * H;
-        let o_ob = o_ow + nb * H;
+        let zx = ext.zx > 0;
+        let w = if zx { ext.zx as usize } else { W };
+        let o_ftb = nf * w;
+        let o_l1w = o_ftb + w;
+        // ZX head: o_l1w holds the per-bucket output weights [nb][w]; there is no L1 layer (o_l1b = o_ow = o_ob)
+        let o_l1b = if zx { o_l1w + nb * w } else { o_l1w + nb * H * D2 };
+        let o_ow = if zx { o_l1b } else { o_l1b + nb * H };
+        let o_ob = if zx { o_ow } else { o_ow + nb * H };
         let o_sk = o_ob + nb;
         let o_wh = o_sk + 4 * nb;
         let np = o_wh + if ext.h1 { 2 * HMAX * W } else { 0 };
@@ -551,14 +571,15 @@ impl Model {
         let scale = 0.15 * (25.0f32 / arch.rows()).sqrt();
         // D847: only the arch's rows draw from the RNG; policy rows and the policy skip start at 0, so a +pol model is
         // EXACTLY its control model at step 0 (paired comparison: any difference comes from the policy input)
-        for v in &mut p[..pol_off * W] {
+        for v in &mut p[..pol_off * w] {
             *v = r.unit() * scale;
         }
         for v in &mut p[o_ftb..o_l1w] {
             *v = 0.25;
         }
+        let fan = if zx { w } else { D2 };
         for v in &mut p[o_l1w..o_l1b] {
-            *v = r.unit() * (3.0 / D2 as f32).sqrt();
+            *v = r.unit() * (3.0 / fan as f32).sqrt();
         }
         for v in &mut p[o_l1b..o_ow] {
             *v = 0.5;
@@ -569,7 +590,168 @@ impl Model {
         for k in 0..nb {
             p[o_sk + k] = 0.8;
         }
-        Model { arch, ext, o_pol, o_dis, o_mv, o_ent, o_src, o_rel, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, o_wh, np }
+        Model { arch, ext, o_pol, o_dis, o_mv, o_ent, o_src, o_rel, nb, p, o_ftb, o_l1w, o_l1b, o_ow, o_ob, o_sk, o_wh, np, w, zx }
+    }
+
+    /// D1295 (C14: never from random weights): start the ZX head from a TRAINED Zataxx-format net (i16, 2916 x 256 rows, 256
+    /// bias, 256 output weights, 1 output bias; QA 255, QB 64). Step 0 = that net exactly (the same output for every bucket;
+    /// output is cp/400, the unit of this trainer): the parent / hand skips start at 0 so nothing else is mixed in.
+    fn load_zx(&mut self, path: &str) -> Result<(), String> {
+        let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let n = 2916 * 256;
+        if !self.zx || self.w != ZX_W || self.arch != Arch::W2 || b.len() != (n + 256 + 256 + 1) * 2 {
+            return Err(format!("{path}: --zx-init needs the w2+zx design and a Zataxx-format net ({} bytes)", (n + 513) * 2));
+        }
+        let v: Vec<f32> = b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32).collect();
+        for i in 0..n {
+            self.p[i] = v[i] / 255.0;
+        }
+        for k in 0..ZX_W {
+            self.p[self.o_ftb + k] = v[n + k] / 255.0;
+        }
+        for bk in 0..self.nb {
+            for k in 0..ZX_W {
+                self.p[self.o_l1w + bk * ZX_W + k] = v[n + 256 + k] / 64.0;
+            }
+            self.p[self.o_ob + bk] = v[n + 512] / (255.0 * 64.0);
+            self.p[self.o_sk + bk] = 0.0;
+            self.p[self.o_sk + self.nb + bk] = 0.0;
+        }
+        Ok(())
+    }
+
+    /// D1296: downscale a ZX head to `w` units. Keep the units with the largest (bucket-mean |output weight|) x (mean
+    /// squared activation `msq` on real children); every dropped unit's MEAN contribution (output weight x msq) is folded
+    /// into that bucket's output bias, so the narrow net starts as the wide one with the dropped units at their average.
+    fn shrink_zx(&self, w: usize, msq: &[f64]) -> Model {
+        let (wf, nb) = (self.w, self.nb);
+        let imp = |k: usize| -> f64 { (0..nb).map(|bk| self.p[self.o_l1w + bk * wf + k].abs() as f64).sum::<f64>() / nb as f64 * msq[k] };
+        let mut order: Vec<usize> = (0..wf).collect();
+        order.sort_by(|&a, &b| imp(b).partial_cmp(&imp(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        let mut keep: Vec<usize> = order[..w].to_vec();
+        keep.sort_unstable();
+        let mut m = Model::new(self.arch, nb, 1, Ext { zx: w as u16, ..self.ext });
+        let nf = self.o_ftb / wf;
+        for f in 0..nf {
+            for (j, &k) in keep.iter().enumerate() {
+                m.p[f * w + j] = self.p[f * wf + k];
+            }
+        }
+        for (j, &k) in keep.iter().enumerate() {
+            m.p[m.o_ftb + j] = self.p[self.o_ftb + k];
+        }
+        let kept: std::collections::HashSet<usize> = keep.iter().copied().collect();
+        for bk in 0..nb {
+            let mut ob = self.p[self.o_ob + bk];
+            for k in 0..wf {
+                if !kept.contains(&k) {
+                    ob += self.p[self.o_l1w + bk * wf + k] * msq[k] as f32;
+                }
+            }
+            m.p[m.o_ob + bk] = ob;
+            for (j, &k) in keep.iter().enumerate() {
+                m.p[m.o_l1w + bk * w + j] = self.p[self.o_l1w + bk * wf + k];
+            }
+        }
+        let (a, b) = (self.o_sk, m.o_sk);
+        for i in 0..4 * nb {
+            m.p[b + i] = self.p[a + i];
+        }
+        m
+    }
+
+    /// D1313: load a trained ZX head (SNAR) of the same width; when the file has half this model's buckets, bucket b of
+    /// this model takes the file's bucket b / 2 (output weights, bias, skips): the same output at step 0.
+    fn load_expand(&mut self, path: &str) -> Result<(), String> {
+        let d = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        if d.len() < 24 || &d[..4] != b"SNAR" || u32::from_le_bytes(d[4..8].try_into().unwrap()) != 2 {
+            return Err(format!("{path}: not a SNAR v2 file"));
+        }
+        let nl = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
+        let fnb = u32::from_le_bytes(d[12 + nl..16 + nl].try_into().unwrap()) as usize;
+        if fnb == self.nb {
+            return load_model(self, path);
+        }
+        if !self.zx || fnb == 0 || self.nb % fnb != 0 {
+            return Err(format!("{path}: has {fnb} buckets, this run {} (a ZX head expands only by a whole factor)", self.nb));
+        }
+        let k = self.nb / fnb;
+        let mut src = Model::new(self.arch, fnb, 1, self.ext);
+        load_model(&mut src, path)?;
+        let w = self.w;
+        self.p[..self.o_l1w].copy_from_slice(&src.p[..src.o_l1w]);
+        for b in 0..self.nb {
+            let s = b / k;
+            self.p[self.o_l1w + b * w..self.o_l1w + (b + 1) * w].copy_from_slice(&src.p[src.o_l1w + s * w..src.o_l1w + (s + 1) * w]);
+            self.p[self.o_ob + b] = src.p[src.o_ob + s];
+            for g in 0..4 {
+                self.p[self.o_sk + g * self.nb + b] = src.p[src.o_sk + g * src.nb + s];
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_zx(&self, s: &Sample) -> Fwd {
+        let p = &self.p;
+        let w = self.w;
+        let mut fu = Vec::with_capacity(48);
+        let mut ft = Vec::new();
+        feats(self.arch, s.own, s.opp, s.blk, s.pown, s.popp, &mut fu);
+        self.ext_rows(s, &mut fu, &mut ft);
+        let mut a = p[self.o_ftb..self.o_ftb + w].to_vec();
+        for &f in &fu {
+            let r = &p[f as usize * w..(f as usize + 1) * w];
+            for j in 0..w {
+                a[j] += r[j];
+            }
+        }
+        for v in a.iter_mut() {
+            *v = v.clamp(0.0, 1.0);
+        }
+        let bk = self.bucket(s);
+        let mut y = p[self.o_ob + bk] + p[self.o_sk + bk] * (s.parent as f32 / 400.0) + p[self.o_sk + self.nb + bk] * (s.hand as f32 / 400.0);
+        if self.ext.pol {
+            y += p[self.o_sk + 2 * self.nb + bk] * (s.lp as f32 / 4000.0);
+        }
+        if self.ext.dis {
+            y += p[self.o_sk + 3 * self.nb + bk] * (s.dis as f32 / 400.0);
+        }
+        let zo = &p[self.o_l1w + bk * w..self.o_l1w + (bk + 1) * w];
+        for j in 0..w {
+            y += zo[j] * a[j] * a[j];
+        }
+        Fwd { x: [0.0; D2], hpre: [0.0; H], h: [0.0; H], y, bk, fu, ft, xz: a }
+    }
+
+    fn backward_zx(&self, s: &Sample, f: &Fwd, dy: f32, g: &mut [f32]) {
+        let p = &self.p;
+        let (w, bk) = (self.w, f.bk);
+        g[self.o_ob + bk] += dy;
+        g[self.o_sk + bk] += dy * (s.parent as f32 / 400.0);
+        g[self.o_sk + self.nb + bk] += dy * (s.hand as f32 / 400.0);
+        if self.ext.pol {
+            g[self.o_sk + 2 * self.nb + bk] += dy * (s.lp as f32 / 4000.0);
+        }
+        if self.ext.dis {
+            g[self.o_sk + 3 * self.nb + bk] += dy * (s.dis as f32 / 400.0);
+        }
+        let mut da = vec![0f32; w];
+        for j in 0..w {
+            let c = f.xz[j];
+            g[self.o_l1w + bk * w + j] += dy * c * c;
+            if c > 0.0 && c < 1.0 {
+                da[j] = dy * p[self.o_l1w + bk * w + j] * 2.0 * c;
+            }
+        }
+        for j in 0..w {
+            g[self.o_ftb + j] += da[j];
+        }
+        for &ff in &f.fu {
+            let b = ff as usize * w;
+            for j in 0..w {
+                g[b + j] += da[j];
+            }
+        }
     }
 
     fn name(&self) -> String {
@@ -582,11 +764,20 @@ impl Model {
     }
 
     fn forward(&self, s: &Sample) -> Fwd {
+        if self.zx {
+            return self.forward_zx(s);
+        }
         let p = &self.p;
         let mut fu = Vec::with_capacity(64);
         let mut ft = Vec::with_capacity(64);
         feats(self.arch, s.own, s.opp, s.blk, s.pown, s.popp, &mut fu);
         feats(self.arch, s.opp, s.own, s.blk, s.popp, s.pown, &mut ft);
+        self.ext_rows(s, &mut fu, &mut ft);
+        self.forward_rest(s, fu, ft)
+    }
+
+    /// the extra input rows (policy, disagreement, move, entropy, source, relative) of both perspectives
+    fn ext_rows(&self, s: &Sample, fu: &mut Vec<u32>, ft: &mut Vec<u32>) {
         let e = self.ext;
         if e.pol {
             // D847: the move's policy rank + log-prob bin, one row each per perspective (separate tables per half)
@@ -626,9 +817,14 @@ impl Model {
         }
         if e.rel > 0 {
             // D863: move-relative rows, separate tables per perspective half
-            rel_rows(s, e.rel, self.o_rel, &mut fu);
-            rel_rows(s, e.rel, self.o_rel + rel_half(e.rel), &mut ft);
+            rel_rows(s, e.rel, self.o_rel, fu);
+            rel_rows(s, e.rel, self.o_rel + rel_half(e.rel), ft);
         }
+    }
+
+    fn forward_rest(&self, s: &Sample, fu: Vec<u32>, ft: Vec<u32>) -> Fwd {
+        let p = &self.p;
+        let e = self.ext;
         let mut a = [0f32; D2];
         a[..W].copy_from_slice(&p[self.o_ftb..self.o_ftb + W]);
         a[W..].copy_from_slice(&p[self.o_ftb..self.o_ftb + W]);
@@ -683,10 +879,13 @@ impl Model {
             h[i] = z.clamp(0.0, 1.0);
             y += p[self.o_ow + bk * H + i] * h[i];
         }
-        Fwd { x, hpre, h, y, bk, fu, ft }
+        Fwd { x, hpre, h, y, bk, fu, ft, xz: Vec::new() }
     }
 
     fn backward(&self, s: &Sample, f: &Fwd, dy: f32, g: &mut [f32]) {
+        if self.zx {
+            return self.backward_zx(s, f, dy, g);
+        }
         let p = &self.p;
         let bk = f.bk;
         g[self.o_ob + bk] += dy;
@@ -746,6 +945,18 @@ impl Model {
             }
         }
     }
+}
+
+/// D1296: mean squared activation of every hidden unit of a ZX head over `set`.
+fn zx_mean_sq(m: &Model, set: &[Sample]) -> Vec<f64> {
+    let mut acc = vec![0f64; m.w];
+    for s in set {
+        let f = m.forward(s);
+        for (a, x) in acc.iter_mut().zip(&f.xz) {
+            *a += (x * x) as f64;
+        }
+    }
+    acc.iter().map(|v| v / set.len().max(1) as f64).collect()
 }
 
 fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, seed: u64) -> Vec<Sample> {
@@ -970,8 +1181,41 @@ struct Sat {
     on_slack: bool,
 }
 
+/// LAWS A14 (user D1305-D1307): one phase's checkpoint (full resumable state, every epoch + on STOP), best snapshot (SNAR,
+/// the moment it improves) and the folder whose STOP file (or C:/gitProjects/STOP_ALL) stops the run.
+struct Ck {
+    state: String,
+    best: String,
+    run_dir: std::path::PathBuf,
+    data_sum: u64,
+    resume: bool,
+}
+
+#[derive(PartialEq, Debug)]
+enum FitEnd {
+    Done,
+    /// stopped by a stop file: the state is saved; the same command + --resume continues
+    Stopped(String),
+}
+
+/// SNAR of `m`'s layout with the parameters `p` (the best snapshot), written atomically.
+fn save_params(m: &Model, p: &[f32], path: &str) -> Result<(), String> {
+    let mut b = Vec::with_capacity(32 + 4 * p.len());
+    b.extend_from_slice(b"SNAR");
+    b.extend_from_slice(&2u32.to_le_bytes());
+    let name = m.name();
+    b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b.extend_from_slice(&(m.nb as u32).to_le_bytes());
+    b.extend_from_slice(&(m.np as u32).to_le_bytes());
+    for v in p {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    crate::stopctl::write_atomic(path, &b)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str, tau_r: f64, sat: Option<Sat>) {
+fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str, tau_r: f64, sat: Option<Sat>, ck: &Ck) -> Result<FitEnd, String> {
     let batch = 16384usize;
     let np = m.np;
     let mut mm = vec![0f32; np];
@@ -984,20 +1228,62 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
     let mut lr_cur = lr0;
     let (mut best, mut best_ep, mut since, mut decays) = (f64::INFINITY, 0usize, 0usize, 0usize);
     let mut best_p: Vec<f32> = Vec::new();
-    let mut idx: Vec<u32> = (0..train.len() as u32).collect();
-    let mut rng = Rng(seed | 1);
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; np]).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    for ep in 0..epochs {
+    let (mut ep0, mut chunk0, mut loss0) = (0usize, 0usize, 0f64);
+    if ck.resume && std::path::Path::new(&ck.state).exists() {
+        let d = std::fs::read(&ck.state).map_err(|e| format!("{}: {e}", ck.state))?;
+        let mut r = crate::stopctl::Rd::new(&d);
+        let (magic, ctag, sum) = (r.str()?, r.str()?, r.u64()?);
+        if magic != "SACK1" || ctag != format!("{}/{tag}", m.name()) {
+            return Err(format!("{}: not a checkpoint of {}/{tag}", ck.state, m.name()));
+        }
+        if sum != ck.data_sum {
+            return Err(format!("{}: checkpoint samples {sum:016x} != this run {:016x} (other data / flags)", ck.state, ck.data_sum));
+        }
+        ep0 = r.u64()? as usize;
+        chunk0 = r.u64()? as usize;
+        step = r.u64()? as usize;
+        lr_cur = r.f64()? as f32;
+        best = r.f64()?;
+        best_ep = r.u64()? as usize;
+        since = r.u64()? as usize;
+        decays = r.u64()? as usize;
+        loss0 = r.f64()?;
+        best_p = r.f32s()?;
+        m.p = r.f32s()?;
+        mm = r.f32s()?;
+        vv = r.f32s()?;
+        println!("[snarch] {} {tag} RESUMED from {}: epoch {} batch {chunk0}, lr {lr_cur:.2e}, best epoch {best_ep} = {best:.6}", m.name(), ck.state, ep0 + 1);
+    } else {
+        // a best snapshot exists from the first second on (the start weights), however short the run (LAWS A14)
+        save_params(m, &m.p, &ck.best)?;
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn save_state(ck: &Ck, name: &str, tag: &str, ep: usize, chunk: usize, step: usize, lr: f32, best: f64, best_ep: usize, since: usize, decays: usize, loss: f64, best_p: &[f32], p: &[f32], mm: &[f32], vv: &[f32]) -> Result<(), String> {
+        let mut w = crate::stopctl::Wr::default();
+        w.str("SACK1").str(&format!("{name}/{tag}")).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).f64(lr as f64).f64(best).u64(best_ep as u64).u64(since as u64).u64(decays as u64).f64(loss).f32s(best_p).f32s(p).f32s(mm).f32s(vv);
+        crate::stopctl::write_atomic(&ck.state, &w.0)
+    }
+    for ep in ep0..epochs {
         let t0 = Instant::now();
+        // the epoch's order is a pure function of (seed, epoch): a resume replays it and skips the batches done
+        let mut idx: Vec<u32> = (0..train.len() as u32).collect();
+        let mut rng = Rng((seed ^ (ep as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
         for i in (1..idx.len()).rev() {
             let j = (rng.next() % (i as u64 + 1)) as usize;
             idx.swap(i, j);
         }
-        let mut loss_sum = 0f64;
-        for chunk in idx.chunks(batch) {
+        let mut loss_sum = if ep == ep0 { loss0 } else { 0.0 };
+        let first = if ep == ep0 { chunk0 } else { 0 };
+        for (ci, chunk) in idx.chunks(batch).enumerate().skip(first) {
             if chunk.len() < batch / 2 {
                 break;
+            }
+            if let Some(f) = crate::stopctl::requested(Some(&ck.run_dir)) {
+                save_state(ck, &m.name(), tag, ep, ci, step, lr_cur, best, best_ep, since, decays, loss_sum, &best_p, &m.p, &mm, &vv)?;
+                println!("[snarch] {} {tag} STOPPED by {f} at epoch {} batch {ci}: state {} , best snapshot {} (epoch {best_ep}); the same command + --resume continues", m.name(), ep + 1, ck.state, ck.best);
+                return Ok(FitEnd::Stopped(f));
             }
             step += 1;
             let lr = if sat.is_some() { lr_cur } else { lr0 * (0.05 + 0.95 * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / steps_total as f32).cos())) };
@@ -1081,6 +1367,7 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
                 best_ep = ep + 1;
                 since = 0;
                 best_p.clone_from(&m.p);
+                save_params(m, &best_p, &ck.best)?;
             } else {
                 since += 1;
                 if cur < best {
@@ -1088,23 +1375,35 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
                     best = cur;
                     best_ep = ep + 1;
                     best_p.clone_from(&m.p);
+                    save_params(m, &best_p, &ck.best)?;
                 }
             }
+            let mut done = false;
             if since >= s.patience {
                 if decays >= s.max_decays {
                     println!("[snarch] {} {tag} SATURATED: {} epochs without a {:.3}% gain of {} at the final lr; best epoch {best_ep} = {best:.6}", m.name(), s.patience, 100.0 * s.min_rel, if s.on_slack { "slack@tau" } else { "val_pin" });
-                    break;
+                    done = true;
+                } else {
+                    decays += 1;
+                    lr_cur *= s.decay;
+                    since = 0;
+                    println!("[snarch] {} {tag} plateau: lr -> {lr_cur:.2e} (decay {decays}/{})", m.name(), s.max_decays);
                 }
-                decays += 1;
-                lr_cur *= s.decay;
-                since = 0;
-                println!("[snarch] {} {tag} plateau: lr -> {lr_cur:.2e} (decay {decays}/{})", m.name(), s.max_decays);
             }
+            save_state(ck, &m.name(), tag, ep + 1, 0, step, lr_cur, best, best_ep, since, decays, 0.0, &best_p, &m.p, &mm, &vv)?;
+            if done {
+                break;
+            }
+        } else {
+            // fixed warm start (no selection): the current weights are the phase's result so far
+            save_params(m, &m.p, &ck.best)?;
+            save_state(ck, &m.name(), tag, ep + 1, 0, step, lr_cur, best, best_ep, since, decays, 0.0, &best_p, &m.p, &mm, &vv)?;
         }
     }
     if sat.is_some() && !best_p.is_empty() {
         m.p = best_p;
     }
+    Ok(FitEnd::Done)
 }
 
 /// Binary dump of a trained research model (no JSON, D806): "SNAR" v2, arch name (u32 length + bytes), buckets u32, params u32,
@@ -1126,7 +1425,8 @@ fn load_model(m: &mut Model, path: &str) -> Result<(), String> {
         v => return Err(format!("{path}: SNAR version {v}")),
     };
     let (nb, np) = (u(hdr), u(hdr + 4));
-    if name != m.name() || nb != m.nb || np != m.np || d.len() != hdr + 8 + 4 * np {
+    let legacy = np + m.nb == m.np && !m.ext.h1; // D1297: files before D851 have 3 skip groups, the 4th (disagreement) stays 0
+    if name != m.name() || nb != m.nb || !(np == m.np || legacy) || d.len() != hdr + 8 + 4 * np {
         return Err(format!("{path}: is {name} nb {nb} np {np}, the run is {} nb {} np {}", m.name(), m.nb, m.np));
     }
     for (i, c) in d[hdr + 8..].chunks_exact(4).enumerate() {
@@ -1149,7 +1449,7 @@ fn save_model(m: &Model, path: &str) -> Result<(), String> {
     for v in &m.p {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::write(path, b).map_err(|e| format!("{path}: {e}"))
+    crate::stopctl::write_atomic(path, &b)
 }
 
 pub fn run_snarch(args: &[String]) -> ExitCode {
@@ -1162,10 +1462,156 @@ pub fn run_snarch(args: &[String]) -> ExitCode {
     }
 }
 
+
+/// D1303: `ti train snarch --export-zx FILE.snar --net big.tnn --val STEM --out OUT.tsn2 [--val-rows 400000] [--tau 0.02]
+/// [--child-every 3] [--threads 7]`: write the saturated ZX head as the engine's "TSN2" blob. The 2% tau shift is fitted
+/// PER EMPTIES BUCKET on val half A (the float model) and folded into that bucket's output bias; the weights are
+/// quantised (ft x 255, output x 256, i16) and the blob is then scored THROUGH THE ENGINE'S OWN code (titanium::smallnet)
+/// on val half B: violation rate and slack per bucket, and the float-vs-integer difference.
+fn export_zx(args: &[String]) -> Result<(), String> {
+    let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
+    let need = |n: &str| flag(n).ok_or_else(|| format!("{n} is required"));
+    let num = |n: &str, d: f64| flag(n).and_then(|x| x.parse::<f64>().ok()).unwrap_or(d);
+    let (snar, out, net_path, val_stem) = (need("--export-zx")?, need("--out")?, need("--net")?, need("--val")?);
+    let (tau, threads, every, val_rows) = (num("--tau", 0.02), num("--threads", 7.0) as usize, num("--child-every", 3.0) as u64, num("--val-rows", 400_000.0) as usize);
+    let big = TrainableNet::from_tnn_bytes(&std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?)?;
+    let mut va = Tdat::open(&val_stem)?;
+    let vrows = load_val(&mut va, val_rows)?;
+    let (mut ra, mut rb) = (Vec::new(), Vec::new());
+    for (i, blk) in vrows.chunks(1024).enumerate() {
+        if i % 2 == 0 { ra.extend_from_slice(blk) } else { rb.extend_from_slice(blk) }
+    }
+    let a = build_samples(&ra, &big, every, threads, 1 ^ 0x5555);
+    let b = build_samples(&rb, &big, every, threads, 1 ^ 0xAAAA);
+    println!("[export] val children: A {} ({:016x}), B {} ({:016x})", a.len(), checksum(&a), b.len(), checksum(&b));
+    // the model's bucket count comes from the SNAR file (8 or 16 = the NNUE's buckets, D1313)
+    let nbz = {
+        let d = std::fs::read(&snar).map_err(|e| format!("{snar}: {e}"))?;
+        let nl = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
+        u32::from_le_bytes(d[12 + nl..16 + nl].try_into().unwrap()) as usize
+    };
+    let mut m = Model::new(Arch::W2, nbz, 1, Ext { zx: ZX_W as u16, ..Ext::default() });
+    load_model(&mut m, &snar)?;
+    // per-bucket shifts on A (cp): bound = 400 y + shift[bk] is violated on tau of the bucket's children
+    let ra_res = residuals(&m, &a);
+    let mut per: Vec<Vec<f64>> = vec![Vec::new(); nbz];
+    for (s, r) in a.iter().zip(&ra_res) {
+        per[m.bucket(s)].push(*r);
+    }
+    let global = tau_shift(&ra_res, tau);
+    // a bucket with too few val children (e.g. the first moves at 32 buckets: >= 46 empties) takes the shift of the NEAREST
+    // populated bucket (same game phase), never the global one: the opening needs a far larger shift than the middle game
+    // (D1317: -377 cp at 8 buckets vs a global -10 cp)
+    let own: Vec<Option<f64>> = per.iter().map(|v| if v.len() >= 400 { Some(tau_shift(v, tau)) } else { None }).collect();
+    let shifts: Vec<f64> = (0..own.len())
+        .map(|b| {
+            own[b].unwrap_or_else(|| {
+                (1..own.len()).find_map(|d| own.get(b.wrapping_sub(d)).copied().flatten().or_else(|| own.get(b + d).copied().flatten())).unwrap_or(global)
+            })
+        })
+        .collect();
+    for (b, o) in own.iter().enumerate() {
+        if o.is_none() {
+            println!("[export] bucket {b}: only {} val children, shift {:.1} cp taken from the nearest populated bucket", per[b].len(), shifts[b]);
+        }
+    }
+    println!("[export] per-bucket shift cp (n): {}", shifts.iter().zip(&per).map(|(s, v)| format!("{s:.1} ({})", v.len())).collect::<Vec<_>>().join(" | "));
+    // quantise
+    let nrows = 2916;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"TSN2");
+    blob.extend_from_slice(&(nbz as u32).to_le_bytes());
+    blob.extend_from_slice(&(ZX_W as u32).to_le_bytes());
+    let mut worst = 0f32;
+    let mut put = |v: f32, scale: f32, blob: &mut Vec<u8>| -> Result<(), String> {
+        let q = (v * scale).round();
+        worst = worst.max(q.abs());
+        if q.abs() > 32767.0 {
+            return Err(format!("weight {v} x {scale} does not fit i16"));
+        }
+        blob.extend_from_slice(&(q as i16).to_le_bytes());
+        Ok(())
+    };
+    for i in 0..nrows * ZX_W {
+        put(m.p[i], 255.0, &mut blob)?;
+    }
+    for k in 0..ZX_W {
+        put(m.p[m.o_ftb + k], 255.0, &mut blob)?;
+    }
+    let mut zo_worst = 0f32;
+    for bk in 0..nbz {
+        let mut l1 = 0f64;
+        for k in 0..ZX_W {
+            let v = m.p[m.o_l1w + bk * ZX_W + k];
+            zo_worst = zo_worst.max(v.abs());
+            l1 += (v * 256.0).round().abs() as f64;
+            put(v, 256.0, &mut blob)?;
+        }
+        if l1 * 32512.0 >= 2_147_483_647.0 {
+            return Err(format!("bucket {bk}: sum of |zo_q| x 32512 overflows i32"));
+        }
+    }
+    for bk in 0..nbz {
+        let ob = m.p[m.o_ob + bk] + (shifts[bk] / 400.0) as f32;
+        blob.extend_from_slice(&ob.to_le_bytes());
+    }
+    for k in 0..2 {
+        for bk in 0..nbz {
+            blob.extend_from_slice(&m.p[m.o_sk + k * nbz + bk].to_le_bytes());
+        }
+    }
+    std::fs::write(&out, &blob).map_err(|e| format!("{out}: {e}"))?;
+    println!("[export] wrote {out}: {} bytes, max |weight q| {worst:.0} (i16 32767), max |output weight| {zo_worst:.3} (x256 = {:.0})", blob.len(), zo_worst * 256.0);
+    #[cfg(feature = "zxengine")]
+    {
+    // score the BLOB through the engine's own integer code on val half B
+    let net = titanium::smallnet::SmallNet::parse(&blob)?;
+    let (mut n_bk, mut viol_bk, mut slack_bk) = (vec![0usize; nbz], vec![0usize; nbz], vec![0f64; nbz]);
+    let (mut dsum, mut dmax, mut ftsum) = (0f64, 0f64, 0f64);
+    for s in &b {
+        // engine call: parent = the side that moved to make this child (its stones before the move = child mover's `pown`)
+        let pa = net.parent_acc(s.popp, s.pown);
+        let empties = 49 - (s.own | s.opp | s.blk).count_ones();
+        let eb = net.child_bound(&pa, s.popp, s.pown, s.own, s.opp, empties, s.parent as i32, s.hand as i32);
+        let bk = m.bucket(s);
+        let fb = 400.0 * m.forward(s).y as f64 + shifts[bk];
+        let d = (eb as f64 - fb).abs();
+        dsum += d;
+        dmax = dmax.max(d);
+        ftsum += fb;
+        n_bk[bk] += 1;
+        viol_bk[bk] += ((s.target as i32) < eb) as usize;
+        slack_bk[bk] += s.target as f64 - eb as f64;
+    }
+    let nb_all = b.len().max(1) as f64;
+    println!("[export] ENGINE integer bound vs float model on B: mean |diff| {:.3} cp, max {:.1} cp (float mean bound {:.1})", dsum / nb_all, dmax, ftsum / nb_all);
+    let tv: usize = viol_bk.iter().sum();
+    let ts: f64 = slack_bk.iter().sum();
+    println!("[export] ENGINE bound on held-out B: violation {:.2}% slack {:.2} cp ({} children)", 100.0 * tv as f64 / nb_all, ts / nb_all, b.len());
+    for bk in 0..nbz {
+        let n = n_bk[bk].max(1) as f64;
+        println!("[export]   bucket {bk}: n {:>7} violation {:5.2}% slack {:6.1} cp", n_bk[bk], 100.0 * viol_bk[bk] as f64 / n, slack_bk[bk] / n);
+    }
+    }
+    #[cfg(not(feature = "zxengine"))]
+    {
+        let _ = (&b, &shifts);
+        println!("[export] engine scoring skipped: build the hub with --features zxengine against the ZX engine to score the blob through the engine code");
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
     let need = |n: &str| flag(n).ok_or_else(|| format!("{n} is required"));
     let num = |n: &str, d: f64| flag(n).and_then(|x| x.parse::<f64>().ok()).unwrap_or(d);
+    if args.iter().any(|a| a == "--export-zx") {
+        return export_zx(args);
+    }
+    if args.iter().any(|a| a == "--bench-heads") {
+        bench_heads::run();
+        return Ok(());
+    }
     let net_path = need("--net")?;
     let train_stem = need("--train")?;
     let val_stem = need("--val")?;
@@ -1201,10 +1647,17 @@ fn run(args: &[String]) -> Result<(), String> {
         min_rel: num("--min-rel", 2e-4),
         on_slack: flag("--sat-metric").map(|v| v != "pin").unwrap_or(true),
     };
-    let save_dir = flag("--save-dir");
+    // LAWS A14 (user D1307): every run keeps its best snapshots + checkpoints in --save-dir; DIR/STOP (or
+    // C:/gitProjects/STOP_ALL) stops it safely; the same command + --resume continues (finished arms / phases are skipped)
+    let sd = flag("--save-dir").ok_or("--save-dir DIR is required (LAWS A14: best snapshots + checkpoints live there; DIR/STOP stops the run safely)")?;
+    let resume = args.iter().any(|a| a == "--resume");
+    let save_dir = Some(sd.clone());
     let init = flag("--init");
-    if let Some(d) = &save_dir {
-        std::fs::create_dir_all(d).map_err(|e| format!("{d}: {e}"))?;
+    let zx_init = flag("--zx-init");
+    let zx_teacher = flag("--zx-teacher");
+    std::fs::create_dir_all(&sd).map_err(|e| format!("{sd}: {e}"))?;
+    if let Some(f) = crate::stopctl::requested(Some(std::path::Path::new(&sd))) {
+        return Err(format!("stop file {f} exists: remove it to train"));
     }
 
     let bytes = std::fs::read(&net_path).map_err(|e| format!("{net_path}: {e}"))?;
@@ -1214,15 +1667,15 @@ fn run(args: &[String]) -> Result<(), String> {
     let rows = crate::trainer::whole_rows_or_experiment("snarch", &tr, rows_req, &experiment, &save_dir.clone().unwrap_or_default(), every, std::mem::size_of::<Sample>())?;
     let mut va = Tdat::open(&val_stem)?;
     let trows = load_val(&mut tr, rows)?;
-    let train = build_samples(&trows, &big, every, threads, data_seed);
+    let mut train = build_samples(&trows, &big, every, threads, data_seed);
     // D845: val split BY POSITION (alternating 1024-row blocks), so all children of one parent sit in one half
     let vrows = load_val(&mut va, val_rows)?;
     let (mut ra, mut rb) = (Vec::new(), Vec::new());
     for (i, blk) in vrows.chunks(1024).enumerate() {
         if i % 2 == 0 { ra.extend_from_slice(blk) } else { rb.extend_from_slice(blk) }
     }
-    let val_a = build_samples(&ra, &big, (every / 2).max(1), threads, data_seed ^ 0x5555);
-    let val_b = build_samples(&rb, &big, (every / 2).max(1), threads, data_seed ^ 0xAAAA);
+    let mut val_a = build_samples(&ra, &big, (every / 2).max(1), threads, data_seed ^ 0x5555);
+    let mut val_b = build_samples(&rb, &big, (every / 2).max(1), threads, data_seed ^ 0xAAAA);
     let pin_txt = format!("pinball to SATURATION on {} of val half A (patience {}, {} lr decays x{}, min gain {:.3}%, NO epoch limit)", if sat.on_slack { "slack@tau" } else { "val_pin" }, sat.patience, sat.max_decays, sat.decay, 100.0 * sat.min_rel);
     println!(
         "[snarch] big net {net_path}; rows {} -> train {} children (checksum {:016x}); val rows {} + {} -> A {} children ({:016x}), B {} children ({:016x}); {:.0}s",
@@ -1266,29 +1719,139 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     println!("[snarch] buckets {nb}, tau {tau}, lrs {lrs:?}, seeds {seeds:?}, threads {threads}, epochs {e_mse} MSE warm start + {pin_txt}");
     let mut summary = Vec::new();
+    // the checkpoints are tied to THESE samples (a resume with other data / flags is refused)
+    let data_sum = checksum(&train) ^ checksum(&val_a).rotate_left(1) ^ checksum(&val_b).rotate_left(2);
     for (arch, ext) in archs {
         for &lr in &lrs {
             for &seed in &seeds {
                 let lr = lr as f32;
                 let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), ext.suffix(), trows.len());
+                if ext.zx > 0 && (arch != Arch::W2 || ext.h1) {
+                    return Err("the +zx head needs the plain w2 rows (no +h1)".into());
+                }
+                let final_path = format!("{sd}/snarch_{tag}_b{nb}.snar");
+                if std::path::Path::new(&final_path).exists() {
+                    if resume {
+                        println!("[snarch] {tag} already finished ({final_path}): skipped");
+                        continue;
+                    }
+                    return Err(format!("{final_path} exists: use another --save-dir, or --resume to skip finished arms"));
+                }
+                let ck_of = |phase: &str| Ck { state: format!("{sd}/{tag}.{phase}.ckpt"), best: format!("{sd}/{tag}.{phase}.best.snar"), run_dir: std::path::PathBuf::from(&sd), data_sum, resume };
+                let done_of = |phase: &str| format!("{sd}/{tag}.{phase}.done");
                 let mut m = Model::new(arch, nb, seed, ext);
+                let distill = ext.zx > 0 && ext.zx as usize != ZX_W && zx_teacher.is_some();
+                if distill {
+                    // D1301 (user): net-to-net downscale = OUR STANDARD distilled method (hub shrink.rs): (1) keep the channels that
+                    // matter most (importance = mean act^2 x squared output weight, dropped ones folded into the bias) = the START,
+                    // (2) DISTIL: train the narrow net to reproduce the saturated 256 head's own outputs, to saturation, (3) the
+                    // normal pinball fit below. The teacher is the SATURATED 256 head, never the raw Zataxx net.
+                    let tp = zx_teacher.as_ref().unwrap();
+                    let mut teacher = Model::new(arch, nb, seed, Ext { zx: ZX_W as u16, ..ext });
+                    load_model(&mut teacher, tp)?;
+                    let rt = report(&teacher, &val_a, &val_b, tau as f64);
+                    println!("[snarch] {tag} teacher {tp}: B slack {:.2} cp viol {:.2}% | A slack@tau {:.2} cp", rt.b_slack, 100.0 * rt.b_viol, rt.a_slack);
+                    let step = (train.len() / 200_000).max(1);
+                    let probe: Vec<Sample> = train.iter().step_by(step).copied().collect();
+                    let msq = zx_mean_sq(&teacher, &probe);
+                    m = teacher.shrink_zx(ext.zx as usize, &msq);
+                    let r1 = report(&m, &val_a, &val_b, tau as f64);
+                    println!("[snarch] {tag} shrunk {ZX_W} -> {} units (importance x mean act^2 on {} children, bias-compensated) = the distillation START, B: RMSE {:.1} cp, A slack@tau {:.2} cp", ext.zx, probe.len(), r1.b_rmse, r1.a_slack);
+                    // teacher outputs as the targets for the distillation phase (originals restored afterwards)
+                    let tout = |set: &[Sample]| -> Vec<i16> {
+                        let mut o = vec![0i16; set.len()];
+                        let per = (set.len() + threads - 1) / threads.max(1);
+                        std::thread::scope(|sc| {
+                            for (oc, sc_set) in o.chunks_mut(per.max(1)).zip(set.chunks(per.max(1))) {
+                                let t = &teacher;
+                                sc.spawn(move || {
+                                    for (d, s) in oc.iter_mut().zip(sc_set) {
+                                        *d = (400.0 * t.forward(s).y).round().clamp(-30000.0, 30000.0) as i16;
+                                    }
+                                });
+                            }
+                        });
+                        o
+                    };
+                    let (o_tr, o_va, o_vb) = (tout(&train), tout(&val_a), tout(&val_b));
+                    let (s_tr, s_va, s_vb): (Vec<i16>, Vec<i16>, Vec<i16>) = (train.iter().map(|s| s.target).collect(), val_a.iter().map(|s| s.target).collect(), val_b.iter().map(|s| s.target).collect());
+                    for (s, t) in train.iter_mut().zip(&o_tr) { s.target = *t; }
+                    for (s, t) in val_a.iter_mut().zip(&o_va) { s.target = *t; }
+                    for (s, t) in val_b.iter_mut().zip(&o_vb) { s.target = *t; }
+                    drop((o_tr, o_va, o_vb));
+                    let ph = ck_of("distill");
+                    if resume && std::path::Path::new(&done_of("distill")).exists() {
+                        load_model(&mut m, &ph.best)?;
+                        println!("[snarch] {tag} distill phase already finished: weights from {}", ph.best);
+                    } else {
+                        if let FitEnd::Stopped(f) = fit(&mut m, &train, &val_a, &val_b, 0, None, lr, threads, seed ^ 3, "distill", tau as f64, Some(sat), &ph)? {
+                            println!("[snarch] run STOPPED by {f} (distill phase of {tag}); the same command + --resume continues");
+                            return Ok(());
+                        }
+                        crate::stopctl::write_atomic(&done_of("distill"), b"done")?;
+                    }
+                    for (s, t) in train.iter_mut().zip(&s_tr) { s.target = *t; }
+                    for (s, t) in val_a.iter_mut().zip(&s_va) { s.target = *t; }
+                    for (s, t) in val_b.iter_mut().zip(&s_vb) { s.target = *t; }
+                    let r2 = report(&m, &val_a, &val_b, tau as f64);
+                    println!("[snarch] {tag} distilled to saturation, then measured against the TRUTH again: B RMSE {:.1} cp, A slack@tau {:.2} cp (before the pinball fit)", r2.b_rmse, r2.a_slack);
+                } else if let (true, Some(ip)) = (ext.zx > 0, &init) {
+                    // D1313 (user): a trained ZX head of the same width as the start; if it has half the buckets (8 -> 16,
+                    // the NNUE's buckets), every bucket b16 starts as the trained bucket b16/2 = exact step-0 parity, since
+                    // floor(e * 8 / 50) == floor(floor(e * 16 / 50) / 2)
+                    m.load_expand(ip)?;
+                    let r0 = report(&m, &val_a, &val_b, tau as f64);
+                    println!("[snarch] {tag} initialised from {ip} ({} buckets), step 0: B slack {:.2} cp viol {:.2}%, A slack@tau {:.2} cp", m.nb, r0.b_slack, 100.0 * r0.b_viol, r0.a_slack);
+                } else if ext.zx > 0 {
+                    // C14 (user D1296): the ZX head ALWAYS starts from the trained Zataxx net; narrower widths are a
+                    // downscale of it (most important units kept, the rest folded into the output bias)
+                    let zp = zx_init.as_ref().ok_or("the +zx head needs --zx-init <Zataxx-format net> or --init <trained ZX .snar> (never random init, C14)")?;
+                    let mut full = Model::new(arch, nb, seed, Ext { zx: ZX_W as u16, ..ext });
+                    full.load_zx(zp)?;
+                    let r0 = report(&full, &val_a, &val_b, tau as f64);
+                    println!("[snarch] {tag} Zataxx net {zp} as the bound, step 0 (skips 0, no fine-tuning), B: RMSE {:.1} cp, A slack@tau {:.2} cp", r0.b_rmse, r0.a_slack);
+                    if ext.zx as usize == ZX_W {
+                        m = full;
+                    } else {
+                        let step = (train.len() / 200_000).max(1);
+                        let probe: Vec<Sample> = train.iter().step_by(step).copied().collect();
+                        let msq = zx_mean_sq(&full, &probe);
+                        m = full.shrink_zx(ext.zx as usize, &msq);
+                        let r1 = report(&m, &val_a, &val_b, tau as f64);
+                        println!("[snarch] {tag} downscaled {ZX_W} -> {} units (importance |out w| x mean act^2 on {} children; dropped units folded into the output bias), step 0, B: RMSE {:.1} cp, A slack@tau {:.2} cp", ext.zx, probe.len(), r1.b_rmse, r1.a_slack);
+                    }
+                }
                 println!("[snarch] {tag} : {} features, {} params", arch.nf(), m.np);
                 // D892 (C14: never from random weights): --init FILE.snar starts from a trained model of the SAME design
-                if let Some(ip) = &init {
+                if let (Some(ip), 0) = (&init, ext.zx) {
                     load_model(&mut m, ip)?;
                     println!("[snarch] {tag} initialised from {ip}");
                 }
                 let ta = Instant::now();
-                if e_mse > 0 {
-                    fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None);
+                for (phase, on) in [("MSE", e_mse > 0 && !distill), ("pinball", true)] {
+                    if !on {
+                        continue;
+                    }
+                    let ph = ck_of(phase);
+                    if resume && std::path::Path::new(&done_of(phase)).exists() {
+                        load_model(&mut m, &ph.best)?;
+                        println!("[snarch] {tag} {phase} phase already finished: weights from {}", ph.best);
+                        continue;
+                    }
+                    let end = if phase == "MSE" {
+                        fit(&mut m, &train, &val_a, &val_b, e_mse, None, lr, threads, seed, "MSE", tau as f64, None, &ph)?
+                    } else {
+                        fit(&mut m, &train, &val_a, &val_b, 0, Some(tau), lr, threads, seed ^ 7, "pinball", tau as f64, Some(sat), &ph)?
+                    };
+                    if let FitEnd::Stopped(f) = end {
+                        println!("[snarch] run STOPPED by {f} ({phase} phase of {tag}); best snapshot {}; the same command + --resume continues", ph.best);
+                        return Ok(());
+                    }
+                    crate::stopctl::write_atomic(&done_of(phase), b"done")?;
                 }
-                fit(&mut m, &train, &val_a, &val_b, 0, Some(tau), lr, threads, seed ^ 7, "pinball", tau as f64, Some(sat));
                 let r = report(&m, &val_a, &val_b, tau as f64);
-                if let Some(d) = &save_dir {
-                    let path = format!("{d}/snarch_{tag}_b{nb}.snar");
-                    save_model(&m, &path)?;
-                    println!("[snarch] {tag} saved {path}");
-                }
+                save_model(&m, &final_path)?;
+                println!("[snarch] {tag} saved {final_path}");
                 let bk: Vec<String> = r.b_bk.iter().map(|(n, s, v)| format!("{s:.0}/{:.1}%/{n}", 100.0 * v)).collect();
                 summary.push(format!(
                     "{tag} | B slack {:.2} cp viol {:.2}% | A slack@tau {:.2} | B q10/50/90 {:.0}/{:.0}/{:.0} | B RMSE {:.1} | rows {:.1} touched {:.1} /persp | params {} | {:.0} min | B per empties bucket 0-7 slack/viol/n: {}",
@@ -1317,6 +1880,150 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+
+/// D1298: `ti train snarch --bench-heads`: ns per CHILD BOUND CALL of the SmallNet head designs, same harness, AVX2 i16 (the
+/// engine way: the parent accumulator is given, the child's is parent +- the changed rows, then the head). Weights are
+/// random (the cost does not depend on their values); rows are random table rows (a 1.5 MB table does not sit in L1).
+///   sq-like : 2 perspectives x W32, row ops each, CReLU, L1 64 -> 16 (per bucket), out 16 (today's engine design)
+///   zx W    : ONE accumulator of W, 2 row ops per changed 2x2 window, SCReLU, dot with the output weights (no L1)
+#[cfg(target_arch = "x86_64")]
+mod bench_heads {
+    use std::arch::x86_64::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    pub fn run() {
+        if !is_x86_feature_detected!("avx2") {
+            println!("[bench] no AVX2 on this CPU");
+            return;
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for &w in &[256usize, 128] {
+            let table: Vec<i16> = (0..2916 * w).map(|_| (rnd() % 61) as i16 - 30).collect();
+            let ow: Vec<i16> = (0..w).map(|_| (rnd() % 127) as i16 - 60).collect();
+            let parent: Vec<i16> = (0..w).map(|_| (rnd() % 256) as i16).collect();
+            for &cw in &[5usize, 8, 12] {
+                let calls = 400_000usize;
+                let rows: Vec<Vec<u32>> = (0..4096).map(|_| (0..2 * cw).map(|_| (rnd() % 2916) as u32).collect()).collect();
+                let mut acc = vec![0i16; w];
+                let mut sink = 0i64;
+                for r in rows.iter().take(512) {
+                    sink += unsafe { zx_call(w, &table, &ow, &parent, r, &mut acc) } as i64;
+                }
+                let t = Instant::now();
+                for i in 0..calls {
+                    sink += unsafe { zx_call(w, &table, &ow, &parent, &rows[i & 4095], &mut acc) } as i64;
+                }
+                let ns = t.elapsed().as_nanos() as f64 / calls as f64;
+                black_box(sink);
+                println!("[bench] zx W{w:<3} {cw:>2} changed windows ({} row ops): {ns:6.1} ns per child bound", 2 * cw);
+            }
+        }
+        // the engine-like sq head: W32 x 2 perspectives, n changed feature rows per perspective, L1 64 -> 16
+        let pt: Vec<i16> = (0..2 * 147 * 32).map(|_| (rnd() % 61) as i16 - 30).collect();
+        let l1: Vec<i16> = (0..8 * 16 * 64).map(|_| (rnd() % 61) as i16 - 30).collect();
+        let l1b: Vec<i32> = (0..8 * 16).map(|_| (rnd() % 100) as i32).collect();
+        let ow2: Vec<i16> = (0..8 * 16).map(|_| (rnd() % 61) as i16 - 30).collect();
+        let parent2: Vec<i16> = (0..64).map(|_| (rnd() % 256) as i16).collect();
+        for &n in &[4usize, 6, 9] {
+            let calls = 400_000usize;
+            let rows: Vec<Vec<u32>> = (0..4096).map(|_| (0..2 * n).map(|_| (rnd() % 294) as u32).collect()).collect();
+            let mut acc = vec![0i16; 64];
+            let mut sink = 0i64;
+            let t = Instant::now();
+            for i in 0..calls {
+                sink += unsafe { sq_call(&pt, &l1, &l1b, &ow2, &parent2, &rows[i & 4095], &mut acc, i & 7) } as i64;
+            }
+            let ns = t.elapsed().as_nanos() as f64 / calls as f64;
+            black_box(sink);
+            println!("[bench] sq-like W32x2 + L1 64->16, {n} row ops per perspective: {ns:6.1} ns per child bound (engine SmallNet measured 88 ns, D890)");
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn zx_call(w: usize, table: &[i16], ow: &[i16], parent: &[i16], rows: &[u32], acc: &mut [i16]) -> i32 {
+        let nv = w / 16;
+        let ap = acc.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(parent.as_ptr(), ap, w);
+        let mut i = 0;
+        while i + 1 < rows.len() {
+            let (po, pn) = (table.as_ptr().add(rows[i] as usize * w), table.as_ptr().add(rows[i + 1] as usize * w));
+            for v in 0..nv {
+                let a = _mm256_loadu_si256(ap.add(v * 16) as *const __m256i);
+                let o = _mm256_loadu_si256(po.add(v * 16) as *const __m256i);
+                let n = _mm256_loadu_si256(pn.add(v * 16) as *const __m256i);
+                _mm256_storeu_si256(ap.add(v * 16) as *mut __m256i, _mm256_add_epi16(_mm256_sub_epi16(a, o), n));
+            }
+            i += 2;
+        }
+        let (zero, qa) = (_mm256_setzero_si256(), _mm256_set1_epi16(255));
+        let mut sum = _mm256_setzero_si256();
+        for v in 0..nv {
+            let a = _mm256_loadu_si256(ap.add(v * 16) as *const __m256i);
+            let c = _mm256_min_epi16(_mm256_max_epi16(a, zero), qa);
+            let o = _mm256_loadu_si256(ow.as_ptr().add(v * 16) as *const __m256i);
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_mullo_epi16(c, o), c));
+        }
+        hsum(sum)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum(v: __m256i) -> i32 {
+        let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        let s = _mm_hadd_epi32(s, s);
+        let s = _mm_hadd_epi32(s, s);
+        _mm_cvtsi128_si32(s)
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sq_call(pt: &[i16], l1: &[i16], l1b: &[i32], ow: &[i16], parent: &[i16], rows: &[u32], acc: &mut [i16], bk: usize) -> i32 {
+        let ap = acc.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(parent.as_ptr(), ap, 64);
+        // rows: the first half update the side-to-move half (offset 0), the second half the other (offset 32)
+        let n = rows.len() / 2;
+        for (k, &r) in rows.iter().enumerate() {
+            let half = (k >= n) as usize;
+            let p = pt.as_ptr().add((r as usize) * 32);
+            for v in 0..2 {
+                let a = _mm256_loadu_si256(ap.add(half * 32 + v * 16) as *const __m256i);
+                let x = _mm256_loadu_si256(p.add(v * 16) as *const __m256i);
+                let y = if k & 1 == 0 { _mm256_add_epi16(a, x) } else { _mm256_sub_epi16(a, x) };
+                _mm256_storeu_si256(ap.add(half * 32 + v * 16) as *mut __m256i, y);
+            }
+        }
+        let (zero, one) = (_mm256_setzero_si256(), _mm256_set1_epi16(255));
+        let mut x = [_mm256_setzero_si256(); 4];
+        for v in 0..4 {
+            x[v] = _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256(ap.add(v * 16) as *const __m256i), zero), one);
+        }
+        let mut out = 0i32;
+        for i in 0..16 {
+            let w = l1.as_ptr().add((bk * 16 + i) * 64);
+            let mut s = _mm256_madd_epi16(x[0], _mm256_loadu_si256(w as *const __m256i));
+            for v in 1..4 {
+                s = _mm256_add_epi32(s, _mm256_madd_epi16(x[v], _mm256_loadu_si256(w.add(v * 16) as *const __m256i)));
+            }
+            let h = (hsum(s) + l1b[bk * 16 + i]).clamp(0, 255 * 255);
+            out += h * ow[bk * 16 + i] as i32;
+        }
+        out
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod bench_heads {
+    pub fn run() {
+        println!("[bench] x86_64 only");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,7 +2037,7 @@ mod tests {
     fn pol_model_equals_control_at_init() {
         for arch in [Arch::Sq, Arch::W2, Arch::DW2Sq, Arch::X3] {
             let a = Model::new(arch, 8, 3, Ext::default());
-            let b = Model::new(arch, 8, 3, Ext { pol: true, dis: true, mv: true, ent: true, h1: true, src: true, rel: 2 });
+            let b = Model::new(arch, 8, 3, Ext { pol: true, dis: true, mv: true, ent: true, h1: true, src: true, rel: 2, zx: 0 });
             for (i, s) in [samp(0, 1 | 1 << 8, 1, 0), samp(1 << 20 | 1 << 21, 1 << 30, 1 << 20, 1 << 30 | 1 << 21)].iter().enumerate() {
                 let mut s = *s;
                 s.parent = 123;
@@ -1437,6 +2144,114 @@ mod tests {
         assert_eq!(touched(Arch::DSq, &s), 11);
         assert_eq!(touched(Arch::DW2, &s), 16);
         assert_eq!(touched(Arch::DW2Sq, &s), 19);
+    }
+
+    fn zx_model_with_net() -> (Model, Vec<i16>) {
+        let mut r = Rng(12345);
+        let n = 2916 * 256;
+        let net: Vec<i16> = (0..n + 513).map(|i| if i < n { (r.unit() * 60.0) as i16 } else if i < n + 256 { (r.unit() * 40.0) as i16 } else if i < n + 512 { (r.unit() * 50.0) as i16 } else { 123 }).collect();
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("zx_test_{}_{}.bin", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::write(&path, net.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let mut m = Model::new(Arch::W2, 8, 1, Ext { zx: 256, ..Ext::default() });
+        m.load_zx(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(path);
+        (m, net)
+    }
+
+    // D1295: step 0 of the ZX head = the Zataxx float forward (clamp^2 dot, QA 255 / QB 64), whatever the bucket
+    #[test]
+    fn zx_head_step0_equals_zataxx_forward() {
+        let (m, net) = zx_model_with_net();
+        let n = 2916 * 256;
+        let s = Sample { parent: 321, hand: -77, ..samp(1 | 1 << 9 | 1 << 20, 1 << 8 | 1 << 30 | 1 << 33, 0, 0) };
+        let mut ix = Vec::new();
+        feats(Arch::W2, s.own, s.opp, s.blk, s.pown, s.popp, &mut ix);
+        assert_eq!(ix.len(), 36);
+        let mut h: Vec<f32> = (0..256).map(|k| net[n + k] as f32 / 255.0).collect();
+        for &i in &ix {
+            for k in 0..256 {
+                h[k] += net[i as usize * 256 + k] as f32 / 255.0;
+            }
+        }
+        let want: f32 = (0..256).map(|k| { let a = h[k].clamp(0.0, 1.0); a * a * net[n + 256 + k] as f32 / 64.0 }).sum::<f32>() + 123.0 / (255.0 * 64.0);
+        let got = m.forward(&s).y;
+        assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        // the unit-window state coding must be Zataxx's (us = 1, them = 2, powers of 3 over a1,b1,a2,b2)
+        assert_eq!(win_code(0, 1, 1 << 1), 1 + 2 * 3);
+    }
+
+    // D1296: keeping every unit is the identity; dropping units keeps the head close (mean contribution folded into the bias)
+    #[test]
+    fn zx_shrink_identity_and_close() {
+        let (m, _) = zx_model_with_net();
+        let s = Sample { parent: 100, hand: 30, ..samp(1 | 1 << 9 | 1 << 20, 1 << 8 | 1 << 30 | 1 << 33, 0, 0) };
+        let probe = vec![s; 4];
+        let msq = zx_mean_sq(&m, &probe);
+        let same = m.shrink_zx(256, &msq);
+        assert_eq!(m.forward(&s).y.to_bits(), same.forward(&s).y.to_bits());
+        let half = m.shrink_zx(128, &msq);
+        assert_eq!(half.w, 128);
+        // on the probe itself the folded bias makes the narrow output differ only by the dropped units' deviation from their mean
+        let d = (m.forward(&s).y - half.forward(&s).y).abs();
+        assert!(d < 0.5, "shrunk output moved by {d}");
+    }
+
+    // D1313: an 8-bucket ZX head expanded to 16 or 32 buckets gives the same output at every empties count
+    #[test]
+    fn zx_bucket_expansion_is_exact() {
+        let (mut m8, _) = zx_model_with_net();
+        for (i, v) in m8.p[m8.o_ob..m8.o_ob + 8].iter_mut().enumerate() {
+            *v = 0.01 * i as f32;
+        }
+        for b in 0..8 {
+            m8.p[m8.o_sk + b] = 0.1 * b as f32;
+            m8.p[m8.o_l1w + b * 256 + 3] += 0.05 * b as f32;
+        }
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("zx_exp_{}_{}.snar", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        save_model(&m8, path.to_str().unwrap()).unwrap();
+        for nb in [16usize, 32] {
+            let mut mb = Model::new(Arch::W2, nb, 1, Ext { zx: 256, ..Ext::default() });
+            mb.load_expand(path.to_str().unwrap()).unwrap();
+            // positions with 0..=49 empties: own fills the first `f` squares in a stripe pattern, opp the next ones
+            for filled in 0..=49usize {
+                let (mut own, mut opp) = (0u64, 0u64);
+                for sq in 0..filled {
+                    if sq % 2 == 0 { own |= 1 << sq } else { opp |= 1 << sq }
+                }
+                let s = Sample { parent: 77, hand: -12, ..samp(own, opp, own, opp) };
+                assert_eq!(m8.forward(&s).y.to_bits(), mb.forward(&s).y.to_bits(), "nb {nb} filled {filled}");
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zx_head_gradient_matches_numeric() {
+        let (mut m, _) = zx_model_with_net();
+        // move the output skips and weights off the exact-parity point so every term is exercised
+        for bk in 0..8 {
+            m.p[m.o_sk + bk] = 0.3;
+            m.p[m.o_sk + m.nb + bk] = -0.2;
+        }
+        let s = Sample { parent: 250, hand: -90, target: 40, ..samp(1 | 1 << 9 | 1 << 20, 1 << 8 | 1 << 30 | 1 << 33, 0, 0) };
+        let f = m.forward(&s);
+        let mut g = vec![0f32; m.np];
+        m.backward(&s, &f, 1.0, &mut g);
+        let bk = f.bk;
+        let probes = [m.o_ob + bk, m.o_sk + bk, m.o_sk + m.nb + bk, m.o_l1w + bk * 256 + 5, m.o_ftb + 7, f.fu[3] as usize * 256 + 11, f.fu[10] as usize * 256 + 200];
+        for &k in &probes {
+            let old = m.p[k];
+            let e = 1e-3f32;
+            m.p[k] = old + e;
+            let up = m.forward(&s).y;
+            m.p[k] = old - e;
+            let dn = m.forward(&s).y;
+            m.p[k] = old;
+            let num = (up - dn) / (2.0 * e);
+            assert!((num - g[k]).abs() < 2e-2 * (1.0 + num.abs()), "param {k}: numeric {num} vs backward {}", g[k]);
+        }
     }
 
     #[test]

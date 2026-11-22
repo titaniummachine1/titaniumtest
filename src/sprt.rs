@@ -164,6 +164,158 @@ impl SprtTally {
     }
 }
 
+// ---- D1346 (user): trinomial / pentanomial Elo + nElo and the fastchess "normalized" SPRT LLR ----
+// Formulas: fastchess (Disservin) sprt.cpp / stats; normalized Elo and the MLE LLR after Michel Van den Bergh,
+// "Comments on normalized Elo" (fishtest). The verdict of `compute` is unchanged; this is the extra, clearer readout.
+
+/// nElo = 800 / ln 10 x (score - 0.5) / sigma (sigma = standard deviation of one GAME result).
+const NELO_SCALE: f64 = 800.0 / std::f64::consts::LN_10;
+
+/// Elo + nElo with 95% intervals for one sample model (games or pairs).
+#[derive(Clone, Copy, Debug)]
+pub struct EloNelo {
+    pub elo: f64,
+    pub elo_ci95: f64,
+    pub nelo: f64,
+    pub nelo_ci95: f64,
+}
+
+fn elo_of_score(s: f64) -> f64 {
+    let s = s.clamp(1e-6, 1.0 - 1e-6);
+    -400.0 * (1.0 / s - 1.0).log10()
+}
+
+/// `mu` = mean score, `se` = standard error of the mean, `sigma_game` = per-game standard deviation.
+fn elo_nelo(mu: f64, se: f64, sigma_game: f64) -> EloNelo {
+    let ci = (elo_of_score(mu + 1.95996 * se) - elo_of_score(mu - 1.95996 * se)) * 0.5;
+    EloNelo { elo: elo_of_score(mu), elo_ci95: ci, nelo: (mu - 0.5) / sigma_game * NELO_SCALE, nelo_ci95: 1.95996 * se / sigma_game * NELO_SCALE }
+}
+
+fn regularize(count: u32) -> f64 {
+    if count == 0 {
+        1e-3
+    } else {
+        count as f64
+    }
+}
+
+/// Maximum-likelihood distribution with normalized Elo `t_star` (Van den Bergh, section 4.1): the iterative scheme of
+/// fastchess, the root of the (decreasing) equation 4.9 found by bisection.
+fn mle_normalized(scores: &[f64], phat: &[f64], mu_ref: f64, t_star: f64) -> Vec<f64> {
+    let n = scores.len();
+    let mut p = vec![1.0 / n as f64; n];
+    for _ in 0..10 {
+        let mu: f64 = scores.iter().zip(&p).map(|(a, q)| a * q).sum();
+        let var: f64 = scores.iter().zip(&p).map(|(a, q)| q * (a - mu) * (a - mu)).sum();
+        let sigma = var.sqrt();
+        let phi: Vec<f64> = scores.iter().map(|&a| a - mu_ref - 0.5 * t_star * sigma * (1.0 + ((a - mu) / sigma).powi(2))).collect();
+        let u = phi.iter().cloned().fold(f64::INFINITY, f64::min);
+        let v = phi.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if !(u < 0.0 && v > 0.0) {
+            break;
+        }
+        let f = |x: f64| -> f64 { phat.iter().zip(&phi).map(|(h, f)| h * f / (1.0 + x * f)).sum() };
+        let (mut lo, mut hi) = (-1.0 / v, -1.0 / u);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if f(mid) > 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let theta = 0.5 * (lo + hi);
+        let mut max_diff: f64 = 0.0;
+        for i in 0..n {
+            let np = phat[i] / (1.0 + theta * phi[i]);
+            max_diff = max_diff.max((np - p[i]).abs());
+            p[i] = np;
+        }
+        if max_diff < 1e-4 {
+            break;
+        }
+    }
+    p
+}
+
+/// fastchess `getLLR_normalized`: LLR of nElo `t0` against `t1` (already scaled to the sample model).
+fn llr_normalized(counts: &[f64], scores: &[f64], t0: f64, t1: f64) -> f64 {
+    let total: f64 = counts.iter().sum();
+    let phat: Vec<f64> = counts.iter().map(|c| c / total).collect();
+    let p0 = mle_normalized(scores, &phat, 0.5, t0);
+    let p1 = mle_normalized(scores, &phat, 0.5, t1);
+    total * phat.iter().zip(p0.iter().zip(&p1)).map(|(h, (a, b))| h * (b.ln() - a.ln())).sum::<f64>()
+}
+
+impl SprtTally {
+    /// Trinomial (win / draw / loss games) Elo and nElo.
+    pub fn trinomial(&self) -> Option<EloNelo> {
+        let n = self.games() as f64;
+        if n < 2.0 {
+            return None;
+        }
+        let x = (self.wins as f64 + 0.5 * self.draws as f64) / n;
+        let var = (self.wins as f64 * (1.0 - x).powi(2) + self.draws as f64 * (0.5 - x).powi(2) + self.losses as f64 * x * x) / n;
+        if var <= 0.0 {
+            return None;
+        }
+        Some(elo_nelo(x, (var / n).sqrt(), var.sqrt()))
+    }
+
+    /// Pentanomial (game pairs) Elo and nElo.
+    pub fn pentanomial(&self) -> Option<EloNelo> {
+        let n = self.pairs() as f64;
+        if n < 2.0 {
+            return None;
+        }
+        let values = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let mu: f64 = self.penta.iter().zip(values).map(|(c, v)| *c as f64 / n * v).sum();
+        let var: f64 = self.penta.iter().zip(values).map(|(c, v)| *c as f64 / n * (v - mu) * (v - mu)).sum();
+        if var <= 0.0 {
+            return None;
+        }
+        Some(elo_nelo(mu, (var / n).sqrt(), (2.0 * var).sqrt()))
+    }
+
+    /// Normalized-model SPRT LLR on the game (trinomial) counts, bounds read as nElo.
+    pub fn llr_trinomial_normalized(&self, nelo0: f64, nelo1: f64) -> f64 {
+        let counts = [regularize(self.losses), regularize(self.draws), regularize(self.wins)];
+        llr_normalized(&counts, &[0.0, 0.5, 1.0], nelo0 / NELO_SCALE, nelo1 / NELO_SCALE)
+    }
+
+    /// Normalized-model SPRT LLR on the pair (pentanomial) counts, bounds read as nElo.
+    pub fn llr_pentanomial_normalized(&self, nelo0: f64, nelo1: f64) -> f64 {
+        let counts = [regularize(self.penta[0]), regularize(self.penta[1]), regularize(self.penta[2]), regularize(self.penta[3]), regularize(self.penta[4])];
+        let k = std::f64::consts::SQRT_2 / NELO_SCALE;
+        llr_normalized(&counts, &[0.0, 0.25, 0.5, 0.75, 1.0], nelo0 * k, nelo1 * k)
+    }
+
+    /// The fastchess-style readout block (trinomial + pentanomial Elo / nElo and the two normalized SPRTs).
+    pub fn report_block(&self, nelo0: f64, nelo1: f64, alpha: f64, beta: f64) -> String {
+        let lower = (beta / (1.0 - alpha)).ln();
+        let upper = ((1.0 - beta) / alpha).ln();
+        let line = |name: &str, e: Option<EloNelo>| match e {
+            Some(e) => format!("{name}: Elo {:+.1} +- {:.1}, nElo {:+.1} +- {:.1}\n", e.elo, e.elo_ci95, e.nelo, e.nelo_ci95),
+            None => format!("{name}: n/a (too few samples)\n"),
+        };
+        let sprt = |name: &str, llr: f64| {
+            let frac = if llr >= 0.0 { llr / upper } else { llr / lower };
+            format!("SPRT ({name}, normalized): llr {llr:+.3} ({:.1}%), bounds [{lower:.2}, {upper:.2}], nElo [{nelo0:.1}, {nelo1:.1}]\n", frac * 100.0)
+        };
+        let mut s = String::new();
+        s += &line("Trinomial   ", self.trinomial());
+        s += &line("Pentanomial ", self.pentanomial());
+        if self.games() >= 2 {
+            s += &sprt("trinomial  ", self.llr_trinomial_normalized(nelo0, nelo1));
+        }
+        if self.pairs() >= 2 {
+            s += &sprt("pentanomial", self.llr_pentanomial_normalized(nelo0, nelo1));
+        }
+        s.push_str("(readout only, fastchess formulas; the bounds above are read as nElo, the verdict line uses the Elo bounds)");
+        s
+    }
+}
+
 fn erf_approx(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -179,6 +331,19 @@ fn erf_approx(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D1346: the fastchess readout reproduced from the user's pasted run (171-124-5, 300 games).
+    #[test]
+    fn trinomial_matches_the_pasted_fastchess_numbers() {
+        let t = SprtTally { wins: 171, losses: 124, draws: 5, penta: [0; 5] };
+        let e = t.trinomial().unwrap();
+        assert!((e.elo - 54.9).abs() < 0.1, "elo {}", e.elo);
+        assert!((e.elo_ci95 - 39.6).abs() < 0.15, "ci {}", e.elo_ci95);
+        assert!((e.nelo - 55.6).abs() < 0.1, "nelo {}", e.nelo);
+        assert!((e.nelo_ci95 - 39.3).abs() < 0.1, "nelo ci {}", e.nelo_ci95);
+        let llr = t.llr_trinomial_normalized(0.0, 10.0);
+        assert!((llr - 1.240).abs() < 0.005, "llr {llr}");
+    }
 
     fn tally(pairs: &[((u8, u8), u32)]) -> SprtTally {
         let mut t = SprtTally::default();

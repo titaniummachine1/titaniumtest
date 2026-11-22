@@ -57,7 +57,7 @@ delta: regret -1.6 cp/move | agreement -2.5 pp | value gap -1.1 cp
 
 Paired difference −1.58 cp/move, sd 12.1, SE 0.85 (t −1.84). Only 13 of 200 positions differ in
 agreement (106 both agree with the reference, 81 neither) → the candidate's misses are cheaper, not
-fewer. Full write-up: engine repo `docs/RESEARCH_REGRET_2026_11_02.md`, decision D383.
+fewer. Full write-up: engine repo `docs/research/search/RESEARCH_REGRET_2026_11_02.md`, decision D383.
 
 ## Limits
 

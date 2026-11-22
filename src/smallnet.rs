@@ -320,32 +320,106 @@ fn val_objective(net: &Net, val: &[Sample], tau: Option<f32>) -> f64 {
     l / val.len().max(1) as f64
 }
 
+/// FNV-1a over every sample field (equal checksums = the same samples; a resume refuses other samples).
+fn samples_checksum(set: &[Sample]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for s in set {
+        for x in [s.own, s.opp, s.blk, (s.parent as u16 as u64) | (s.hand as u16 as u64) << 16 | (s.target as u16 as u64) << 32] {
+            h ^= x;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// LAWS A14 (user D1305-D1307): where a run keeps its checkpoint + best snapshot, and the folder its STOP file sits in.
+pub struct Ck {
+    /// full resumable state (atomic, every epoch and on STOP)
+    pub state: String,
+    /// the best weights so far as an engine blob (atomic, the moment they improve)
+    pub best: String,
+    pub run_dir: std::path::PathBuf,
+    pub data_sum: u64,
+    pub resume: bool,
+}
+
+/// How a fit ended.
+#[derive(PartialEq, Debug)]
+pub enum FitEnd {
+    Saturated,
+    /// stopped by a stop file: the state is saved, `--resume` continues
+    Stopped(String),
+}
+
 /// LAWS C15 (D868): no epoch limit. Trains until `patience` consecutive epochs bring no val gain (relative 1e-4), lr
 /// lr0 * 0.85^epoch (floor 2% of lr0); the best epoch's weights are kept.
+/// LAWS A14: every epoch writes a resumable checkpoint, every new best writes the best blob, a stop file (run dir STOP or
+/// STOP_ALL) is checked before every batch: the exact state (inside the epoch) is saved and the fit returns `Stopped`.
+/// The epoch's sample order is a pure function of (seed, epoch), so a resume replays it and skips the batches done.
 #[allow(clippy::too_many_arguments)]
-fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str) {
+fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str, ck: &Ck) -> Result<FitEnd, String> {
     let batch = 16384usize;
     let mut m = vec![0f32; NP];
     let mut v = vec![0f32; NP];
     let mut step = 0usize;
-    let mut idx: Vec<u32> = (0..train.len() as u32).collect();
-    let mut rng = Rng(seed | 1);
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; NP]).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
     let mut best = (val_objective(net, val, tau), net.p.clone(), 0usize);
     println!("[smallnet] {tag} start: val objective {:.6}", best.0);
+    if !ck.resume {
+        // a best snapshot exists from the first second on (the init), however short the run (LAWS A14)
+        crate::stopctl::write_atomic(&ck.best, &net.to_bytes())?;
+    }
     let mut bad = 0usize;
-    for ep in 0.. {
+    let (mut ep0, mut chunk0, mut loss0) = (0usize, 0usize, 0f64);
+    if ck.resume {
+        let d = std::fs::read(&ck.state).map_err(|e| format!("--resume: {}: {e}", ck.state))?;
+        let mut r = crate::stopctl::Rd::new(&d);
+        if r.str()? != "SNCK1" || r.str()? != tag {
+            return Err(format!("{}: not a smallnet {tag} checkpoint", ck.state));
+        }
+        let sum = r.u64()?;
+        if sum != ck.data_sum {
+            return Err(format!("{}: checkpoint samples {sum:016x} != this run {:016x} (other data / flags)", ck.state, ck.data_sum));
+        }
+        ep0 = r.u64()? as usize;
+        chunk0 = r.u64()? as usize;
+        step = r.u64()? as usize;
+        bad = r.u64()? as usize;
+        loss0 = r.f64()?;
+        best.0 = r.f64()?;
+        best.2 = r.u64()? as usize;
+        best.1 = r.f32s()?;
+        net.p = r.f32s()?;
+        m = r.f32s()?;
+        v = r.f32s()?;
+        println!("[smallnet] {tag} RESUMED from {}: epoch {} batch {chunk0}, best epoch {} = {:.6}", ck.state, ep0 + 1, best.2, best.0);
+    }
+    let save_state = |ep: usize, chunk: usize, step: usize, bad: usize, loss: f64, best: &(f64, Vec<f32>, usize), p: &[f32], m: &[f32], v: &[f32]| -> Result<(), String> {
+        let mut w = crate::stopctl::Wr::default();
+        w.str("SNCK1").str(tag).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).u64(bad as u64).f64(loss).f64(best.0).u64(best.2 as u64).f32s(&best.1).f32s(p).f32s(m).f32s(v);
+        crate::stopctl::write_atomic(&ck.state, &w.0)
+    };
+    for ep in ep0.. {
         let t0 = Instant::now();
         let lr = lr0 * 0.85f32.powi(ep as i32).max(0.02);
+        let mut idx: Vec<u32> = (0..train.len() as u32).collect();
+        let mut rng = Rng((seed ^ (ep as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
         for i in (1..idx.len()).rev() {
             let j = (rng.next() % (i as u64 + 1)) as usize;
             idx.swap(i, j);
         }
-        let mut loss_sum = 0f64;
-        for chunk in idx.chunks(batch) {
+        let mut loss_sum = if ep == ep0 { loss0 } else { 0.0 };
+        let first = if ep == ep0 { chunk0 } else { 0 };
+        for (ci, chunk) in idx.chunks(batch).enumerate().skip(first) {
             if chunk.len() < batch / 2 {
                 break;
+            }
+            if let Some(f) = crate::stopctl::requested(Some(&ck.run_dir)) {
+                save_state(ep, ci, step, bad, loss_sum, &best, &net.p, &m, &v)?;
+                println!("[smallnet] {tag} STOPPED by {f} at epoch {} batch {ci}: state saved to {}, best so far (epoch {}) in {}; continue with the same command + --resume", ep + 1, ck.state, best.2, ck.best);
+                net.p = best.1.clone();
+                return Ok(FitEnd::Stopped(f));
             }
             step += 1;
             let per = (chunk.len() + threads - 1) / threads;
@@ -419,15 +493,19 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
         if gain {
             best = (obj, net.p.clone(), ep + 1);
             bad = 0;
+            // the best weights as an engine blob, the moment they improve (LAWS A14)
+            crate::stopctl::write_atomic(&ck.best, &net.to_bytes())?;
         } else {
             bad += 1;
-            if bad >= patience {
-                println!("[smallnet] {tag} saturated: {patience} epochs without a val gain, best epoch {}", best.2);
-                break;
-            }
+        }
+        save_state(ep + 1, 0, step, bad, 0.0, &best, &net.p, &m, &v)?;
+        if bad >= patience {
+            println!("[smallnet] {tag} saturated: {patience} epochs without a val gain, best epoch {}", best.2);
+            break;
         }
     }
     net.p = best.1;
+    Ok(FitEnd::Saturated)
 }
 
 /// Max |hub forward - engine SmallNet::bound| in cp over the samples.
@@ -478,6 +556,19 @@ fn run(args: &[String]) -> Result<(), String> {
     if std::path::Path::new(&out).exists() {
         return Err(format!("{out} exists (refusing to overwrite)"));
     }
+    // LAWS A14: checkpoint + best snapshot next to --out; STOP in that folder (or C:/gitProjects/STOP_ALL) stops safely
+    let resume = args.iter().any(|a| a == "--resume");
+    let (ck_state, ck_best) = (format!("{out}.ckpt"), format!("{out}.best.tsn"));
+    let run_dir = std::path::Path::new(&out).parent().map(|d| if d.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { d.to_path_buf() }).unwrap_or_else(|| ".".into());
+    if resume && !std::path::Path::new(&ck_state).exists() {
+        return Err(format!("--resume: no checkpoint {ck_state}"));
+    }
+    if !resume && std::path::Path::new(&ck_state).exists() {
+        return Err(format!("{ck_state} exists: continue it with --resume, or delete it to start over"));
+    }
+    if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+        return Err(format!("stop file {f} exists: remove it to train"));
+    }
 
     let mut tr = Tdat::open(&train_stem)?;
     let rows = crate::trainer::whole_rows_or_experiment("smallnet", &tr, rows_req, &experiment, &out, every, std::mem::size_of::<Sample>())?;
@@ -500,7 +591,12 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     let mut net = Net::parse(&std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?)?;
     print_report(&format!("BEFORE (init {p})"), &report(&net, &val));
-    fit(&mut net, &train, &val, patience, Some(tau), lr * 0.5, threads, seed ^ 0xAAAA, "pinball");
+    let ck = Ck { state: ck_state.clone(), best: ck_best.clone(), run_dir, data_sum: samples_checksum(&train) ^ samples_checksum(&val).rotate_left(1), resume };
+    if let FitEnd::Stopped(f) = fit(&mut net, &train, &val, patience, Some(tau), lr * 0.5, threads, seed ^ 0xAAAA, "pinball", &ck)? {
+        print_report("BEST SO FAR (stopped)", &report(&net, &val));
+        println!("[smallnet] stopped by {f}: NOT saturated; best so far = {ck_best}, state = {ck_state}; run the same command + --resume to continue");
+        return Ok(());
+    }
     print_report("AFTER", &report(&net, &val));
 
     let blob = net.to_bytes();

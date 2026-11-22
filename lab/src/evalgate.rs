@@ -32,6 +32,8 @@ pub enum Ev {
     /// D1237: Zataxx's own net (net6.bin or a lab zataxx-train `*_net.bin`), bit-exact port of its nn.rs (extval::Zat,
     /// parity 8/8 with zataxx.exe 'eval', D995); score in Zataxx's own cp units (move choice only needs the order)
     Zat(Box<crate::extval::Zat>),
+    /// D1200/D1267: trained `*_levatt.bin` lever-attention head on champion NNUE trunk
+    Lev(Box<crate::levatt::LevAttNet>),
 }
 
 impl Ev {
@@ -42,6 +44,7 @@ impl Ev {
             Ev::Res(r) => r.eval_f(b),
             Ev::Jat(j) => j.eval_f(b),
             Ev::Zat(z) => z.eval(b.me(), b.opp()) as f32,
+            Ev::Lev(l) => l.eval_f(b),
         }
     }
     pub(crate) fn is_res(&self) -> bool {
@@ -52,6 +55,8 @@ impl Ev {
             Ev::Zat(Box::new(crate::extval::Zat::load(p)))
         } else if p.ends_with("_jat3.json") {
             Ev::Jat(Box::new(crate::jat3::Jat3Net::load(p)))
+        } else if p.ends_with("_levatt.bin") {
+            Ev::Lev(Box::new(crate::levatt::LevAttNet::load(p)))
         } else if p.ends_with(".json") {
             Ev::Res(Box::new(crate::hcetrain::Residual::load(p)))
         } else {
@@ -64,6 +69,7 @@ impl Ev {
             Ev::Res(r) => r.eval(b),
             Ev::Jat(j) => j.eval(b),
             Ev::Zat(z) => z.eval(b.me(), b.opp()),
+            Ev::Lev(l) => l.eval(b),
         }
     }
 }
@@ -75,7 +81,7 @@ struct Ctx<'a> {
     abort: bool,
 }
 
-fn terminal(b: &Board) -> i32 {
+pub(crate) fn terminal(b: &Board) -> i32 {
     let (blk, wht) = b.bz_counts();
     let (me, op) = if b.turn == 0 { (blk as i32, wht as i32) } else { (wht as i32, blk as i32) };
     let d = me - op;
@@ -88,7 +94,28 @@ fn terminal(b: &Board) -> i32 {
     }
 }
 
-fn ordered(b: &Board) -> Vec<Move> {
+/// D1280 (lab sibling-corr): value of `b` for its side to move by the same plain alpha-beta, iterative deepening until
+/// `budget` nodes (the last completed depth decides). Does not touch the eval-gate path.
+pub(crate) fn search_value(net: &Ev, b: &Board, budget: u64) -> i32 {
+    if b.bz_over() {
+        return terminal(b);
+    }
+    let mut c = Ctx { net, nodes: 0, budget, abort: false };
+    let mut val = net.eval(b);
+    for d in 1..=64u32 {
+        let v = ab(&mut c, b, d, -2 * WIN, 2 * WIN);
+        if c.abort {
+            break;
+        }
+        val = v;
+        if v.abs() >= WIN {
+            break;
+        }
+    }
+    val
+}
+
+pub(crate) fn ordered(b: &Board) -> Vec<Move> {
     let mut ml = MoveList::new();
     b.legal_moves_dedup_into(&mut ml);
     let mut v: Vec<(i32, Move)> = ml.iter().map(|m| ((b.captures(m.to) as i32) * 2 + m.is_clone() as i32, m)).collect();
@@ -261,20 +288,79 @@ pub fn run(args: &[String]) -> ExitCode {
         if depth > 0 { format!("fixed depth {depth}") } else { format!("{budget} nodes/move (iterative deepening)") },
         starts.len()
     );
+    // LAWS A14 (user D1307): every finished pair is appended (and flushed) to --results at once, so a stop, a crash or a
+    // power cut keeps every finished game; STOP in the results folder or C:/gitProjects/STOP_ALL is checked before every
+    // pair (no new pair starts, the summary of the finished pairs is printed); --resume skips the pairs already in the file.
+    let Some(results) = arg(args, "--results") else {
+        eprintln!("eval-gate: --results FILE.tsv is required (LAWS A14: every finished pair is kept there; STOP in its folder stops the gate)");
+        return ExitCode::from(2);
+    };
+    let run_dir = std::path::Path::new(&results).parent().map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }).unwrap_or_else(|| ".".into());
+    if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+        eprintln!("eval-gate: stop file {f} exists: remove it to play");
+        return ExitCode::from(2);
+    }
+    let header = format!("# eval-gate A {pa} [{}] B {pb} [{}] depth {depth} nodes {budget} book {book} @{book0} pairs {}", sha(&pa), sha(&pb), starts.len());
+    let resume = args.iter().any(|a| a == "--resume");
+    let mut prev: Vec<(usize, f64, [u64; 2], [u64; 2], [u64; 2])> = Vec::new();
+    if std::path::Path::new(&results).exists() {
+        if !resume {
+            eprintln!("eval-gate: {results} exists: continue it with --resume, or delete it to start over");
+            return ExitCode::from(2);
+        }
+        let t = std::fs::read_to_string(&results).unwrap_or_default();
+        let mut lines = t.lines();
+        if lines.next() != Some(header.as_str()) {
+            eprintln!("eval-gate --resume: {results} was written by another setup (nets / budget / book / pairs differ)");
+            return ExitCode::from(2);
+        }
+        for l in lines {
+            let v: Vec<&str> = l.split('\t').collect();
+            if v.len() == 8 {
+                let u = |k: usize| v[k].parse::<u64>().unwrap_or(0);
+                prev.push((u(0) as usize, v[1].parse().unwrap_or(0.5), [u(2), u(3)], [u(4), u(5)], [u(6), u(7)]));
+            }
+        }
+        println!("eval-gate: RESUMED from {results}: {} finished pairs kept", prev.len());
+    } else if std::fs::write(&results, format!("{header}\n")).is_err() {
+        eprintln!("eval-gate: cannot write {results}");
+        return ExitCode::from(1);
+    }
+    let done: std::collections::HashSet<usize> = prev.iter().map(|x| x.0).collect();
+    let out = Mutex::new(std::fs::OpenOptions::new().append(true).open(&results).expect("open --results"));
+    let stopped: Mutex<Option<String>> = Mutex::new(None);
     let next = AtomicUsize::new(0);
-    let res: Mutex<Vec<(usize, f64, [u64; 2], [u64; 2], [u64; 2])>> = Mutex::new(Vec::new());
+    let res: Mutex<Vec<(usize, f64, [u64; 2], [u64; 2], [u64; 2])>> = Mutex::new(prev);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
+                if let Some(f) = crate::stopctl::requested(Some(&run_dir)) {
+                    let mut st = stopped.lock().unwrap();
+                    if st.is_none() {
+                        println!("eval-gate: STOP requested by {f}: no new pair starts; finished pairs are kept in {results}");
+                        *st = Some(f);
+                    }
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= starts.len() {
                     break;
                 }
+                if done.contains(&i) {
+                    continue;
+                }
                 let g1 = play(&starts[i], true, [&na, &nb], depth, budget);
                 let g2 = play(&starts[i], false, [&na, &nb], depth, budget);
                 let add = |x: [u64; 2], y: [u64; 2]| [x[0] + y[0], x[1] + y[1]];
+                let row = (i, (g1.score_a + g2.score_a) / 2.0, add(g1.depth, g2.depth), add(g1.nodes, g2.nodes), add(g1.moves, g2.moves));
+                {
+                    use std::io::Write;
+                    let mut f = out.lock().unwrap();
+                    let _ = writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", row.0, row.1, row.2[0], row.2[1], row.3[0], row.3[1], row.4[0], row.4[1]);
+                    let _ = f.flush();
+                }
                 let mut r = res.lock().unwrap();
-                r.push((i, (g1.score_a + g2.score_a) / 2.0, add(g1.depth, g2.depth), add(g1.nodes, g2.nodes), add(g1.moves, g2.moves)));
+                r.push(row);
                 let n = r.len();
                 if n % 50 == 0 || n == starts.len() {
                     report(&r, n == starts.len());
@@ -282,7 +368,50 @@ pub fn run(args: &[String]) -> ExitCode {
             });
         }
     });
+    let r = res.into_inner().unwrap();
+    if let Some(f) = stopped.into_inner().unwrap() {
+        if !r.is_empty() {
+            report(&r, false);
+        }
+        println!("eval-gate: STOPPED by {f} after {} of {} pairs (all finished pairs are in {results}); the same command + --resume plays the rest", r.len(), starts.len());
+    } else if r.len() == starts.len() && r.len() == done.len() && !r.is_empty() {
+        // resumed a run whose pairs were all finished already: print its final line
+        report(&r, true);
+    }
     ExitCode::SUCCESS
+}
+
+/// In-process paired match between two loaded evaluators (used by `lab spsa-blend`).
+/// Returns `(mean_score_a, penta)` across `starts` (each played twice with swapped seats).
+#[allow(dead_code)]
+pub(crate) fn play_match(na: &Ev, nb: &Ev, starts: &[Board], depth: u32, budget: u64, threads: usize) -> (f64, [usize; 5]) {
+    let next = AtomicUsize::new(0);
+    let res: Mutex<Vec<f64>> = Mutex::new(Vec::with_capacity(starts.len()));
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| loop {
+                // LAWS A14: a stop file ends the match early (the caller sees the stop and discards the partial match)
+                if crate::stopctl::requested_global().is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= starts.len() {
+                    break;
+                }
+                let g1 = play(&starts[i], true, [na, nb], depth, budget);
+                let g2 = play(&starts[i], false, [na, nb], depth, budget);
+                res.lock().unwrap().push((g1.score_a + g2.score_a) / 2.0);
+            });
+        }
+    });
+    let r = res.into_inner().unwrap();
+    let n = r.len().max(1) as f64;
+    let m = r.iter().sum::<f64>() / n;
+    let mut penta = [0usize; 5];
+    for &x in &r {
+        penta[(x * 4.0).round() as usize] += 1;
+    }
+    (m, penta)
 }
 
 fn report(r: &[(usize, f64, [u64; 2], [u64; 2], [u64; 2])], last: bool) {
