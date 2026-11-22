@@ -1,0 +1,19 @@
+#!/bin/sh
+# LIVE copy: C:/gitProjects/toolchains/githooks/pre-commit (this repo copy is the
+# versioned master - keep in sync). core.hooksPath points at the LIVE copy because a
+# repo-local path would go missing in worktrees checked out on other branches.
+# Docs live on main only (user order 2026-11-22): documentation may be committed
+# on main and nowhere else, so it can never be left behind on an experiment branch.
+# Applies to docs/** and top-level markdown/text; code and tooling are unaffected.
+# To update docs while working on a branch: leave the doc edits uncommitted (or
+# stash just them: `git stash push -- docs/`), switch to main, stage and commit there.
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null)
+if [ "$branch" != "main" ]; then
+  if git diff --cached --name-only -z | tr '\0' '\n' | grep -qiE '^(docs/.*\.(md|markdown|txt)|[^/]*\.(md|markdown|txt))$'; then
+    echo "BLOCKED: documentation may only be committed on main (docs live on main, never on branches)." >&2
+    echo "  You are on: ${branch:-(detached HEAD)}" >&2
+    echo "  Commit the doc files from main instead; code changes are unaffected." >&2
+    exit 1
+  fi
+fi
+exit 0
