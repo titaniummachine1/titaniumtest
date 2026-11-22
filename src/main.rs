@@ -50,7 +50,9 @@ use sprt::{SprtTally, SprtVerdict};
 mod hash;
 mod prov;
 mod repro;
-// mod proof; // DISABLED 2026-11-21 (D1410): untracked src/proof.rs calls Searcher::pv which does not exist -> breaks the whole hub build (gen/analyze/botzone all dead). Restore by uncommenting once the engine exposes a read-only PV accessor.
+// D1606: the old `ti proof-hunt` (src/proof.rs: positions sent WITHOUT their game history) is RETIRED, archived in
+// C:/gitProjects/_retired/2026-11-22_opencode_proof_hunt/. The only proof tool is `ti proof-lines` (src/proofline.rs);
+// runbook: mainpromo-ataxx docs/runbooks/PROOF_HUNT.md.
 mod stopctl;
 use std::collections::HashMap;
 use std::fs;
@@ -79,7 +81,6 @@ fn main() -> ExitCode {
         "data" => data::run_data(&args[1..]),
         "train" => run_train_subcmd(&args[1..]),
         "relabel" => run_relabel_local(&args[1..]),
-        // "proof-hunt" disabled with `mod proof` 2026-11-21 (D1410, see above)
         "policy" => policy::run_policy(&args[1..]),
         "policy2" => policy2::run(&args[1..]),
         "ordfit" => ordfit::run(&args[1..]),
