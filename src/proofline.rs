@@ -111,7 +111,7 @@ struct Zx {
 }
 
 impl Zx {
-    fn spawn(exe: &str, confirm: u32, abort: &str) -> Result<Zx, String> {
+    fn spawn(exe: &str, confirm: u32, abort: &str, hash_mb: u64) -> Result<Zx, String> {
         let mut child = Command::new(exe)
             .env("ZAX_STOP_ON_PROOF", "1")
             .env("ZAX_PROOF_CONFIRM", confirm.to_string())
@@ -125,6 +125,9 @@ impl Zx {
         let out = BufReader::new(child.stdout.take().unwrap());
         let mut z = Zx { child, inp, out, confirm };
         z.send("uai\nisready\n")?;
+        z.wait_for("readyok")?;
+        // D1603: hash table size per worker (kept for the whole run: never reset between positions)
+        z.send(&format!("setoption name Hash value {hash_mb}\nisready\n"))?;
         z.wait_for("readyok")?;
         Ok(z)
     }
@@ -480,6 +483,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let max_ms = crate::flag_u64(args, "--max-ms").unwrap_or(1000).max(20);
     // D1602 queue tuning: switch when a waiting candidate promises --switch times more proofs per ms; a fresh candidate's
     // first depths are assumed to cost --first-ms
+    let hash_mb = crate::flag_u64(args, "--hash-mb").unwrap_or(64).clamp(1, 1024); // D1603: 32/64/512 MB gave 262/258/255 proofs (no effect), 64 per the user
     let switch_x = crate::flag_f64(args, "--switch").unwrap_or(6.0).max(1.0); // D1602 sweep: x1.5 thrashed (755 switches, 235 proofs), x6 best (261)
     let first_ms = crate::flag_f64(args, "--first-ms").unwrap_or(FIRST_COST_MS).max(1.0);
     let confirm = crate::flag_u64(args, "--confirm").unwrap_or(2).max(1) as u32;
@@ -548,13 +552,16 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
-                let mut z = match Zx::spawn(&zexe, confirm, &abort) {
+                let mut z = match Zx::spawn(&zexe, confirm, &abort, hash_mb) {
                     Ok(z) => z,
                     Err(e) => {
                         errs.lock().unwrap().push(e);
                         return;
                     }
                 };
+                // D1603 worker affinity: a position this worker paused stays with it (its hash table holds that work);
+                // the worker takes whichever is better, its own best paused position or the best one in the queue
+                let mut own: std::collections::BinaryHeap<QItem> = std::collections::BinaryHeap::new();
                 loop {
                     if crate::stopctl::requested(Some(stop_dir.as_path())).is_some() || !errs.lock().unwrap().is_empty() {
                         return;
@@ -562,7 +569,12 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     // take the best candidate; an empty queue ends the worker only when no other worker can push back
                     let item = {
                         let mut h = heap.lock().unwrap();
-                        let it = h.pop();
+                        let take_own = match (own.peek(), h.peek()) {
+                            (Some(o), Some(g)) => o.prio >= g.prio,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        let it = if take_own { own.pop() } else { h.pop() };
                         if it.is_some() {
                             active.fetch_add(1, Relaxed);
                         }
@@ -600,7 +612,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                             return true;
                         }
                         let mine = rate(chance_zx(score.abs()), ms as f64 * (EBF - 1.0));
-                        let best_waiting = heap.lock().unwrap().peek().map(|q| q.prio).unwrap_or(0);
+                        let best_waiting = heap.lock().unwrap().peek().map(|q| q.prio).unwrap_or(0).max(own.peek().map(|q| q.prio).unwrap_or(0));
                         if best_waiting as f64 > mine as f64 * switch_x {
                             c.switches.fetch_add(1, Relaxed);
                             return false;
@@ -620,8 +632,10 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                             // not proven: back into the queue at its new rank, or dropped once its budget is spent
                             let used = it.used_ms as u64 + a.ms;
                             if a.stopped && used < max_ms {
-                                let cost = (reached_ms.max(1) as f64) * EBF;
-                                heap.lock().unwrap().push(QItem { prio: rate(chance_zx(a.score.abs()), cost), cand: it.cand, used_ms: used as u32, reached_ms: reached_ms as u32 });
+                                // resumed on THIS worker (affinity): its hash table brings it back to the reached depth
+                                // cheaply, so the cost is the next depth only
+                                let cost = (reached_ms.max(1) as f64) * (EBF - 1.0);
+                                own.push(QItem { prio: rate(chance_zx(a.score.abs()), cost), cand: it.cand, used_ms: used as u32, reached_ms: reached_ms as u32 });
                             } else {
                                 c.dropped_budget.fetch_add(1, Relaxed);
                                 done_n.fetch_add(1, Relaxed);
