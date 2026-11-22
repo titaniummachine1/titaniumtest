@@ -637,7 +637,10 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
         eprintln!("data games-tdat: note: --best-scores is the only behaviour now (D925); the flag is not needed");
     }
     let against = crate::flag_str(args, "--dedup-against");
-    let want_dedup = against.is_some() || args.iter().any(|a| a == "--dedup");
+    // D1602 (option only): --exclude-keys FILE (one hex position key per line, ti proof-lines' STEM.conflicts.keys) keeps
+    // disputed positions out of the rows entirely; implies the dedup path (an excluded key counts as already seen)
+    let exclude = crate::flag_str(args, "--exclude-keys");
+    let want_dedup = against.is_some() || exclude.is_some() || args.iter().any(|a| a == "--dedup");
     let work = || -> Result<(u64, u64, u64, Vec<Chain>, u64, u64, u64, u64), String> {
         let mut skipped_gates: Vec<String> = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
@@ -664,6 +667,16 @@ pub fn run_games_tdat(args: &[String]) -> ExitCode {
                 }
             }
             eprintln!("games-tdat: {} distinct positions loaded from {p} ({base_rows} rows)", seen.len());
+        }
+        if let Some(p) = &exclude {
+            let txt = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
+            let mut n = 0u64;
+            for l in txt.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let k = u64::from_str_radix(l, 16).map_err(|e| format!("{p}: bad key '{l}': {e}"))?;
+                seen.insert(k);
+                n += 1;
+            }
+            eprintln!("games-tdat: {n} disputed position keys excluded ({p})");
         }
         let (mut dups, mut n_best) = (0u64, 0u64);
         let mut w = BufWriter::with_capacity(1 << 22, File::create(&out_tdat).map_err(|e| format!("{out_tdat}: {e}"))?);

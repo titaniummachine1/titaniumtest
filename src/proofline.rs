@@ -13,7 +13,7 @@
 //!   `ti gen` format): per ply the played move = the engine's best move, the proven score (Titanium mate units,
 //!   mover's view), result = the proven result. `ti data games-tdat` turns them into rows like any game.
 //!
-//!   ti proof-lines --tgam DIR|a.tgam[,..] --out STEM [--zataxx EXE] [--threads 4] [--slice-ms 100] [--max-ms 1000] [--confirm 2]
+//!   ti proof-lines --tgam DIR|a.tgam[,..] --out STEM [--zataxx EXE] [--threads 4] [--max-ms 1000] [--switch 6] [--first-ms 300] [--confirm 2]
 //!                  [--min-stones 40] [--limit-games N]
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -95,6 +95,9 @@ struct Ans {
     /// the winning line of the last completed depth (Zataxx walks it from its TT, uncapped since D1592); used at once to
     /// play the line out, never stored (LAWS D15)
     line: Vec<String>,
+    /// wall time of this search, and whether the queue stopped it (D1602)
+    ms: u64,
+    stopped: bool,
 }
 
 /// D206 calibrated early bail (zataxx-bz ZAX_ABORT, 0 of 625 proofs lost): a search not heading for a proof stops
@@ -142,12 +145,18 @@ impl Zx {
     }
     /// Prove the position reached by `moves` from the standard start (the whole game: Botzone-exact history).
     fn prove(&mut self, moves: &[String], ms: u64, fresh: bool) -> Result<Ans, String> {
+        self.prove_dyn(moves, ms, fresh, &mut |_, _, _| true)
+    }
+    /// D1602: as `prove`, but after every completed depth `go_on(depth, score, ms)` decides whether this search is
+    /// still the best use of the worker; `false` sends UAI `stop` (zataxx-bz 5bbad56) and returns at once.
+    fn prove_dyn(&mut self, moves: &[String], ms: u64, fresh: bool, go_on: &mut dyn FnMut(u32, i32, u64) -> bool) -> Result<Ans, String> {
         let mv = if moves.is_empty() { String::new() } else { format!(" moves {}", moves.join(" ")) };
         let ng = if fresh { "uainewgame\n" } else { "" };
         self.send(&format!("{ng}position startpos{mv}\nisready\n"))?;
         self.wait_for("readyok")?;
+        let t0 = std::time::Instant::now();
         self.send(&format!("go movetime {}\n", ms.max(20)))?;
-        let (mut a, mut run, mut line) = (Ans { score: 0, proven: false, best: String::new(), depth: 0, line: Vec::new() }, 0u32, String::new());
+        let (mut a, mut run, mut line) = (Ans { score: 0, proven: false, best: String::new(), depth: 0, line: Vec::new(), ms: 0, stopped: false }, 0u32, String::new());
         loop {
             line.clear();
             if self.out.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -176,7 +185,12 @@ impl Zx {
             a.score = s as i32;
             a.line = t.iter().position(|&x| x == "pv").map(|i| t[i + 1..].iter().map(|x| x.to_string()).collect()).unwrap_or_default();
             run = if a.score.abs() >= ZX_PROVEN { run + 1 } else { 0 };
+            if !a.stopped && run < self.confirm && !go_on(a.depth, a.score, t0.elapsed().as_millis() as u64) {
+                a.stopped = true;
+                self.send("stop\n")?;
+            }
         }
+        a.ms = t0.elapsed().as_millis() as u64;
         a.proven = run >= self.confirm;
         Ok(a)
     }
@@ -211,6 +225,8 @@ struct Counts {
     dropped_budget: AtomicU64,
     /// positions walked that an earlier line had already written (kept in the line, removed at conversion)
     lines_joined: AtomicU64,
+    /// searches stopped at a completed depth because a waiting candidate promised more proofs per ms (D1602)
+    switches: AtomicU64,
     positions_written: AtomicU64,
     covered_skips: AtomicU64,
     conflicts: AtomicU64,
@@ -285,16 +301,24 @@ struct Ctx {
     rep: Rep,
 }
 
-/// queue entry: priority = chance of a proof per slice, discounted by the slices it already used (max-heap)
+/// D1602 queue entry (max-heap): priority = expected proofs per millisecond = chance of a proof / expected time to the
+/// next depth that could show it. `used_ms` = search time already spent on it (budget), `reached_ms` = time its last
+/// search needed to reach the depth it stopped at (the cost of getting back there).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct QItem {
     prio: u64,
     cand: u32,
-    slices: u16,
+    used_ms: u32,
+    reached_ms: u32,
 }
 
-fn qprio(chance: f64, slices: u16) -> u64 {
-    (chance * 0.7f64.powi(slices as i32) * 1e12) as u64
+/// time growth per completed depth (Zataxx endgame searches; only the ranking depends on it)
+const EBF: f64 = 2.5;
+/// expected time of the first depths of a fresh position
+const FIRST_COST_MS: f64 = 300.0; // D1602 sweep: 30 ms made fresh positions look too cheap (thrashing)
+
+fn rate(chance: f64, cost_ms: f64) -> u64 {
+    (chance / cost_ms.max(1.0) * 1e12) as u64
 }
 
 /// Play out a proven position: walk the proven search's own winning line (no search per ply); every position gets
@@ -311,6 +335,7 @@ fn play_out(
     gi: usize,
     c: &Counts,
     covered: &Mutex<HashMap<u64, i8>>,
+    conflicts: &Mutex<Vec<String>>,
     w: &Mutex<crate::gen::BinOut>,
 ) -> Result<(), String> {
     let mut hist: Vec<String> = ctx.moves[..i].to_vec();
@@ -385,18 +410,33 @@ fn play_out(
         return Ok(());
     }
     {
+        // D1602 ISOLATION: a position this line proves opposite to an earlier line is disputed: this line is NOT written,
+        // the dispute is logged with both proofs (STEM.conflicts.tsv), and the position's key goes to STEM.conflicts.keys
+        // so the earlier line's copy is kept out of the dataset at conversion. Nothing disputed is merged.
         let mut cv = covered.lock().unwrap();
-        for (pb, _, sc, _) in &line {
-            let sg = sc.signum() as i8;
-            match cv.get(&key(pb)) {
-                Some(&old) if old != sg => {
-                    c.conflicts.fetch_add(1, Relaxed);
-                }
-                Some(_) => {}
-                None => {
-                    cv.insert(key(pb), sg);
-                }
+        let disputed: Vec<(usize, i8)> = line.iter().enumerate().filter_map(|(k, (pb, _, sc, _))| match cv.get(&key(pb)) {
+            Some(&old) if old != sc.signum() as i8 => Some((k, old)),
+            _ => None,
+        }).collect();
+        if !disputed.is_empty() {
+            let mut cf = conflicts.lock().unwrap();
+            for (k, old) in &disputed {
+                let (pb, m, sc, d) = &line[*k];
+                c.conflicts.fetch_add(1, Relaxed);
+                cf.push(format!(
+                    "{:016x}\t{}\tgame {gi} ply {}\tthis line: {} (score {sc}, depth {d}, move {}, line ply {k})\tearlier line: {}",
+                    key(pb),
+                    pb.to_ataxx_fen(),
+                    i + k,
+                    if *sc > 0 { "win" } else { "loss" },
+                    uai(*m),
+                    if *old > 0 { "win" } else { "loss" }
+                ));
             }
+            return Ok(());
+        }
+        for (pb, _, sc, _) in &line {
+            cv.entry(key(pb)).or_insert(sc.signum() as i8);
         }
     }
     let root = line[0].0;
@@ -433,12 +473,15 @@ fn play_out(
 fn run_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
     let (Some(spec), Some(out)) = (f("--tgam"), f("--out")) else {
-        return Err("usage: ti proof-lines --tgam DIR|a.tgam[,..] --out STEM [--zataxx EXE] [--threads 4] [--slice-ms 100] [--max-ms 1000] [--confirm 2] [--min-stones 40] [--limit-games N] [--abort N:S,..]".into());
+        return Err("usage: ti proof-lines --tgam DIR|a.tgam[,..] --out STEM [--zataxx EXE] [--threads 4] [--max-ms 1000] [--confirm 2] [--min-stones 40] [--limit-games N] [--abort N:S,..]".into());
     };
     let zexe = f("--zataxx").unwrap_or_else(|| DEFAULT_ZATAXX.to_string());
     let threads = crate::flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
-    let slice_ms = crate::flag_u64(args, "--slice-ms").unwrap_or(100).max(20);
-    let max_ms = crate::flag_u64(args, "--max-ms").unwrap_or(1000).max(slice_ms);
+    let max_ms = crate::flag_u64(args, "--max-ms").unwrap_or(1000).max(20);
+    // D1602 queue tuning: switch when a waiting candidate promises --switch times more proofs per ms; a fresh candidate's
+    // first depths are assumed to cost --first-ms
+    let switch_x = crate::flag_f64(args, "--switch").unwrap_or(6.0).max(1.0); // D1602 sweep: x1.5 thrashed (755 switches, 235 proofs), x6 best (261)
+    let first_ms = crate::flag_f64(args, "--first-ms").unwrap_or(FIRST_COST_MS).max(1.0);
     let confirm = crate::flag_u64(args, "--confirm").unwrap_or(2).max(1) as u32;
     let min_stones = crate::flag_u64(args, "--min-stones").unwrap_or(40) as u32;
     let abort = f("--abort").unwrap_or_else(|| DEFAULT_ABORT.to_string());
@@ -476,7 +519,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     continue;
                 }
                 let chance = p.score.map(|s| chance_ti(s.abs())).unwrap_or(0.28);
-                heap.push(QItem { prio: qprio(chance, 0), cand: cands.len() as u32, slices: 0 });
+                heap.push(QItem { prio: rate(chance, first_ms), cand: cands.len() as u32, used_ms: 0, reached_ms: 0 });
                 cands.push((ci, i as u32));
             }
             ctxs.push(Ctx { moves: plies.iter().map(|p| uai(p.mv)).collect(), boards: plies.iter().map(|p| p.board).collect(), rep });
@@ -484,14 +527,19 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     }
     let total_cands = cands.len();
     eprintln!(
-        "proof-lines: {} games, {total_cands} candidate positions (>= {min_stones} stones), zataxx {zexe}, {threads} threads, slice {slice_ms} ms, at most {max_ms} ms per position, confirm {confirm} -> {out}.tgam/.tbst",
+        "proof-lines: {} games, {total_cands} candidate positions (>= {min_stones} stones), zataxx {zexe}, {threads} threads, dynamic queue (re-ranked at every depth), at most {max_ms} ms per position, confirm {confirm} -> {out}.tgam/.tbst",
         c.games.load(Relaxed)
     );
     let heap = Mutex::new(heap);
     let active = AtomicUsize::new(0);
+    // never overwrite earlier output (a finished or partial run stays as it is; the caller moves it away first)
+    if std::path::Path::new(&format!("{out}.tgam")).exists() {
+        return Err(format!("{out}.tgam exists: refusing to overwrite it"));
+    }
     let w = Mutex::new(crate::gen::BinOut::create(&out).map_err(|e| format!("{out}: {e}"))?);
     // position -> proven sign for its side to move (first proof wins; a later opposite proof is a conflict)
     let covered: Mutex<HashMap<u64, i8>> = Mutex::new(HashMap::new());
+    let conflicts: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let t0 = std::time::Instant::now();
     let stop_dir = std::path::PathBuf::from(format!("{out}.run"));
     let _ = std::fs::create_dir_all(&stop_dir);
@@ -537,16 +585,43 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                         continue;
                     }
                     c.queried.fetch_add(1, Relaxed);
-                    let r = z.prove(&ctx.moves[..i as usize], slice_ms, false).and_then(|a| {
+                    // D1602: after every completed depth compare this search's expected proofs per ms (chance from the
+                    // score it reached / time of its next depth) with the best waiting candidate; if that one is clearly
+                    // better (x1.5, no thrashing), or another line has proven this position meanwhile, stop and switch.
+                    let budget = max_ms.saturating_sub(it.used_ms as u64).max(20);
+                    let mut reached_ms = 0u64;
+                    let k = key(&b);
+                    let mut go_on = |depth: u32, score: i32, ms: u64| -> bool {
+                        reached_ms = ms;
+                        if covered.lock().unwrap().contains_key(&k) {
+                            return false;
+                        }
+                        if depth < 2 {
+                            return true;
+                        }
+                        let mine = rate(chance_zx(score.abs()), ms as f64 * (EBF - 1.0));
+                        let best_waiting = heap.lock().unwrap().peek().map(|q| q.prio).unwrap_or(0);
+                        if best_waiting as f64 > mine as f64 * switch_x {
+                            c.switches.fetch_add(1, Relaxed);
+                            return false;
+                        }
+                        true
+                    };
+                    let r = z.prove_dyn(&ctx.moves[..i as usize], budget, false, &mut go_on).and_then(|a| {
                         if a.proven {
                             c.proven_roots.fetch_add(1, Relaxed);
                             done_n.fetch_add(1, Relaxed);
-                            play_out(&mut z, ctx, i as usize, a, max_ms, ci as usize, &c, &covered, &w)
+                            play_out(&mut z, ctx, i as usize, a, max_ms, ci as usize, &c, &covered, &conflicts, &w)
+                        } else if covered.lock().unwrap().contains_key(&k) {
+                            c.covered_skips.fetch_add(1, Relaxed);
+                            done_n.fetch_add(1, Relaxed);
+                            Ok(())
                         } else {
-                            // not proven in this slice: re-rank from the score Zataxx reached, or drop at the budget
-                            let sl = it.slices + 1;
-                            if sl as u64 * slice_ms < max_ms {
-                                heap.lock().unwrap().push(QItem { prio: qprio(chance_zx(a.score.abs()), sl), cand: it.cand, slices: sl });
+                            // not proven: back into the queue at its new rank, or dropped once its budget is spent
+                            let used = it.used_ms as u64 + a.ms;
+                            if a.stopped && used < max_ms {
+                                let cost = (reached_ms.max(1) as f64) * EBF;
+                                heap.lock().unwrap().push(QItem { prio: rate(chance_zx(a.score.abs()), cost), cand: it.cand, used_ms: used as u32, reached_ms: reached_ms as u32 });
                             } else {
                                 c.dropped_budget.fetch_add(1, Relaxed);
                                 done_n.fetch_add(1, Relaxed);
@@ -582,13 +657,14 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     });
     let e = errs.into_inner().unwrap();
     let rep = format!(
-        "proof-lines report ({:.0}s)\ngames {} (not from the start position, skipped: {}, replay errors: {})\ncandidate positions {}, slices searched {}, skipped as already on a proof line {}, dropped at the per-position budget {}\nproven roots {}\nlines written {} (to the real end {}, proof stopped earlier {}), positions written {} (of them also on an earlier line {}: removed by games-tdat --dedup)\nDISCARDED: final count disagrees with the proof {}, proven sign flipped mid-line {}, illegal / unparsable move {}, repetition-banned move {}\nconflicting proofs for the same position {}\nsearches inside lines {}, complete lines whose length != proven distance {}\nerrors: {}\n",
+        "proof-lines report ({:.0}s)\ngames {} (not from the start position, skipped: {}, replay errors: {})\ncandidate positions {}, searches started {} (switched away at a completed depth {}), skipped as already on a proof line {}, dropped at the per-position budget {}\nproven roots {}\nlines written {} (to the real end {}, proof stopped earlier {}), positions written {} (of them also on an earlier line {}: removed by games-tdat --dedup)\nDISCARDED: final count disagrees with the proof {}, proven sign flipped mid-line {}, illegal / unparsable move {}, repetition-banned move {}\nconflicting proofs for the same position {} (isolated: STEM.conflicts.tsv / .keys, the line not written)\nsearches inside lines {}, complete lines whose length != proven distance {}\nerrors: {}\n",
         t0.elapsed().as_secs_f64(),
         c.games.load(Relaxed),
         c.not_startpos.load(Relaxed),
         c.bad_replay.load(Relaxed),
         total_cands,
         c.queried.load(Relaxed),
+        c.switches.load(Relaxed),
         c.covered_skips.load(Relaxed),
         c.dropped_budget.load(Relaxed),
         c.proven_roots.load(Relaxed),
@@ -608,6 +684,18 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     );
     eprint!("{rep}");
     std::fs::write(format!("{out}.report.txt"), &rep).map_err(|e| e.to_string())?;
+    // D1602: every disputed position (both proofs) + the keys to keep out of the dataset (games-tdat --exclude-keys)
+    let cf = conflicts.into_inner().unwrap();
+    let mut txt = String::from("key\tfen\twhere\tthis line\tearlier line\n");
+    let mut keys = String::new();
+    for l in &cf {
+        txt.push_str(l);
+        txt.push('\n');
+        keys.push_str(l.split('\t').next().unwrap_or(""));
+        keys.push('\n');
+    }
+    std::fs::write(format!("{out}.conflicts.tsv"), txt).map_err(|e| e.to_string())?;
+    std::fs::write(format!("{out}.conflicts.keys"), keys).map_err(|e| e.to_string())?;
     if !e.is_empty() {
         return Err("stopped on errors (see report)".into());
     }
