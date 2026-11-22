@@ -375,6 +375,7 @@ pub fn run_data(args: &[String]) -> ExitCode {
         Some("diff") => crate::gamedata::run_diff(args),
         Some("patch") => crate::gamedata::run_patch(args),
         Some("proof-upgrade") => crate::gamedata::run_proof_upgrade(args),
+        Some("proof-check") => crate::gamedata::run_proof_check(args),
         Some("chain-audit") => crate::gamedata::run_chain_audit(args),
         Some("pack-games") => crate::gamedata::run_pack_games(args),
         Some("games-stat") => crate::gamedata::run_games_stat(args),

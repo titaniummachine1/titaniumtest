@@ -866,6 +866,13 @@ fn proof_value(r: &Rec) -> Option<f32> {
     }
 }
 
+/// D1613: 64-bit key of a position's D4 class (side to move, opponent; minimum over the 8 symmetries, as pool_key).
+pub fn d4_key(occ0: u64, occ1: u64, stm: u8) -> u64 {
+    let (m, o) = if stm == 0 { (occ0, occ1) } else { (occ1, occ0) };
+    let (a, b) = (0..8).map(|k| (crate::mapper::transform_bb(m, k), crate::mapper::transform_bb(o, k))).min().unwrap();
+    crate::dag::splitmix(crate::dag::splitmix(a) ^ b.rotate_left(17))
+}
+
 /// Position key for pooling: side to move's stones, opponent's stones, minimum over the 8 board symmetries.
 fn pool_key(r: &Rec) -> (u64, u64) {
     let (m, o) = if r.stm == 0 { (r.occ0, r.occ1) } else { (r.occ1, r.occ0) };
@@ -3543,6 +3550,10 @@ pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let check_only = args.iter().any(|a| a == "--check-only");
+    // D1613/D1614 (user order, DEFAULT): a proof covers all 8 rotations / mirrors of its position (the rules are
+    // D4-invariant on the open board): positions are matched by their D4 class (as pool_key); --exact = exact stones only
+    let exact = args.iter().any(|a| a == "--exact");
+    let keyf = move |o0: u64, o1: u64, s: u8| -> u64 { if exact { pos_key(o0, o1, s) } else { d4_key(o0, o1, s) } };
     let r = || -> Result<String, String> {
         let mut excl: HashSet<u64> = HashSet::new();
         if let Some(list) = crate::flag_str(args, "--exclude-keys") {
@@ -3565,7 +3576,10 @@ pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
             let r = Rec::from_bytes(c);
             n_rows += 1;
             let t = crate::targets::target_of(&r);
-            let k = pos_key(r.occ0, r.occ1, r.stm);
+            let k = keyf(r.occ0, r.occ1, r.stm);
+            if excl.contains(&pos_key(r.occ0, r.occ1, r.stm)) {
+                excl.insert(k); // an excluded (raw) position excludes its whole D4 class
+            }
             if t.proven < 0 {
                 unproven += 1;
                 continue;
@@ -3604,6 +3618,65 @@ pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
             fs::write(format!("{report}.summary.txt"), format!("{head}\n")).map_err(|e| e.to_string())?;
             return Ok(head);
         }
+        // D1613: --new-exclude-out FILE --base X.tdat: the RAW keys games-tdat must skip so that only NEW classes are
+        // appended, each class once: classes already anywhere in X (incl. its held-out tail), contradicting / excluded
+        // classes, and every further raw member of a class after its first one in the proof file order
+        if let Some(sel) = crate::flag_str(args, "--new-exclude-out") {
+            let base = crate::flag_str(args, "--base").ok_or("--new-exclude-out needs --base X.tdat")?;
+            let mut present: HashSet<u64> = HashSet::new();
+            let mut rd = BufReader::with_capacity(1 << 22, File::open(&base).map_err(|e| format!("{base}: {e}"))?);
+            let mut buf = vec![0u8; REC * 65536];
+            let mut n_base = 0u64;
+            loop {
+                let mut got = 0;
+                while got < buf.len() {
+                    let n = rd.read(&mut buf[got..]).map_err(|e| format!("{base}: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                for c in buf[..got - got % REC].chunks_exact(REC) {
+                    let r = Rec::from_bytes(c);
+                    n_base += 1;
+                    let k = keyf(r.occ0, r.occ1, r.stm);
+                    if map.contains_key(&k) {
+                        present.insert(k);
+                    }
+                }
+                if got < buf.len() {
+                    break;
+                }
+            }
+            let mut first: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            let mut out_keys: Vec<u64> = Vec::new();
+            let mut new_cls = 0u64;
+            for c in pb.chunks_exact(REC) {
+                let r = Rec::from_bytes(c);
+                let (k, raw) = (keyf(r.occ0, r.occ1, r.stm), pos_key(r.occ0, r.occ1, r.stm));
+                if !map.contains_key(&k) || present.contains(&k) {
+                    out_keys.push(raw);
+                    continue;
+                }
+                match first.entry(k) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(raw);
+                        new_cls += 1;
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if *e.get() != raw {
+                            out_keys.push(raw);
+                        }
+                    }
+                }
+            }
+            out_keys.sort_unstable();
+            out_keys.dedup();
+            fs::write(&sel, out_keys.iter().map(|k| format!("{k:016x}\n")).collect::<String>()).map_err(|e| e.to_string())?;
+            let s = format!("{head}\nbase {base} {n_base} rows: proof classes already present {}; NEW classes {new_cls} (one raw position each); raw keys to skip {} -> {sel}", present.len(), out_keys.len());
+            fs::write(format!("{report}.summary.txt"), format!("{s}\n")).map_err(|e| e.to_string())?;
+            return Ok(s);
+        }
         let (Some(base), Some(tail), Some(out)) = (crate::flag_str(args, "--base"), crate::flag_u64(args, "--preserve-tail"), crate::flag_str(args, "--out")) else {
             return Err("full mode needs --base X.tdat --preserve-tail N --out D.tdif".into());
         };
@@ -3635,7 +3708,7 @@ pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
                 let ri = row + i as u64;
                 let x = &mut buf[i * REC..(i + 1) * REC];
                 let r = Rec::from_bytes(x);
-                let k = pos_key(r.occ0, r.occ1, r.stm);
+                let k = keyf(r.occ0, r.occ1, r.stm);
                 let Some(&(sign, pcp)) = map.get(&k) else { continue };
                 if ri >= cut {
                     tail_hits += 1;
@@ -3710,6 +3783,83 @@ pub fn run_proof_upgrade(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("data proof-upgrade: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// D1614 (user: hub, never python): `ti data proof-check --base A.tdat --new B.tdat --tail N --added M`: B = A with M rows
+/// inserted before A's last N rows and proof upgrades applied. Checks: row count; tail byte-identical; head rows of A changed
+/// only in outcome / cp / proof_kind and only where B has proof_kind 6; inserted rows proven, outcome = (cp > 0), proof_kind
+/// 6; every proof_kind-6 row of B proven with outcome = (cp > 0). Read-only, streamed.
+pub fn run_proof_check(args: &[String]) -> ExitCode {
+    let (Some(base), Some(new), Some(tail), Some(added)) = (crate::flag_str(args, "--base"), crate::flag_str(args, "--new"), crate::flag_u64(args, "--tail"), crate::flag_u64(args, "--added")) else {
+        eprintln!("usage: ti data proof-check --base A.tdat --new B.tdat --tail N --added M");
+        return ExitCode::FAILURE;
+    };
+    let r = || -> Result<Vec<(bool, String)>, String> {
+        let len = |p: &str| fs::metadata(p).map(|m| m.len() / REC as u64).map_err(|e| format!("{p}: {e}"));
+        let (nb, nn) = (len(&base)?, len(&new)?);
+        let mut res = vec![(nn == nb + added, format!("rows {nn} = base {nb} + added {added}"))];
+        if nn != nb + added || tail >= nb {
+            return Ok(res);
+        }
+        let (cut_b, cut_n) = (nb - tail, nn - tail);
+        let mut ra = BufReader::with_capacity(1 << 22, File::open(&base).map_err(|e| e.to_string())?);
+        let mut rb = BufReader::with_capacity(1 << 22, File::open(&new).map_err(|e| e.to_string())?);
+        let proven_ok = |x: &[u8]| {
+            let r = Rec::from_bytes(x);
+            r.cp.abs() >= 98000.0 && r.outcome == if r.cp > 0.0 { 1.0 } else { 0.0 }
+        };
+        let (mut changed, mut bad_head, mut bad_add, mut n6, mut bad6, mut tail_diff) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut a, mut b) = (vec![0u8; REC], vec![0u8; REC]);
+        for i in 0..nn {
+            rb.read_exact(&mut b).map_err(|e| e.to_string())?;
+            let in_head = i < cut_b;
+            let in_tail = i >= cut_n;
+            if in_head || in_tail {
+                ra.read_exact(&mut a).map_err(|e| e.to_string())?;
+            }
+            let is6 = b[42] == 6;
+            if is6 && !in_tail {
+                n6 += 1;
+                if !proven_ok(&b) {
+                    bad6 += 1;
+                }
+            }
+            if in_tail {
+                if a != b {
+                    tail_diff += 1;
+                }
+            } else if in_head {
+                if a != b {
+                    changed += 1;
+                    let other = (0..REC).any(|k| !(16..24).contains(&k) && k != 42 && a[k] != b[k]);
+                    if other || !is6 {
+                        bad_head += 1;
+                    }
+                }
+            } else if !is6 || !proven_ok(&b) {
+                bad_add += 1;
+            }
+        }
+        res.push((tail_diff == 0, format!("held-out tail ({tail} rows) byte-identical (different rows {tail_diff})")));
+        res.push((bad_head == 0, format!("base head rows changed only in outcome/cp/proof_kind and only on proof_kind 6 rows (changed {changed}, bad {bad_head})")));
+        res.push((bad_add == 0, format!("inserted rows all proven, outcome consistent, proof_kind 6 (bad {bad_add})")));
+        res.push((bad6 == 0, format!("proof_kind-6 rows {n6}: all |cp| >= 98000 with outcome = (cp > 0) (bad {bad6})")));
+        Ok(res)
+    };
+    match r() {
+        Ok(res) => {
+            let fail = res.iter().filter(|x| !x.0).count();
+            for (ok, m) in &res {
+                println!("data proof-check: {} {m}", if *ok { "OK  " } else { "FAIL" });
+            }
+            println!("data proof-check: {}", if fail == 0 { "ALL CHECKS PASS".to_string() } else { format!("{fail} CHECK(S) FAILED") });
+            if fail == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Err(e) => {
+            eprintln!("data proof-check: {e}");
             ExitCode::FAILURE
         }
     }
