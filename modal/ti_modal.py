@@ -65,6 +65,8 @@ image = (
     # the current engine also include_bytes!s these two (config.rs pin test, policy.rs head)
     .add_local_file(ENGINE + r"\data\nnue\BUNDLE.txt", "/src/engine/data/nnue/BUNDLE.txt", copy=True)
     .add_local_file(ENGINE + r"\data\nnue\policy_main.bin", "/src/engine/data/nnue/policy_main.bin", copy=True)
+    # D1520: the per-stage knob table is include_str!'d too since D1369
+    .add_local_file(ENGINE + r"\data\nnue\knobs_main.txt", "/src/engine/data/nnue/knobs_main.txt", copy=True)
     # dependency layer: only the manifest + a dummy main, so bullet/CUDA/flate2 are compiled once and cached
     .add_local_file(HUB + r"\Cargo.toml", "/src/hub/Cargo.toml", copy=True)
     .add_local_file(HUB + r"\Cargo.lock", "/src/hub/Cargo.lock", copy=True)
