@@ -208,6 +208,17 @@ pub fn run_train(args: &[String]) -> ExitCode {
 
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
+    let d4 = !crate::has_flag(args, "--no-d4");
+    let d4_rand = crate::has_flag(args, "--d4-rand");
+    let holdout = crate::flag_u64(args, "--holdout-mode").map(|v| v as usize);
+    let d4_all = d4 && !d4_rand && holdout.is_none();
+    if crate::has_flag(args, "--d4-all") && !d4_all {
+        return Err("--d4-all expands all 8 D4 orientations and conflicts with --no-d4 / --d4-rand / --holdout-mode".into());
+    }
+    let exp = f("--experiment");
+    if exp.is_none() && (d4_rand || !d4) {
+        return Err("--d4-rand and --no-d4 are forbidden on standard training (LAWS A13/D1631: default feeds all 8 D4 orientations per epoch, scrambled); pass --experiment NAME under experiments/".into());
+    }
     if f("--backend").as_deref() == Some("cuda") {
         // LAWS D5 / D1159 / D1260 / D1554 / D1629 + LAWS A13: combined Muon + Schedule-Free AdamW (`--opt muon`)
         // is the MANDATORY default GPU optimiser; standalone `--opt sfadamw` or `--opt ranger` requires `--experiment NAME`.
@@ -215,15 +226,11 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         if !matches!(opt_name.as_str(), "muon" | "sfadamw" | "ranger") {
             return Err("--backend cuda: --opt takes muon (default, Muon + Schedule-Free AdamW), sfadamw (--experiment only), or ranger (--experiment only)".into());
         }
-        let exp = f("--experiment");
         if exp.is_none() && opt_name != "muon" {
             return Err(format!(
                 "--opt {opt_name} is forbidden on standard CUDA training (LAWS D5/D1260/D1629: mandatory default is --opt muon [Muon + Schedule-Free AdamW]); pass --experiment NAME under experiments/"
             ));
         }
-        // D1553/D1554 (user, LAWS C15 + D5): the run stops after 4 consecutive epochs of data without a val gain >= 1e-5; the LR
-        // comes from the optimiser, never a hand rule: no step cap, no cosine horizon, no checkpoint patience, no
-        // 'stop after N drops'. Other schedules only with --experiment NAME (output under an experiments/ folder).
         let legacy: Vec<&str> = ["--patience", "--plateau", "--max-drops", "--lr-min", "--steps", "--min-delta"]
             .into_iter()
             .filter(|k| f(k).is_some())
@@ -262,8 +269,9 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 val_rows: g("--val-rows", 65536),
                 threads: g("--threads", 8),
                 seed: g("--seed", 7) as u64,
-                d4: !crate::has_flag(args, "--no-d4"),
-                holdout: crate::flag_u64(args, "--holdout-mode").map(|v| v as usize),
+                d4,
+                d4_all,
+                holdout,
                 resume: crate::has_flag(args, "--resume"),
                 ram: crate::has_flag(args, "--ram"),
                 wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
@@ -291,7 +299,6 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         return Err("this ti was built without --features cuda".into());
     }
     // engine D427 / D1629: standard CPU trainer enforces Muon + Schedule-Free AdamW + LAWS C15 unless --experiment NAME under experiments/
-    let exp = f("--experiment");
     let result_weight: Option<targets::Rw> = targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
     let loss_weight: Option<targets::Rw> = targets::parse_lw(f("--loss-weight-buckets"))?;
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
@@ -323,7 +330,6 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let val_rows = crate::flag_u64(args, "--val-rows").unwrap_or(65536) as usize;
     let save_every = crate::flag_u64(args, "--save-every").unwrap_or(500) as usize;
     let seed = crate::flag_u64(args, "--seed").unwrap_or(7);
-    let d4 = !crate::has_flag(args, "--no-d4");
     let resume = crate::has_flag(args, "--resume");
     let wsum_clip = crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32;
     let guard = crate::flag_f64(args, "--guard").unwrap_or(1.15);
@@ -343,11 +349,12 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         }
     }
     let mut train = if crate::has_flag(args, "--ram") { Tdat::open_ram(&data)? } else { Tdat::open(&data)? };
-    let epoch_batches = train.rows.div_ceil(bs).max(1);
+    let d4_mult = if d4_all { mapper::MODES } else { 1 };
+    let epoch_batches = (train.rows * d4_mult).div_ceil(bs).max(1);
     let eval_every = if epoch_rule { epoch_batches } else { crate::flag_u64(args, "--eval-every").unwrap_or(250) as usize };
     let mut valf = Tdat::open(&val_stem)?;
     let val = load_val(&mut valf, val_rows)?;
-    println!("[train] rows {} val {} bs {bs} {} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len(), if epoch_rule { format!("epoch_batches {epoch_batches} (LAWS C15)") } else { format!("steps {steps}") });
+    println!("[train] rows {} val {} bs {bs} {} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4} d4_all {d4_all}", train.rows, val.len(), if epoch_rule { format!("epoch_batches {epoch_batches} ({d4_mult}x D4, LAWS C15)") } else { format!("steps {steps}") });
     let v0 = evaluate(&net, &val, threads);
     if !std::path::Path::new(&format!("{out}/best.tnn")).exists() {
         // a best snapshot exists from the first second on (the init), however short the run (LAWS A14)
@@ -383,7 +390,19 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         rng.next();
     }
     let nblk = train.rows / BLOCK;
+    let mut raw: Vec<Rec> = Vec::new();
     let mut buf: Vec<Rec> = Vec::new();
+    let mut perm = if d4_all {
+        let mut nx = || rng.next();
+        let mut p = mapper::BlockPerm::new(nblk, &mut nx);
+        if nblk > 0 {
+            p.advance((step0 * bs / mapper::MODES / BLOCK) % nblk, &mut nx);
+        }
+        println!("[train] d4-all FULL 8x SCRAMBLED D4 QUEUE (default): all 8 orientations per board per pass");
+        Some(p)
+    } else {
+        None
+    };
     let mut best = v0.mse;
     let mut best_saved = v0.mse;
     let mut flat_epochs = 0usize;
@@ -391,18 +410,30 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let (mut run_loss, mut run_w, mut run_n) = (0f64, 0f64, 0usize);
     for step in step0..steps {
         if buf.len() < bs {
-            // refill: 64 batches worth of random 1024-row blocks, shuffled together (mixes sources and phases)
-            buf.clear();
-            for _ in 0..(bs * 64 / BLOCK).max(1) {
-                train.read_block(rng.below(nblk) * BLOCK, BLOCK, &mut buf)?;
-            }
-            for i in (1..buf.len()).rev() {
-                let j = rng.below(i + 1);
-                buf.swap(i, j);
+            if let Some(p) = perm.as_mut() {
+                raw.clear();
+                for _ in 0..(bs * 8 / BLOCK).max(16) {
+                    let b = {
+                        let mut nx = || rng.next();
+                        p.next_block(&mut nx)
+                    };
+                    train.read_block(b * BLOCK, BLOCK, &mut raw)?;
+                }
+                mapper::expand_and_scramble_d4(&raw, &mut buf, || rng.next());
+            } else {
+                // refill: 64 batches worth of random 1024-row blocks, shuffled together (mixes sources and phases)
+                buf.clear();
+                for _ in 0..(bs * 64 / BLOCK).max(1) {
+                    train.read_block(rng.below(nblk) * BLOCK, BLOCK, &mut buf)?;
+                }
+                for i in (1..buf.len()).rev() {
+                    let j = rng.below(i + 1);
+                    buf.swap(i, j);
+                }
             }
         }
         let batch: Vec<Rec> = buf.split_off(buf.len() - bs);
-        let modes: Vec<usize> = batch.iter().map(|_| if d4 { rng.below(8) } else { 0 }).collect();
+        let modes: Vec<usize> = batch.iter().map(|_| if d4 && !d4_all { rng.below(8) } else { 0 }).collect();
         let per = (bs + threads - 1) / threads;
         let netref = &net;
         let losses: Vec<(f64, f64)> = std::thread::scope(|s| {
@@ -796,6 +827,16 @@ mod tests {
         ] {
             let err = run_train_inner(&args(&bad)).expect_err("suboptimal --opt must be refused");
             assert!(err.contains("--experiment"), "expected --experiment hint in: {err}");
+        }
+        for bad in [
+            vec!["--d4-all", "--no-d4", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--d4-all", "--d4-rand", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--d4-all", "--holdout-mode", "0", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--d4-rand", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--no-d4", "--data", "d", "--val", "v", "--out", "o"],
+        ] {
+            let err = run_train_inner(&args(&bad)).expect_err("non-default D4 flags must be refused");
+            assert!(err.contains("--d4-all") || err.contains("--experiment"), "unexpected error: {err}");
         }
     }
 }

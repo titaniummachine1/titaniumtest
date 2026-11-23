@@ -79,6 +79,65 @@ pub fn sample(r: &Rec, mode: usize, buckets: usize, map_id: u32) -> Sample {
     Sample { us: us[..nu].to_vec(), them: them[..nt].to_vec(), bucket: bucket_of_id(b.empty().count_ones() as usize, buckets, map_id) }
 }
 
+/// Full-dataset shuffled block permutation so `--d4-all` visits every 1024-row block once per pass without replacement,
+/// ensuring all 8 D4 orientations of every position appear in one augmented epoch.
+pub struct BlockPerm {
+    perm: Vec<usize>,
+    pos: usize,
+}
+
+impl BlockPerm {
+    pub fn new(nblk: usize, next_u64: &mut impl FnMut() -> u64) -> Self {
+        let mut perm: Vec<usize> = (0..nblk).collect();
+        for i in (1..perm.len()).rev() {
+            let j = (next_u64() % (i as u64 + 1)) as usize;
+            perm.swap(i, j);
+        }
+        BlockPerm { perm, pos: 0 }
+    }
+
+    pub fn advance(&mut self, steps: usize, next_u64: &mut impl FnMut() -> u64) {
+        for _ in 0..steps {
+            let _ = self.next_block(next_u64);
+        }
+    }
+
+    pub fn next_block(&mut self, next_u64: &mut impl FnMut() -> u64) -> usize {
+        if self.perm.is_empty() {
+            return 0;
+        }
+        if self.pos >= self.perm.len() {
+            for i in (1..self.perm.len()).rev() {
+                let j = (next_u64() % (i as u64 + 1)) as usize;
+                self.perm.swap(i, j);
+            }
+            self.pos = 0;
+        }
+        let b = self.perm[self.pos];
+        self.pos += 1;
+        b
+    }
+}
+
+/// D1630/D1631 (default on value training): expand every sampled position into all 8 D4 orientations (`transform_bb` `0..8`)
+/// and Fisher-Yates scramble the entire queue buffer so the 8 copies of a position are never trained in sequence.
+pub fn expand_and_scramble_d4(raw: &[Rec], out: &mut Vec<Rec>, mut next_u64: impl FnMut() -> u64) {
+    out.clear();
+    out.reserve(raw.len() * MODES);
+    for &r in raw {
+        for mode in 0..MODES {
+            let mut o = r;
+            o.occ0 = transform_bb(r.occ0, mode);
+            o.occ1 = transform_bb(r.occ1, mode);
+            out.push(o);
+        }
+    }
+    for i in (1..out.len()).rev() {
+        let j = (next_u64() % (i as u64 + 1)) as usize;
+        out.swap(i, j);
+    }
+}
+
 #[allow(dead_code)]
 pub const MAX: usize = MAX_ACTIVE;
 
@@ -142,6 +201,45 @@ mod tests {
         assert_eq!(bucket_of(0, 8), 0);
         assert_eq!(bucket_of(49, 8), 7);
         assert_eq!(bucket_of(25, 8), 4);
+    }
+
+    #[test]
+    fn d4_all_expands_all_8_and_scrambles() {
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        let mut raw = Vec::new();
+        for idx in 0..32usize {
+            let mut r = rec(&mut s);
+            r.zx = idx as i32; // distinguish source board uniquely
+            raw.push(r);
+        }
+        let mut rng = 0xDEAD_BEEF_CAFE_BABEu64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut out = Vec::new();
+        expand_and_scramble_d4(&raw, &mut out, &mut next);
+        assert_eq!(out.len(), raw.len() * MODES);
+        // Every source board must appear with all 8 transformed bitboards exactly once.
+        for (idx, r) in raw.iter().enumerate() {
+            let got: Vec<(u64, u64)> = out.iter().filter(|o| o.zx == idx as i32).map(|o| (o.occ0, o.occ1)).collect();
+            assert_eq!(got.len(), MODES);
+            for mode in 0..MODES {
+                let want = (transform_bb(r.occ0, mode), transform_bb(r.occ1, mode));
+                assert!(got.contains(&want), "board {idx} missing D4 mode {mode}");
+            }
+        }
+        // Check that orientations are genuinely scrambled (not left in consecutive 8-item blocks).
+        let consecutive_runs = out.windows(2).filter(|w| w[0].zx == w[1].zx).count();
+        assert!(consecutive_runs < 10, "expected scrambled queue, found {consecutive_runs} adjacent pairs");
+
+        // BlockPerm must visit every block 0..nblk exactly once before reshuffling.
+        let mut perm = BlockPerm::new(17, &mut next);
+        let mut seen: Vec<usize> = (0..17).map(|_| perm.next_block(&mut next)).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..17).collect::<Vec<_>>());
     }
 }
 

@@ -31,6 +31,8 @@ pub struct TdatReader {
     seed: u64,
     /// shared RAM copy (`--ram`), None = stream from disk
     ram: Option<std::sync::Arc<Tdat>>,
+    /// D1630 (`--d4-all`): expand each sampled board into all 8 D4 orientations and scramble across batches
+    d4_all: bool,
 }
 
 impl DataReader<Rec> for TdatReader {
@@ -47,14 +49,33 @@ impl DataReader<Rec> for TdatReader {
             s ^= s << 17;
             s
         };
-        let mut buf: Vec<Rec> = Vec::with_capacity(128 * BLOCK);
-        loop {
-            buf.clear();
-            for _ in 0..128 {
-                t.read_block((next() % nblk as u64) as usize * BLOCK, BLOCK, &mut buf).expect("read block");
+        let mut raw: Vec<Rec> = Vec::with_capacity(if self.d4_all { 64 * BLOCK } else { 0 });
+        let mut buf: Vec<Rec> = Vec::with_capacity(if self.d4_all { 64 * BLOCK * mapper::MODES } else { 128 * BLOCK });
+        let mut perm = if self.d4_all {
+            let mut p = mapper::BlockPerm::new(nblk, &mut next);
+            if nblk > 0 {
+                p.advance((skip_count / BLOCK) % nblk, &mut next);
             }
-            for i in (1..buf.len()).rev() {
-                buf.swap(i, (next() % (i as u64 + 1)) as usize);
+            Some(p)
+        } else {
+            None
+        };
+        loop {
+            if let Some(p) = perm.as_mut() {
+                raw.clear();
+                for _ in 0..64 {
+                    let b = p.next_block(&mut next);
+                    t.read_block(b * BLOCK, BLOCK, &mut raw).expect("read block");
+                }
+                mapper::expand_and_scramble_d4(&raw, &mut buf, &mut next);
+            } else {
+                buf.clear();
+                for _ in 0..128 {
+                    t.read_block((next() % nblk as u64) as usize * BLOCK, BLOCK, &mut buf).expect("read block");
+                }
+                for i in (1..buf.len()).rev() {
+                    buf.swap(i, (next() % (i as u64 + 1)) as usize);
+                }
             }
             if f(&buf) {
                 return;
@@ -78,6 +99,7 @@ pub struct GpuCfg {
     pub threads: usize,
     pub seed: u64,
     pub d4: bool,
+    pub d4_all: bool,
     /// DIAGNOSTIC ONLY: never train on D4 orientation k, validate it separately. A big gap = the net memorised orientations
     /// instead of learning the symmetry. Production runs train on all 8 (search meets every orientation).
     pub holdout: Option<usize>,
@@ -241,13 +263,23 @@ pub fn run(c: GpuCfg) -> Result<(), String> {
 
 fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let base = load_init(&c.init)?;
+    if c.d4_all && (!c.d4 || c.holdout.is_some()) {
+        return Err("--d4-all expands all 8 D4 orientations and conflicts with --no-d4 / --holdout-mode".into());
+    }
     if let Some(k) = c.holdout {
         if !c.d4 || k > 7 {
             return Err("--holdout-mode needs D4 on and a mode 0..7".into());
         }
         println!("[holdout] DIAGNOSTIC RUN: D4 orientation {k} is never trained, it is validated separately");
     }
-    let (mapper, defn) = build(&base, c.d4, c.holdout, c.wsum_clip, c.proof_blend, c.result_weight, c.loss_weight);
+    if c.d4_all {
+        println!("[d4-all] FULL 8x SCRAMBLED D4 QUEUE (D1630/D1631, default): every position expands into all 8 orientations per full-dataset block pass, scrambled across 64 blocks (524,288 rows/refill)");
+    } else if c.d4 {
+        println!("[d4-rand] EXPERIMENT 1x random D4 orientation per sampled position");
+    } else {
+        println!("[d4] OFF (--no-d4 experiment)");
+    }
+    let (mapper, defn) = build(&base, c.d4 && !c.d4_all, c.holdout, c.wsum_clip, c.proof_blend, c.result_weight, c.loss_weight);
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
@@ -320,7 +352,7 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
         track_grad_norms: false,
     };
     let ram = if c.ram { Some(std::sync::Arc::new(Tdat::open_ram(&c.data)?)) } else { None };
-    let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram }, mapper, c.threads.min(255) as u8);
+    let loader = ReadMapLoader::new(TdatReader { path: c.data.clone(), seed: c.seed, ram, d4_all: c.d4_all }, mapper, c.threads.min(255) as u8);
     let (out, threads, ema_d, guard, holdout) = (c.out.clone(), c.threads, c.ema, c.guard, c.holdout);
     let (patience, min_delta) = (c.patience, c.min_delta);
     let (plateau, lr_factor, max_drops) = (c.plateau, c.lr_factor, c.max_drops);
@@ -330,9 +362,10 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     let mut drops = 0usize;
     // D1553 epoch rule: batches since the last val gain >= min_delta, and how many flat epochs already halved the LR
     let epoch_rule = c.epoch_rule;
-    let epoch_batches = if epoch_rule { Tdat::open(&c.data)?.rows.div_ceil(c.bs).max(1) } else { 0 };
+    let d4_mult = if c.d4_all { mapper::MODES } else { 1 };
+    let epoch_batches = if epoch_rule { (Tdat::open(&c.data)?.rows * d4_mult).div_ceil(c.bs).max(1) } else { 0 };
     if epoch_rule {
-        println!("[epoch rule] LAWS C15/D5 (D1553): 1 epoch = {epoch_batches} batches of {} ({} rows); STOP after 4 epochs without a val gain >= {:e}", c.bs, epoch_batches * c.bs, c.min_delta);
+        println!("[epoch rule] LAWS C15/D5 (D1553/D1631): 1 epoch = {epoch_batches} batches of {} ({} augmented rows, {}x D4); STOP after 4 epochs without a val gain >= {:e}", c.bs, epoch_batches * c.bs, d4_mult, c.min_delta);
     }
     let mut batches_flat = 0usize;
     let mut flat_epochs_done = 0usize;
