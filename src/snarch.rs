@@ -960,6 +960,13 @@ fn zx_mean_sq(m: &Model, set: &[Sample]) -> Vec<f64> {
 }
 
 fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, seed: u64) -> Vec<Sample> {
+    let cap = ((rows.len() as f64 * 46.0 / every.max(1) as f64) as usize) + 1024;
+    let mut dest = Vec::with_capacity(cap);
+    build_samples_at(rows, 0, big, every, threads, seed, &mut dest);
+    dest
+}
+
+fn build_samples_at(rows: &[Rec], base_gi: usize, big: &TrainableNet, every: u64, threads: usize, seed: u64, dest: &mut Vec<Sample>) {
     let part = (rows.len() + threads - 1) / threads.max(1);
     let parts: Vec<Vec<Sample>> = std::thread::scope(|sc| {
         let hs: Vec<_> = rows
@@ -967,11 +974,11 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
             .enumerate()
             .map(|(ti, chunk)| {
                 sc.spawn(move || {
-                    let mut out = Vec::new();
+                    let mut out = Vec::with_capacity((chunk.len() as f64 * 46.0 / every.max(1) as f64) as usize + 64);
                     for (li, r) in chunk.iter().enumerate() {
                         // D845: the D4 mode depends only on (seed, global row index), not on the thread split, so every
                         // machine and every --threads value builds the SAME samples (checked by the sample checksum)
-                        let gi = (ti * part + li) as u64;
+                        let gi = (base_gi + ti * part + li) as u64;
                         let mut rng = Rng((seed ^ (gi + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
                         rng.next();
                         let mode = (rng.next() % mapper::MODES as u64) as usize;
@@ -1038,7 +1045,32 @@ fn build_samples(rows: &[Rec], big: &TrainableNet, every: u64, threads: usize, s
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    parts.into_iter().flatten().collect()
+    for p in parts {
+        dest.extend(p);
+    }
+}
+
+fn build_samples_stream(tr: &mut Tdat, rows: usize, big: &TrainableNet, every: u64, threads: usize, seed: u64) -> Result<(usize, Vec<Sample>), String> {
+    const BLOCK: usize = 1024;
+    const BATCH_BLOCKS: usize = 56;
+    let blocks = (rows / BLOCK).max(1);
+    let nblk = tr.rows / BLOCK;
+    let total_blocks = blocks.min(nblk.max(1));
+    let trows_len = total_blocks * BLOCK;
+    let cap = ((trows_len as f64 * 46.0 / every.max(1) as f64) as usize) + 65536;
+    let mut dest = Vec::with_capacity(cap);
+    let mut chunk = Vec::with_capacity(BATCH_BLOCKS * BLOCK);
+    let mut b0 = 0usize;
+    while b0 < total_blocks {
+        let b1 = (b0 + BATCH_BLOCKS).min(total_blocks);
+        chunk.clear();
+        for i in b0..b1 {
+            tr.read_block((i * nblk / blocks) * BLOCK, BLOCK, &mut chunk)?;
+        }
+        build_samples_at(&chunk, b0 * BLOCK, big, every, threads, seed, &mut dest);
+        b0 = b1;
+    }
+    Ok((trows_len, dest))
 }
 
 /// Row updates per child when the child accumulator is built from the parent's (the engine's way, smallnet.rs
@@ -1666,8 +1698,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut tr = Tdat::open(&train_stem)?;
     let rows = crate::trainer::whole_rows_or_experiment("snarch", &tr, rows_req, &experiment, &save_dir.clone().unwrap_or_default(), every, std::mem::size_of::<Sample>())?;
     let mut va = Tdat::open(&val_stem)?;
-    let trows = load_val(&mut tr, rows)?;
-    let mut train = build_samples(&trows, &big, every, threads, data_seed);
+    let (trows_len, mut train) = build_samples_stream(&mut tr, rows, &big, every, threads, data_seed)?;
     // D845: val split BY POSITION (alternating 1024-row blocks), so all children of one parent sit in one half
     let vrows = load_val(&mut va, val_rows)?;
     let (mut ra, mut rb) = (Vec::new(), Vec::new());
@@ -1679,7 +1710,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let pin_txt = format!("pinball to SATURATION on {} of val half A (patience {}, {} lr decays x{}, min gain {:.3}%, NO epoch limit)", if sat.on_slack { "slack@tau" } else { "val_pin" }, sat.patience, sat.max_decays, sat.decay, 100.0 * sat.min_rel);
     println!(
         "[snarch] big net {net_path}; rows {} -> train {} children (checksum {:016x}); val rows {} + {} -> A {} children ({:016x}), B {} children ({:016x}); {:.0}s",
-        trows.len(),
+        trows_len,
         train.len(),
         checksum(&train),
         ra.len(),
@@ -1725,7 +1756,7 @@ fn run(args: &[String]) -> Result<(), String> {
         for &lr in &lrs {
             for &seed in &seeds {
                 let lr = lr as f32;
-                let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), ext.suffix(), trows.len());
+                let tag = format!("{}{}_lr{lr:.0e}_s{seed}_r{}", arch.name(), ext.suffix(), trows_len);
                 if ext.zx > 0 && (arch != Arch::W2 || ext.h1) {
                     return Err("the +zx head needs the plain w2 rows (no +h1)".into());
                 }
