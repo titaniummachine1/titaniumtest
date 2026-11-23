@@ -351,21 +351,28 @@ pub enum FitEnd {
     Stopped(String),
 }
 
-/// LAWS C15 (D868): no epoch limit. Trains until `patience` consecutive epochs bring no val gain (relative 1e-4), lr
-/// lr0 * 0.85^epoch (floor 2% of lr0); the best epoch's weights are kept.
+/// LAWS C15 + LAWS D5 (user D812, D1553, D1554): Schedule-Free AdamW (Defazio et al. 2024, evaluated on averaged
+/// weights x, no LR decay schedule) stopping ONLY when `patience` (4) consecutive epochs of data bring no validation
+/// loss improvement >= 1e-5 (the 5th decimal place). The best epoch's weights are kept.
 /// LAWS A14: every epoch writes a resumable checkpoint, every new best writes the best blob, a stop file (run dir STOP or
 /// STOP_ALL) is checked before every batch: the exact state (inside the epoch) is saved and the fit returns `Stopped`.
 /// The epoch's sample order is a pure function of (seed, epoch), so a resume replays it and skips the batches done.
 #[allow(clippy::too_many_arguments)]
 fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str, ck: &Ck) -> Result<FitEnd, String> {
     let batch = 16384usize;
-    let mut m = vec![0f32; NP];
-    let mut v = vec![0f32; NP];
+    let warmup = 200usize;
+    let mut zz = net.p.clone();
+    let mut xx = net.p.clone();
+    let mut vv = vec![0f32; NP];
+    let mut muon_m = vec![0f32; O_L1B - O_L1W];
+    let mut sum_lr2 = 0f64;
     let mut step = 0usize;
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; NP]).collect();
-    let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    let mut best = (val_objective(net, val, tau), net.p.clone(), 0usize);
-    println!("[smallnet] {tag} start: val objective {:.6}", best.0);
+    let (b1, b2, eps, mu_mom) = (0.9f32, 0.999f32, 1e-8f32, 0.95f32);
+    let val0 = val_objective(net, val, tau);
+    let mut best = (val0, xx.clone(), 0usize);
+    let mut best_saved = val0;
+    println!("[smallnet] {tag} start (Muon+SF-AdamW, patience {patience}, min gain >= 1e-5, NO lr decay): val objective {:.6}", best.0);
     if !ck.resume {
         // a best snapshot exists from the first second on (the init), however short the run (LAWS A14)
         crate::stopctl::write_atomic(&ck.best, &net.to_bytes())?;
@@ -375,8 +382,8 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
     if ck.resume {
         let d = std::fs::read(&ck.state).map_err(|e| format!("--resume: {}: {e}", ck.state))?;
         let mut r = crate::stopctl::Rd::new(&d);
-        if r.str()? != "SNCK1" || r.str()? != tag {
-            return Err(format!("{}: not a smallnet {tag} checkpoint", ck.state));
+        if r.str()? != "SNCK2" || r.str()? != tag {
+            return Err(format!("{}: not a Muon+SF smallnet {tag} checkpoint", ck.state));
         }
         let sum = r.u64()?;
         if sum != ck.data_sum {
@@ -385,24 +392,33 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
         ep0 = r.u64()? as usize;
         chunk0 = r.u64()? as usize;
         step = r.u64()? as usize;
+        sum_lr2 = r.f64()?;
         bad = r.u64()? as usize;
         loss0 = r.f64()?;
         best.0 = r.f64()?;
+        best_saved = r.f64()?;
         best.2 = r.u64()? as usize;
         best.1 = r.f32s()?;
-        net.p = r.f32s()?;
-        m = r.f32s()?;
-        v = r.f32s()?;
-        println!("[smallnet] {tag} RESUMED from {}: epoch {} batch {chunk0}, best epoch {} = {:.6}", ck.state, ep0 + 1, best.2, best.0);
+        zz = r.f32s()?;
+        xx = r.f32s()?;
+        vv = r.f32s()?;
+        muon_m = r.f32s()?;
+        for k in 0..NP {
+            net.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+        }
+        println!("[smallnet] {tag} RESUMED (Muon+SF-AdamW) from {}: epoch {} batch {chunk0}, best epoch {} = {:.6}", ck.state, ep0 + 1, best.2, best.0);
     }
-    let save_state = |ep: usize, chunk: usize, step: usize, bad: usize, loss: f64, best: &(f64, Vec<f32>, usize), p: &[f32], m: &[f32], v: &[f32]| -> Result<(), String> {
+    #[allow(clippy::too_many_arguments)]
+    let save_state = |ep: usize, chunk: usize, step: usize, sum_lr2: f64, bad: usize, loss: f64, best: &(f64, Vec<f32>, usize), best_saved: f64, zz: &[f32], xx: &[f32], vv: &[f32], muon_m: &[f32]| -> Result<(), String> {
         let mut w = crate::stopctl::Wr::default();
-        w.str("SNCK1").str(tag).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).u64(bad as u64).f64(loss).f64(best.0).u64(best.2 as u64).f32s(&best.1).f32s(p).f32s(m).f32s(v);
+        w.str("SNCK2").str(tag).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).f64(sum_lr2).u64(bad as u64).f64(loss).f64(best.0).f64(best_saved).u64(best.2 as u64).f32s(&best.1).f32s(zz).f32s(xx).f32s(vv).f32s(muon_m);
         crate::stopctl::write_atomic(&ck.state, &w.0)
     };
     for ep in ep0.. {
         let t0 = Instant::now();
-        let lr = lr0 * 0.85f32.powi(ep as i32).max(0.02);
+        for k in 0..NP {
+            net.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+        }
         let mut idx: Vec<u32> = (0..train.len() as u32).collect();
         let mut rng = Rng((seed ^ (ep as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
         for i in (1..idx.len()).rev() {
@@ -416,12 +432,13 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
                 break;
             }
             if let Some(f) = crate::stopctl::requested(Some(&ck.run_dir)) {
-                save_state(ep, ci, step, bad, loss_sum, &best, &net.p, &m, &v)?;
+                save_state(ep, ci, step, sum_lr2, bad, loss_sum, &best, best_saved, &zz, &xx, &vv, &muon_m)?;
                 println!("[smallnet] {tag} STOPPED by {f} at epoch {} batch {ci}: state saved to {}, best so far (epoch {}) in {}; continue with the same command + --resume", ep + 1, ck.state, best.2, ck.best);
                 net.p = best.1.clone();
                 return Ok(FitEnd::Stopped(f));
             }
             step += 1;
+            let lr = if step <= warmup { lr0 * (step as f32 / warmup as f32) } else { lr0 };
             let per = (chunk.len() + threads - 1) / threads;
             let netr = &*net;
             let ls: Vec<f64> = std::thread::scope(|sc| {
@@ -461,29 +478,72 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
             });
             loss_sum += ls.iter().sum::<f64>();
             let used = chunk.chunks(per).count();
-            let bc1 = 1.0 - b1.powi(step as i32);
-            let bc2 = 1.0 - b2.powi(step as i32);
+            let bc2 = 1.0 - b2.powi((step.min(i32::MAX as usize)) as i32);
+            sum_lr2 += (lr as f64) * (lr as f64);
+            let c = ((lr as f64) * (lr as f64) / sum_lr2) as f32;
+            // Muon (Nesterov + NS5) on the NB phase-bucket H x D2 hidden matrices
+            let blk = H * D2;
+            let scale = ((H as f32) / (D2 as f32)).max(1.0).sqrt();
+            let mut u = vec![0f32; blk];
+            for bk in 0..NB {
+                let lo = bk * blk;
+                let off = O_L1W + lo;
+                let mut any = false;
+                for i in 0..blk {
+                    let mut gk = 0f32;
+                    for g in grads.iter().take(used) {
+                        gk += g[off + i];
+                    }
+                    gk /= used as f32;
+                    any |= gk != 0.0 || muon_m[lo + i] != 0.0;
+                    let mm = mu_mom * muon_m[lo + i] + gk;
+                    muon_m[lo + i] = mm;
+                    u[i] = gk + mu_mom * mm;
+                }
+                if any {
+                    let o = crate::train::newton_schulz5(&u, H, D2);
+                    for i in 0..blk {
+                        zz[off + i] -= lr * scale * o[i];
+                    }
+                }
+            }
             for k in 0..NP {
+                if (O_L1W..O_L1B).contains(&k) {
+                    xx[k] += c * (zz[k] - xx[k]);
+                    net.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+                    continue;
+                }
                 let mut gk = 0f32;
                 for g in grads.iter().take(used) {
                     gk += g[k];
                 }
                 gk /= used as f32;
-                m[k] = b1 * m[k] + (1.0 - b1) * gk;
-                v[k] = b2 * v[k] + (1.0 - b2) * gk * gk;
-                net.p[k] -= lr * (m[k] / bc1) / ((v[k] / bc2).sqrt() + eps);
+                if gk != 0.0 {
+                    vv[k] = b2 * vv[k] + (1.0 - b2) * gk * gk;
+                    zz[k] -= lr * gk / ((vv[k] / bc2).sqrt() + eps);
+                }
+                xx[k] += c * (zz[k] - xx[k]);
+                net.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
             }
         }
+        // LAWS D5 (D1554): evaluate and save the averaged iterate x
+        net.p.copy_from_slice(&xx);
         let r = report(net, val);
         let obj = val_objective(net, val, tau);
-        let gain = obj < best.0 * (1.0 - 1e-4);
+        if obj < best_saved {
+            best_saved = obj;
+            best.1.clone_from(&xx);
+            // the best weights as an engine blob, the moment they improve (LAWS A14)
+            crate::stopctl::write_atomic(&ck.best, &net.to_bytes())?;
+        }
+        let gain = obj <= best.0 - 1e-5;
         println!(
-            "[smallnet] {tag} epoch {} lr {:.5} loss {:.5} | val objective {:.6}{} | val RMSE {:.1} cp, P(bound>truth) {:.2}% (end {:.2}%), slack {:.1} cp | {:.0}s",
+            "[smallnet] {tag} epoch {} lr {:.2e} loss {:.5} | val objective {:.6}{} | val RMSE {:.1} cp, P(bound>truth) {:.2}% (end {:.2}%), slack {:.1} cp | {:.0}s",
             ep + 1,
-            lr,
+            lr0,
             loss_sum / (train.len() as f64),
             obj,
-            if gain { " (best)" } else { "" },
+            if gain { " (best >=1e-5)" } else { "" },
             r.rmse_cp,
             100.0 * r.viol,
             100.0 * r.viol_end,
@@ -491,16 +551,15 @@ fn fit(net: &mut Net, train: &[Sample], val: &[Sample], patience: usize, tau: Op
             t0.elapsed().as_secs_f64()
         );
         if gain {
-            best = (obj, net.p.clone(), ep + 1);
+            best.0 = obj;
+            best.2 = ep + 1;
             bad = 0;
-            // the best weights as an engine blob, the moment they improve (LAWS A14)
-            crate::stopctl::write_atomic(&ck.best, &net.to_bytes())?;
         } else {
             bad += 1;
         }
-        save_state(ep + 1, 0, step, bad, 0.0, &best, &net.p, &m, &v)?;
+        save_state(ep + 1, 0, step, sum_lr2, bad, 0.0, &best, best_saved, &zz, &xx, &vv, &muon_m)?;
         if bad >= patience {
-            println!("[smallnet] {tag} saturated: {patience} epochs without a val gain, best epoch {}", best.2);
+            println!("[smallnet] {tag} SATURATED (LAWS C15, D1553/D1554): {patience} epochs without a val gain >= 1e-5, best epoch {} = {:.6} (best_saved {best_saved:.6})", best.2, best.0);
             break;
         }
     }
@@ -544,9 +603,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let rows_req = flag("--rows").map(|x| x.parse::<usize>().map_err(|e| format!("--rows {x}: {e}"))).transpose()?;
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
-    // LAWS C15 (D868): no epoch limit of any size; every phase stops only by saturation (--patience epochs, default 4)
+    // LAWS C15 (D868/D1553): no epoch limit of any size; standard runs always stop only after 4 epochs without a val gain >= 1e-5
     if args.iter().any(|a| a == "--epochs-mse" || a == "--epochs-pin" || a == "--max-epochs") {
         return Err("--epochs-mse / --epochs-pin / --max-epochs are forbidden (LAWS C15: train to saturation)".into());
+    }
+    if experiment.is_none() && args.iter().any(|a| a == "--patience") {
+        return Err("--patience on standard runs is forbidden (LAWS C15: always 4 epochs without val gain >= 1e-5); use --experiment NAME".into());
     }
     let patience = (num("--patience", 4.0) as usize).max(1);
     let tau = num("--tau", 0.02) as f32;

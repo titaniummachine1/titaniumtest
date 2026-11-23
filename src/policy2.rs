@@ -603,6 +603,81 @@ fn ckpt_read(path: &str) -> Option<((u32, i32, f64, u32, u32), Vec<Vec<f32>>)> {
     Some((hdr, vs))
 }
 
+fn ckpt2_bytes(hdr: (u32, i32, f64, f64, f64, u32, u32), vs: [&[f32]; 16], ls: [&[f64]; 2]) -> Vec<u8> {
+    let mut o = b"PCK2".to_vec();
+    o.extend_from_slice(&hdr.0.to_le_bytes());
+    o.extend_from_slice(&hdr.1.to_le_bytes());
+    o.extend_from_slice(&hdr.2.to_le_bytes());
+    o.extend_from_slice(&hdr.3.to_le_bytes());
+    o.extend_from_slice(&hdr.4.to_le_bytes());
+    o.extend_from_slice(&hdr.5.to_le_bytes());
+    o.extend_from_slice(&hdr.6.to_le_bytes());
+    for v in vs {
+        o.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    for v in ls {
+        o.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    o
+}
+
+#[allow(clippy::type_complexity)]
+fn ckpt2_read(path: &str) -> Option<((u32, i32, f64, f64, f64, u32, u32), Vec<Vec<f32>>, Vec<Vec<f64>>)> {
+    let d = fs::read(path).ok()?;
+    if d.len() < 44 || &d[0..4] != b"PCK2" {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let f64_at = |o: usize| f64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let hdr = (
+        u32_at(4),
+        i32::from_le_bytes(d[8..12].try_into().unwrap()),
+        f64_at(12),
+        f64_at(20),
+        f64_at(28),
+        u32_at(36),
+        u32_at(40),
+    );
+    let mut off = 44;
+    let mut vs = Vec::new();
+    for _ in 0..16 {
+        let n = u64::from_le_bytes(d.get(off..off + 8)?.try_into().unwrap()) as usize;
+        off += 8;
+        let b = d.get(off..off + 4 * n)?;
+        vs.push(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
+        off += 4 * n;
+    }
+    let mut ls = Vec::new();
+    for _ in 0..2 {
+        let n = u64::from_le_bytes(d.get(off..off + 8)?.try_into().unwrap()) as usize;
+        off += 8;
+        let b = d.get(off..off + 8 * n)?;
+        ls.push(b.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect());
+        off += 8 * n;
+    }
+    Some((hdr, vs, ls))
+}
+
+fn sync_sparse(tab: &mut [f32], z: &[f32], x: &mut [f32], last_s: &mut [f64], s_now: f64, b1: f32, eval_mode: bool) {
+    if s_now <= 0.0 {
+        return;
+    }
+    for k in 0..tab.len() {
+        if last_s[k] < s_now {
+            let a = (last_s[k] / s_now) as f32;
+            x[k] = z[k] + a * (x[k] - z[k]);
+            last_s[k] = s_now;
+        }
+        tab[k] = if eval_mode { x[k] } else { (1.0 - b1) * z[k] + b1 * x[k] };
+    }
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(net_path) = arg(args, "--net") else {
         eprintln!("usage: ti policy2 --net NET.tnn --games a.tgam|a.jsonl[,..] [--kata DIR[,DIR]] --pat k3c [--init POL.bin] --out-bin OUT.bin [--lr 0.003] [--pat-lr 0.01] [--kata-w 1] [--games-w 1] [--patience 4] [--max-samples N]");
@@ -615,7 +690,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let use_pat = pat_kind == "k3" || pat_kind == "k3c";
     let k3c = pat_kind == "k3c";
     let (nd_slots, no_slots) = if k3c { (18usize, 9usize) } else { (SLOTS, 49usize) };
-    // LAWS C15 (user D868): no epoch limit of any size; the run stops only by saturation (--patience epochs without a gain)
+    // LAWS C15 / D5 (D1553/D1554): Schedule-Free AdamW, no epoch limit, stop only after 4 epochs without val gain >= 1e-5
     if args.iter().any(|a| a == "--max-epochs") {
         eprintln!("--max-epochs is forbidden (LAWS C15, user D868: no epoch limit; every run trains to saturation)");
         return ExitCode::from(2);
@@ -624,8 +699,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let pat_lr: f32 = arg(args, "--pat-lr").and_then(|v| v.parse().ok()).unwrap_or(0.01);
     let kata_w: f32 = arg(args, "--kata-w").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let games_w: f32 = arg(args, "--games-w").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    // C15 saturation: stop after `patience` consecutive epochs without a val gain (default 4 = "4 more epochs change nothing")
-    let patience: usize = arg(args, "--patience").and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+    // C15 saturation: stop after 4 consecutive epochs without a val gain >= 1e-5
+    let patience_arg = arg(args, "--patience");
+    let patience: usize = patience_arg.as_deref().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
     let max_samples: usize = arg(args, "--max-samples").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // D528: default 6 of the 8 hardware threads (the PC stays usable); Kata TRAIN files are streamed, never all in RAM
     let threads: usize = arg(args, "--threads").and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
@@ -636,6 +712,10 @@ pub fn run(args: &[String]) -> ExitCode {
     // (main 0120fd12 reads TPOL3/TPOL5 only and has no SEE term at all; a SEE / ring / k3 / table-less head is either
     // refused on load or played with an input it never trained on, D891).
     let exp = crate::genguard::experiment(args);
+    if exp.is_none() && patience_arg.is_some() {
+        eprintln!("--patience on standard policy2 runs is forbidden (LAWS C15: always 4 epochs without val gain >= 1e-5); use --experiment NAME");
+        return ExitCode::from(2);
+    }
     crate::genguard::announce("policy2", &exp);
     let out_bin_path = arg(args, "--out-bin").unwrap_or_default();
     if let Err(e) = crate::genguard::check_inputs("policy2", &exp, files.iter().map(String::as_str))
@@ -1054,15 +1134,19 @@ pub fn run(args: &[String]) -> ExitCode {
         match stop_on.as_str() { "kata" => kce, "games" => gce, _ => gce + kce }
     };
     let mut best = (score(&r0), bias.clone(), g.clone(), td.clone(), tor.clone(), 0usize);
+    let mut best_saved = best.0;
 
-    // Adam (dense on bias/g, lazy sparse on the tables)
+    // Schedule-Free AdamW (Defazio et al. 2024, LAWS D5 / D1554): dense on bias/g, exact lazy sparse catch-up on td/tor
     let mut tr: Vec<u32> = (0..ss.len() as u32).filter(|&i| !ss[i as usize].val && ss[i as usize].kind == 0).collect();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-    let (mut mb, mut vb, mut mg, mut vg) = (vec![0f32; bias.len()], vec![0f32; bias.len()], vec![0f32; g.len()], vec![0f32; g.len()]);
-    let (mut mtd, mut vtd, mut mto, mut vto) = (vec![0f32; td.len()], vec![0f32; td.len()], vec![0f32; tor.len()], vec![0f32; tor.len()]);
+    let (mut zb, mut xb, mut vb) = (bias.clone(), bias.clone(), vec![0f32; bias.len()]);
+    let (mut zg, mut xg, mut vg) = (g.clone(), g.clone(), vec![0f32; g.len()]);
+    let (mut ztd, mut xtd, mut vtd, mut s_td) = (td.clone(), td.clone(), vec![0f32; td.len()], vec![0f64; td.len()]);
+    let (mut zto, mut xto, mut vto, mut s_to) = (tor.clone(), tor.clone(), vec![0f32; tor.len()], vec![0f64; tor.len()]);
     let (mut gtd, mut gto) = (vec![0f32; td.len()], vec![0f32; tor.len()]);
     let (mut touched, mut touched_o): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     let mut t = 0i32;
+    let mut sum_lr2 = 0f64;
     let bs = 256usize;
     let mut bad_epochs = 0usize;
     let _z: Vec<f32> = Vec::new();
@@ -1085,27 +1169,31 @@ pub fn run(args: &[String]) -> ExitCode {
     let stop_path = out_bin.as_ref().map(|p| format!("{p}.stop"));
     let mut ep0 = 0usize;
     if args.iter().any(|a| a == "--resume") {
-        match ckpt_path.as_deref().and_then(ckpt_read) {
-            Some((h, vs)) if vs[0].len() == bias.len() && vs[1].len() == g.len() && vs[2].len() == td.len() && vs[3].len() == tor.len() => {
-                bias.copy_from_slice(&vs[0]);
-                g.copy_from_slice(&vs[1]);
-                td.copy_from_slice(&vs[2]);
-                tor.copy_from_slice(&vs[3]);
-                mb.copy_from_slice(&vs[4]);
-                vb.copy_from_slice(&vs[5]);
-                mg.copy_from_slice(&vs[6]);
-                vg.copy_from_slice(&vs[7]);
-                mtd.copy_from_slice(&vs[8]);
-                vtd.copy_from_slice(&vs[9]);
-                mto.copy_from_slice(&vs[10]);
+        match ckpt_path.as_deref().and_then(ckpt2_read) {
+            Some((h, vs, ls)) if vs[0].len() == bias.len() && vs[3].len() == g.len() && vs[6].len() == td.len() && vs[9].len() == tor.len() => {
+                zb.copy_from_slice(&vs[0]);
+                xb.copy_from_slice(&vs[1]);
+                vb.copy_from_slice(&vs[2]);
+                zg.copy_from_slice(&vs[3]);
+                xg.copy_from_slice(&vs[4]);
+                vg.copy_from_slice(&vs[5]);
+                ztd.copy_from_slice(&vs[6]);
+                xtd.copy_from_slice(&vs[7]);
+                vtd.copy_from_slice(&vs[8]);
+                zto.copy_from_slice(&vs[9]);
+                xto.copy_from_slice(&vs[10]);
                 vto.copy_from_slice(&vs[11]);
-                best = (h.2, vs[12].clone(), vs[13].clone(), vs[14].clone(), vs[15].clone(), h.3 as usize);
+                best = (h.3, vs[12].clone(), vs[13].clone(), vs[14].clone(), vs[15].clone(), h.5 as usize);
+                best_saved = h.4;
+                s_td.copy_from_slice(&ls[0]);
+                s_to.copy_from_slice(&ls[1]);
                 ep0 = h.0 as usize;
                 t = h.1;
-                bad_epochs = h.4 as usize;
-                println!("resumed from {} at epoch {} (best epoch {}, score {:.4})", ckpt_path.as_deref().unwrap_or(""), ep0 + 1, best.5, best.0);
+                sum_lr2 = h.2;
+                bad_epochs = h.6 as usize;
+                println!("resumed (SF-AdamW) from {} at epoch {} (best epoch {}, score {:.6})", ckpt_path.as_deref().unwrap_or(""), ep0 + 1, best.5, best.0);
             }
-            _ => println!("--resume: no usable checkpoint, starting fresh"),
+            _ => println!("--resume: no usable PCK2 checkpoint, starting fresh"),
         }
     }
     if ep0 == 0 {
@@ -1115,9 +1203,16 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    println!("[policy2] Schedule-Free AdamW (D1554, lr {lr0}, pat_lr {pat_lr}, eval on x, NO lr decay) to SATURATION (LAWS C15: patience {patience} epochs, min gain >= 1e-5)");
     let mut abort: Option<String> = None;
     for ep in ep0.. {
-        let lr = lr0 * (0.85f32).powi(ep as i32);
+        // Gradients evaluate at y = (1 - b1)*z + b1*x
+        for ((y, &z), &xx) in bias.iter_mut().zip(&zb).zip(&xb) { *y = (1.0 - b1) * z + b1 * xx; }
+        for ((y, &z), &xx) in g.iter_mut().zip(&zg).zip(&xg) { *y = (1.0 - b1) * z + b1 * xx; }
+        if use_pat {
+            for ((y, &z), &xx) in td.iter_mut().zip(&ztd).zip(&xtd) { *y = (1.0 - b1) * z + b1 * xx; }
+            for ((y, &z), &xx) in tor.iter_mut().zip(&zto).zip(&xto) { *y = (1.0 - b1) * z + b1 * xx; }
+        }
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ (ep as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         for i in (1..tr.len()).rev() {
             x ^= x << 13;
@@ -1250,7 +1345,13 @@ pub fn run(args: &[String]) -> ExitCode {
                     touched_o.append(&mut gr.touched_o);
                 }
                 t += 1;
-                let c1 = 1.0 - b1.powi(t);
+                let wf = if t <= 200 { t as f32 / 200.0 } else { 1.0 };
+                let lr = lr0 * wf;
+                let p_lr = pat_lr * wf;
+                let s_prev = sum_lr2;
+                let lr2 = (lr as f64) * (lr as f64);
+                sum_lr2 += lr2;
+                let c = if sum_lr2 > 0.0 { (lr2 / sum_lr2) as f32 } else { 1.0 };
                 let c2 = 1.0 - b2.powi(t);
                 // SAFETY: workers are parked at `start_b`; the main thread is the only accessor now
                 let (pbias, pg, ptd, ptor) = unsafe {
@@ -1261,25 +1362,41 @@ pub fn run(args: &[String]) -> ExitCode {
                         std::slice::from_raw_parts_mut(pp[3].0, pp[3].1),
                     )
                 };
-                for (p, gr, m, v) in [(pbias, &gb, &mut mb, &mut vb), (pg, &gg, &mut mg, &mut vg)] {
-                    for i in 0..p.len() {
-                        m[i] = b1 * m[i] + (1.0 - b1) * gr[i];
-                        v[i] = b2 * v[i] + (1.0 - b2) * gr[i] * gr[i];
-                        p[i] -= lr * (m[i] / c1) / ((v[i] / c2).sqrt() + eps);
+                for (y, z, x, gr, v) in [(pbias, &mut zb, &mut xb, &gb, &mut vb), (pg, &mut zg, &mut xg, &gg, &mut vg)] {
+                    for i in 0..y.len() {
+                        if gr[i] != 0.0 {
+                            v[i] = b2 * v[i] + (1.0 - b2) * gr[i] * gr[i];
+                            z[i] -= lr * gr[i] / ((v[i] / c2).sqrt() + eps);
+                        }
+                        x[i] += c * (z[i] - x[i]);
+                        y[i] = (1.0 - b1) * z[i] + b1 * x[i];
                     }
                 }
                 if use_pat {
-                    for (tab, gr, m, v, list) in [(ptd, &mut gtd, &mut mtd, &mut vtd, &mut touched), (ptor, &mut gto, &mut mto, &mut vto, &mut touched_o)] {
+                    for (tab, z, x, v, gr, ls, list) in [
+                        (&mut *ptd, &mut ztd, &mut xtd, &mut vtd, &mut gtd, &mut s_td, &mut touched),
+                        (&mut *ptor, &mut zto, &mut xto, &mut vto, &mut gto, &mut s_to, &mut touched_o),
+                    ] {
                         list.sort_unstable();
                         list.dedup();
                         for &k in list.iter() {
                             let k = k as usize;
-                            m[k] = b1 * m[k] + (1.0 - b1) * gr[k];
+                            if s_prev > 0.0 && ls[k] < s_prev {
+                                let a = (ls[k] / s_prev) as f32;
+                                x[k] = z[k] + a * (x[k] - z[k]);
+                            }
                             v[k] = b2 * v[k] + (1.0 - b2) * gr[k] * gr[k];
-                            tab[k] -= pat_lr * (lr / lr0) * (m[k] / c1) / ((v[k] / c2).sqrt() + eps);
+                            z[k] -= p_lr * gr[k] / ((v[k] / c2).sqrt() + eps);
+                            x[k] += c * (z[k] - x[k]);
+                            tab[k] = (1.0 - b1) * z[k] + b1 * x[k];
+                            ls[k] = sum_lr2;
                             gr[k] = 0.0;
                         }
                         list.clear();
+                    }
+                    if t % 512 == 0 {
+                        sync_sparse(ptd, &ztd, &mut xtd, &mut s_td, sum_lr2, b1, false);
+                        sync_sparse(ptor, &zto, &mut xto, &mut s_to, sum_lr2, b1, false);
                     }
                 }
                 if bi % 2000 == 1999 {
@@ -1304,30 +1421,45 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         eprintln!(" {} rows trained this epoch", rows_seen);
+        // LAWS D5 (D1554): evaluate, checkpoint and save on the averaged iterate x
+        bias.copy_from_slice(&xb);
+        g.copy_from_slice(&xg);
+        if use_pat {
+            sync_sparse(&mut td, &ztd, &mut xtd, &mut s_td, sum_lr2, b1, true);
+            sync_sparse(&mut tor, &zto, &mut xto, &mut s_to, sum_lr2, b1, true);
+        }
         let r = evaluate(&bias, &g, &td, &tor, &mut sc);
-        show(&format!("epoch {} lr {:.5} ({:.0} s)", ep + 1, lr, t0.elapsed().as_secs_f64()), &r);
+        show(&format!("epoch {} sf-lr {:.5} ({:.0} s)", ep + 1, lr0, t0.elapsed().as_secs_f64()), &r);
         let sc_now = score(&r);
         let mut stop = false;
-        if sc_now < best.0 - 0.0005 {
-            best = (sc_now, bias.clone(), g.clone(), td.clone(), tor.clone(), ep + 1);
-            bad_epochs = 0;
+        if sc_now < best_saved {
+            best_saved = sc_now;
+            best.1.clone_from(&xb);
+            best.2.clone_from(&xg);
+            best.3.clone_from(&xtd);
+            best.4.clone_from(&xto);
+            best.5 = ep + 1;
             if let Some(p) = &out_bin {
                 match write_atomic(p, &head_bytes(k3c, use_pat, [&best.1, &best.2, &best.3, &best.4])) {
-                    Ok(()) => println!("  saved best (epoch {}) -> {p}", ep + 1),
+                    Ok(()) => println!("  saved best (epoch {}, score {best_saved:.6}) -> {p}", ep + 1),
                     Err(e) => eprintln!("  {p}: {e}"),
                 }
             }
+        }
+        if sc_now <= best.0 - 1e-5 {
+            best.0 = sc_now;
+            bad_epochs = 0;
         } else {
             bad_epochs += 1;
             if bad_epochs >= patience {
-                println!("early stop: no val improvement for {} epochs (best epoch {})", bad_epochs, best.5);
+                println!("SATURATED (LAWS C15, D1553/D1554): {} epochs without val gain >= 1e-5 (best epoch {} = {:.6}, best_saved {best_saved:.6})", bad_epochs, best.5, best.0);
                 stop = true;
             }
         }
         if let Some(cp) = &ckpt_path {
-            let hdr = ((ep + 1) as u32, t, best.0, best.5 as u32, bad_epochs as u32);
-            let vs: [&[f32]; 16] = [&bias, &g, &td, &tor, &mb, &vb, &mg, &vg, &mtd, &vtd, &mto, &vto, &best.1, &best.2, &best.3, &best.4];
-            if let Err(e) = write_atomic(cp, &ckpt_bytes(hdr, vs)) {
+            let hdr = ((ep + 1) as u32, t, sum_lr2, best.0, best_saved, best.5 as u32, bad_epochs as u32);
+            let vs: [&[f32]; 16] = [&zb, &xb, &vb, &zg, &xg, &vg, &ztd, &xtd, &vtd, &zto, &xto, &vto, &best.1, &best.2, &best.3, &best.4];
+            if let Err(e) = write_atomic(cp, &ckpt2_bytes(hdr, vs, [&s_td, &s_to])) {
                 eprintln!("  {cp}: {e}");
             }
         }
@@ -1339,7 +1471,7 @@ pub fn run(args: &[String]) -> ExitCode {
             break;
         }
     }
-    println!("best epoch {} (val score {:.4}, --stop-on {})", best.5, best.0, stop_on);
+    println!("best epoch {} (val score {:.6}, --stop-on {})", best.5, best.0, stop_on);
     if let Some(p) = &out_bin {
         let o = head_bytes(k3c, use_pat, [&best.1, &best.2, &best.3, &best.4]);
         match write_atomic(p, &o) {

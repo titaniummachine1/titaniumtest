@@ -1110,6 +1110,8 @@ struct Report {
     a_slack: f64,
     /// val pinball on A (unshifted model, the training objective)
     a_pin: f64,
+    /// val MSE on A in (cp/400)^2 units (unshifted model, for MSE distillation objective)
+    a_mse: f64,
     /// on B with A's shift: mean slack, real violation rate, RMSE of the unshifted model
     b_slack: f64,
     b_viol: f64,
@@ -1135,6 +1137,14 @@ fn report(m: &Model, a: &[Sample], b: &[Sample], tau: f64) -> Report {
         .map(|&r| {
             let d = r / 400.0;
             if d > 0.0 { tau * d } else { (tau - 1.0) * d }
+        })
+        .sum::<f64>()
+        / na;
+    let a_mse = ra
+        .iter()
+        .map(|&r| {
+            let d = r / 400.0;
+            d * d
         })
         .sum::<f64>()
         / na;
@@ -1167,6 +1177,7 @@ fn report(m: &Model, a: &[Sample], b: &[Sample], tau: f64) -> Report {
     Report {
         a_slack,
         a_pin,
+        a_mse,
         b_slack,
         b_viol,
         b_rmse,
@@ -1200,17 +1211,13 @@ fn checksum(set: &[Sample]) -> u64 {
     h
 }
 
-/// Saturation rule (user definition, memory feedback-saturation-definition): train at a constant LR; when the val pinball loss
-/// has not improved by more than `min_rel` (relative) for `patience` epochs, multiply the LR by `decay`; after `max_decays`
-/// decays, stop once `patience` more epochs bring no improvement. The best epoch's weights are restored at the end.
+/// LAWS C15 + LAWS D5 (user D812, D1553, D1554): Schedule-Free AdamW (Defazio et al. 2024, evaluated on averaged
+/// weights x, no LR decay schedule) stopping ONLY when `patience` (4) consecutive epochs of data bring no validation
+/// loss improvement >= `min_gain` (1e-5, 5th decimal place) on val half A.
 #[derive(Clone, Copy)]
 struct Sat {
     patience: usize,
-    max_decays: usize,
-    decay: f32,
-    min_rel: f64,
-    /// D844: watch slack@tau (the compared number) instead of the val pinball loss
-    on_slack: bool,
+    min_gain: f64,
 }
 
 /// LAWS A14 (user D1305-D1307): one phase's checkpoint (full resumable state, every epoch + on STOP), best snapshot (SNAR,
@@ -1250,25 +1257,34 @@ fn save_params(m: &Model, p: &[f32], path: &str) -> Result<(), String> {
 fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: usize, tau: Option<f32>, lr0: f32, threads: usize, seed: u64, tag: &str, tau_r: f64, sat: Option<Sat>, ck: &Ck) -> Result<FitEnd, String> {
     let batch = 16384usize;
     let np = m.np;
-    let mut mm = vec![0f32; np];
+    let warmup = 200usize;
+    // Schedule-Free AdamW + Muon (MuonAdamW when !m.zx has H x D2 hidden matrices, else Schedule-Free AdamW):
+    // z = primary iterate, x = averaged iterate (validated & exported), y = (1 - b1)*z + b1*x in m.p during batches.
+    let use_muon = !m.zx;
+    let l1_end = if use_muon { m.o_l1b } else { m.o_l1w };
+    let mut zz = m.p.clone();
+    let mut xx = m.p.clone();
     let mut vv = vec![0f32; np];
+    let mut muon_m = vec![0f32; if use_muon { m.o_l1b - m.o_l1w } else { 0 }];
+    let mut sum_lr2 = 0f64;
     let mut step = 0usize;
     // LAWS C15 (user D868): a saturation run has NO epoch limit; it stops only by the saturation rule below. The fixed
     // count `epochs` applies only to the MSE warm start (sat = None), which initialises the pinball phase.
     let epochs = if sat.is_some() { usize::MAX } else { epochs };
-    let steps_total = if sat.is_some() { 1 } else { epochs * (train.len() / batch).max(1) };
-    let mut lr_cur = lr0;
-    let (mut best, mut best_ep, mut since, mut decays) = (f64::INFINITY, 0usize, 0usize, 0usize);
-    let mut best_p: Vec<f32> = Vec::new();
+    let r_init = report(m, va, vb, tau_r);
+    let val0 = if tau.is_some() { r_init.a_pin } else { r_init.a_mse };
+    let (mut best, mut best_saved, mut best_ep, mut since) = (val0, val0, 0usize, 0usize);
+    let mut best_p: Vec<f32> = xx.clone();
     let mut grads: Vec<Vec<f32>> = (0..threads).map(|_| vec![0f32; np]).collect();
-    let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+    let (b1, b2, eps, mu_mom) = (0.9f32, 0.999f32, 1e-8f32, 0.95f32);
+    let opt_tag = if use_muon { "Muon+SF-AdamW" } else { "SF-AdamW" };
     let (mut ep0, mut chunk0, mut loss0) = (0usize, 0usize, 0f64);
     if ck.resume && std::path::Path::new(&ck.state).exists() {
         let d = std::fs::read(&ck.state).map_err(|e| format!("{}: {e}", ck.state))?;
         let mut r = crate::stopctl::Rd::new(&d);
         let (magic, ctag, sum) = (r.str()?, r.str()?, r.u64()?);
-        if magic != "SACK1" || ctag != format!("{}/{tag}", m.name()) {
-            return Err(format!("{}: not a checkpoint of {}/{tag}", ck.state, m.name()));
+        if magic != "SACK2" || ctag != format!("{}/{tag}", m.name()) {
+            return Err(format!("{}: not a Muon+SF SACK2 checkpoint of {}/{tag}", ck.state, m.name()));
         }
         if sum != ck.data_sum {
             return Err(format!("{}: checkpoint samples {sum:016x} != this run {:016x} (other data / flags)", ck.state, ck.data_sum));
@@ -1276,29 +1292,46 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
         ep0 = r.u64()? as usize;
         chunk0 = r.u64()? as usize;
         step = r.u64()? as usize;
-        lr_cur = r.f64()? as f32;
+        sum_lr2 = r.f64()?;
         best = r.f64()?;
+        best_saved = r.f64()?;
         best_ep = r.u64()? as usize;
         since = r.u64()? as usize;
-        decays = r.u64()? as usize;
         loss0 = r.f64()?;
         best_p = r.f32s()?;
-        m.p = r.f32s()?;
-        mm = r.f32s()?;
+        zz = r.f32s()?;
+        xx = r.f32s()?;
         vv = r.f32s()?;
-        println!("[snarch] {} {tag} RESUMED from {}: epoch {} batch {chunk0}, lr {lr_cur:.2e}, best epoch {best_ep} = {best:.6}", m.name(), ck.state, ep0 + 1);
+        muon_m = r.f32s()?;
+        for k in 0..np {
+            m.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+        }
+        println!("[snarch] {} {tag} RESUMED ({opt_tag}) from {}: epoch {} batch {chunk0}, lr {lr0:.2e}, best epoch {best_ep} = {best:.6}", m.name(), ck.state, ep0 + 1);
     } else {
         // a best snapshot exists from the first second on (the start weights), however short the run (LAWS A14)
-        save_params(m, &m.p, &ck.best)?;
+        println!(
+            "[snarch] {} {tag} start ({opt_tag}): A val_loss {:.6} slack@tau {:.2} | B slack {:.2} viol {:.2}% RMSE {:.1}",
+            m.name(),
+            val0,
+            r_init.a_slack,
+            r_init.b_slack,
+            100.0 * r_init.b_viol,
+            r_init.b_rmse
+        );
+        save_params(m, &best_p, &ck.best)?;
     }
     #[allow(clippy::too_many_arguments)]
-    fn save_state(ck: &Ck, name: &str, tag: &str, ep: usize, chunk: usize, step: usize, lr: f32, best: f64, best_ep: usize, since: usize, decays: usize, loss: f64, best_p: &[f32], p: &[f32], mm: &[f32], vv: &[f32]) -> Result<(), String> {
+    fn save_state(ck: &Ck, name: &str, tag: &str, ep: usize, chunk: usize, step: usize, sum_lr2: f64, best: f64, best_saved: f64, best_ep: usize, since: usize, loss: f64, best_p: &[f32], zz: &[f32], xx: &[f32], vv: &[f32], muon_m: &[f32]) -> Result<(), String> {
         let mut w = crate::stopctl::Wr::default();
-        w.str("SACK1").str(&format!("{name}/{tag}")).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).f64(lr as f64).f64(best).u64(best_ep as u64).u64(since as u64).u64(decays as u64).f64(loss).f32s(best_p).f32s(p).f32s(mm).f32s(vv);
+        w.str("SACK2").str(&format!("{name}/{tag}")).u64(ck.data_sum).u64(ep as u64).u64(chunk as u64).u64(step as u64).f64(sum_lr2).f64(best).f64(best_saved).u64(best_ep as u64).u64(since as u64).f64(loss).f32s(best_p).f32s(zz).f32s(xx).f32s(vv).f32s(muon_m);
         crate::stopctl::write_atomic(&ck.state, &w.0)
     }
     for ep in ep0..epochs {
         let t0 = Instant::now();
+        // evaluate gradients at the interpolation point y = (1 - b1)*z + b1*x
+        for k in 0..np {
+            m.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+        }
         // the epoch's order is a pure function of (seed, epoch): a resume replays it and skips the batches done
         let mut idx: Vec<u32> = (0..train.len() as u32).collect();
         let mut rng = Rng((seed ^ (ep as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
@@ -1313,12 +1346,14 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
                 break;
             }
             if let Some(f) = crate::stopctl::requested(Some(&ck.run_dir)) {
-                save_state(ck, &m.name(), tag, ep, ci, step, lr_cur, best, best_ep, since, decays, loss_sum, &best_p, &m.p, &mm, &vv)?;
+                save_state(ck, &m.name(), tag, ep, ci, step, sum_lr2, best, best_saved, best_ep, since, loss_sum, &best_p, &zz, &xx, &vv, &muon_m)?;
                 println!("[snarch] {} {tag} STOPPED by {f} at epoch {} batch {ci}: state {} , best snapshot {} (epoch {best_ep}); the same command + --resume continues", m.name(), ep + 1, ck.state, ck.best);
+                m.p.copy_from_slice(&best_p);
                 return Ok(FitEnd::Stopped(f));
             }
             step += 1;
-            let lr = if sat.is_some() { lr_cur } else { lr0 * (0.05 + 0.95 * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / steps_total as f32).cos())) };
+            // Constant lr0 after linear warmup (D1554: Schedule-Free AdamW uses no decay schedule)
+            let lr = if step <= warmup { lr0 * (step as f32 / warmup as f32) } else { lr0 };
             let per = (chunk.len() + threads - 1) / threads;
             let mr = &*m;
             let ls: Vec<f64> = std::thread::scope(|sc| {
@@ -1358,30 +1393,69 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
             });
             loss_sum += ls.iter().sum::<f64>();
             let used = chunk.chunks(per).count();
-            let bc1 = 1.0 - b1.powi(step as i32);
-            let bc2 = 1.0 - b2.powi(step as i32);
+            let bc2 = 1.0 - b2.powi((step.min(i32::MAX as usize)) as i32);
+            sum_lr2 += (lr as f64) * (lr as f64);
+            let c = ((lr as f64) * (lr as f64) / sum_lr2) as f32;
+            if use_muon {
+                // Muon (Nesterov + NS5) on the H x D2 hidden matrix of each phase bucket
+                let blk = H * D2;
+                let scale = ((H as f32) / (D2 as f32)).max(1.0).sqrt();
+                let mut u = vec![0f32; blk];
+                for bk in 0..m.nb {
+                    let lo = bk * blk;
+                    let off = m.o_l1w + lo;
+                    let mut any = false;
+                    for i in 0..blk {
+                        let mut gk = 0f32;
+                        for g in grads.iter().take(used) {
+                            gk += g[off + i];
+                        }
+                        gk /= used as f32;
+                        any |= gk != 0.0 || muon_m[lo + i] != 0.0;
+                        let mm = mu_mom * muon_m[lo + i] + gk;
+                        muon_m[lo + i] = mm;
+                        u[i] = gk + mu_mom * mm;
+                    }
+                    if any {
+                        let o = crate::train::newton_schulz5(&u, H, D2);
+                        for i in 0..blk {
+                            zz[off + i] -= lr * scale * o[i];
+                        }
+                    }
+                }
+            }
             for k in 0..np {
+                if use_muon && k >= m.o_l1w && k < l1_end {
+                    xx[k] += c * (zz[k] - xx[k]);
+                    m.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
+                    continue;
+                }
                 let mut gk = 0f32;
                 for g in grads.iter().take(used) {
                     gk += g[k];
                 }
-                if gk == 0.0 && mm[k] == 0.0 {
-                    continue;
-                }
                 gk /= used as f32;
-                mm[k] = b1 * mm[k] + (1.0 - b1) * gk;
-                vv[k] = b2 * vv[k] + (1.0 - b2) * gk * gk;
-                m.p[k] -= lr * (mm[k] / bc1) / ((vv[k] / bc2).sqrt() + eps);
+                if gk != 0.0 {
+                    vv[k] = b2 * vv[k] + (1.0 - b2) * gk * gk;
+                    let vhat = vv[k] / bc2;
+                    zz[k] -= lr * gk / (vhat.sqrt() + eps);
+                }
+                xx[k] += c * (zz[k] - xx[k]);
+                m.p[k] = (1.0 - b1) * zz[k] + b1 * xx[k];
             }
         }
+        // LAWS D5 (D1554): under Schedule-Free AdamW, validation, checkpointing and export evaluate the averaged iterate x
+        m.p.copy_from_slice(&xx);
         let r = report(m, va, vb, tau_r);
+        let cur = if tau.is_some() { r.a_pin } else { r.a_mse };
         println!(
-            "[snarch] {} {tag} epoch {}/{} train {:.5} lr {:.2e} | A: slack@tau {:.2} pin {:.6} | B (A's shift {:+.1}): slack {:.2} viol {:.2}% (raw {:.2}%) RMSE {:.1} | {:.0}s",
+            "[snarch] {} {tag} epoch {}/{} train {:.5} lr {:.2e} | A: val_loss {:.6} slack@tau {:.2} pin {:.6} | B (A's shift {:+.1}): slack {:.2} viol {:.2}% (raw {:.2}%) RMSE {:.1} | {:.0}s",
             m.name(),
             ep + 1,
             if sat.is_some() { "sat".to_string() } else { epochs.to_string() },
             loss_sum / train.len() as f64,
-            if sat.is_some() { lr_cur } else { lr0 },
+            lr0,
+            cur,
             r.a_slack,
             r.a_pin,
             r.shift,
@@ -1392,44 +1466,38 @@ fn fit(m: &mut Model, train: &[Sample], va: &[Sample], vb: &[Sample], epochs: us
             t0.elapsed().as_secs_f64()
         );
         if let Some(s) = sat {
-            // D844/D845: select on half A only (B is never used for any decision)
-            let cur = if s.on_slack { r.a_slack } else { r.a_pin };
-            if cur < best * (1.0 - s.min_rel) {
+            // D845: select on half A only (B is never used for any decision)
+            // LAWS C15 (D1553): stop ONLY after `patience` (4) consecutive epochs without val_loss gain >= 1e-5
+            if cur < best_saved {
+                best_saved = cur;
+                best_p.clone_from(&xx);
+                save_params(m, &best_p, &ck.best)?;
+            }
+            if cur <= best - s.min_gain {
                 best = cur;
                 best_ep = ep + 1;
                 since = 0;
-                best_p.clone_from(&m.p);
-                save_params(m, &best_p, &ck.best)?;
             } else {
                 since += 1;
-                if cur < best {
-                    // a tiny gain still counts as the best weights, not as progress
-                    best = cur;
-                    best_ep = ep + 1;
-                    best_p.clone_from(&m.p);
-                    save_params(m, &best_p, &ck.best)?;
-                }
             }
-            let mut done = false;
-            if since >= s.patience {
-                if decays >= s.max_decays {
-                    println!("[snarch] {} {tag} SATURATED: {} epochs without a {:.3}% gain of {} at the final lr; best epoch {best_ep} = {best:.6}", m.name(), s.patience, 100.0 * s.min_rel, if s.on_slack { "slack@tau" } else { "val_pin" });
-                    done = true;
-                } else {
-                    decays += 1;
-                    lr_cur *= s.decay;
-                    since = 0;
-                    println!("[snarch] {} {tag} plateau: lr -> {lr_cur:.2e} (decay {decays}/{})", m.name(), s.max_decays);
-                }
+            let done = since >= s.patience;
+            if done {
+                println!(
+                    "[snarch] {} {tag} SATURATED (LAWS C15, D1553/D1554): {} epochs without val loss gain >= {:.0e}; best epoch {best_ep} = {best:.6} (best_saved {best_saved:.6})",
+                    m.name(),
+                    s.patience,
+                    s.min_gain
+                );
             }
-            save_state(ck, &m.name(), tag, ep + 1, 0, step, lr_cur, best, best_ep, since, decays, 0.0, &best_p, &m.p, &mm, &vv)?;
+            save_state(ck, &m.name(), tag, ep + 1, 0, step, sum_lr2, best, best_saved, best_ep, since, 0.0, &best_p, &zz, &xx, &vv, &muon_m)?;
             if done {
                 break;
             }
         } else {
-            // fixed warm start (no selection): the current weights are the phase's result so far
-            save_params(m, &m.p, &ck.best)?;
-            save_state(ck, &m.name(), tag, ep + 1, 0, step, lr_cur, best, best_ep, since, decays, 0.0, &best_p, &m.p, &mm, &vv)?;
+            // fixed warm start (no selection): the current averaged weights x are the phase's result so far
+            best_p.clone_from(&xx);
+            save_params(m, &best_p, &ck.best)?;
+            save_state(ck, &m.name(), tag, ep + 1, 0, step, sum_lr2, best, best_saved, best_ep, since, 0.0, &best_p, &zz, &xx, &vv, &muon_m)?;
         }
     }
     if sat.is_some() && !best_p.is_empty() {
@@ -1656,10 +1724,13 @@ fn run(args: &[String]) -> Result<(), String> {
     let val_rows = num("--val-rows", 60_000.0) as usize;
     let every = num("--child-every", 3.0) as u64;
     let e_mse = num("--epochs-mse", 4.0) as usize;
-    for banned in ["--max-epochs", "--epochs-pin", "--fixed"] {
+    for banned in ["--max-epochs", "--epochs-pin", "--fixed", "--max-decays", "--decay", "--min-rel", "--sat-metric"] {
         if args.iter().any(|a| a == banned) {
-            return Err(format!("{banned} is forbidden (LAWS C15, user D868: no epoch limit; every run trains to saturation)"));
+            return Err(format!("{banned} is forbidden (LAWS C15/D5, user D1553/D1554: Schedule-Free AdamW with no LR decay schedule, stop ONLY after 4 epochs without val loss gain >= 1e-5)"));
         }
+    }
+    if experiment.is_none() && (args.iter().any(|a| a == "--patience") || args.iter().any(|a| a == "--min-gain")) {
+        return Err("--patience / --min-gain on standard runs are forbidden (LAWS C15: always 4 epochs without val loss gain >= 1e-5); use --experiment NAME".into());
     }
     let tau = num("--tau", 0.02) as f32;
     // D845: lists, one model per (arch, lr, seed): --lr 1e-3,2e-3,4e-3 --seed 1,2
@@ -1671,13 +1742,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let threads = num("--threads", 8.0) as usize;
     // samples always come from seed 1 (D845: model seeds vary the init + shuffle only, never the data)
     let data_seed = num("--data-seed", 1.0) as u64;
-    // LAWS C15 (user D868): the pinball phase ALWAYS trains to saturation; there is no epoch limit and no fixed mode
+    // LAWS C15 / D5 (user D812, D1553, D1554): Schedule-Free AdamW, stop ONLY after 4 epochs without val loss gain >= 1e-5
     let sat = Sat {
-        patience: num("--patience", 4.0) as usize,
-        max_decays: num("--max-decays", 3.0) as usize,
-        decay: num("--decay", 0.3) as f32,
-        min_rel: num("--min-rel", 2e-4),
-        on_slack: flag("--sat-metric").map(|v| v != "pin").unwrap_or(true),
+        patience: (num("--patience", 4.0) as usize).max(1),
+        min_gain: num("--min-gain", 1e-5),
     };
     // LAWS A14 (user D1307): every run keeps its best snapshots + checkpoints in --save-dir; DIR/STOP (or
     // C:/gitProjects/STOP_ALL) stops it safely; the same command + --resume continues (finished arms / phases are skipped)
@@ -1707,7 +1775,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let mut val_a = build_samples(&ra, &big, (every / 2).max(1), threads, data_seed ^ 0x5555);
     let mut val_b = build_samples(&rb, &big, (every / 2).max(1), threads, data_seed ^ 0xAAAA);
-    let pin_txt = format!("pinball to SATURATION on {} of val half A (patience {}, {} lr decays x{}, min gain {:.3}%, NO epoch limit)", if sat.on_slack { "slack@tau" } else { "val_pin" }, sat.patience, sat.max_decays, sat.decay, 100.0 * sat.min_rel);
+    let pin_txt = format!(
+        "Muon + Schedule-Free AdamW (MuonAdamW, D1159/D1554) to SATURATION (LAWS C15: patience {} epochs, min val_loss gain >= {:.0e} [5th decimal], NO lr decay, NO epoch limit)",
+        sat.patience, sat.min_gain
+    );
     println!(
         "[snarch] big net {net_path}; rows {} -> train {} children (checksum {:016x}); val rows {} + {} -> A {} children ({:016x}), B {} children ({:016x}); {:.0}s",
         trows_len,

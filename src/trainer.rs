@@ -209,14 +209,19 @@ pub fn run_train(args: &[String]) -> ExitCode {
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
     if f("--backend").as_deref() == Some("cuda") {
-        // D1181: the GPU optimiser is Ranger; `--opt muon` = Muon on the dense hidden blocks + Ranger on the rest
-        if f("--opt").is_some_and(|o| o != "muon" && o != "sfadamw") {
-            return Err("--backend cuda: --opt takes muon or sfadamw (default = Ranger; adamw / muonadamw are the CPU backend)".into());
+        // LAWS D5 / D1159 / D1554 + LAWS A13: MuonAdamW (`--opt muon`) is the default GPU optimiser; `--opt sfadamw`
+        // (Schedule-Free AdamW) is supported; legacy `--opt ranger` requires `--experiment NAME`.
+        let opt_name = f("--opt").unwrap_or_else(|| "muon".into());
+        if !matches!(opt_name.as_str(), "muon" | "sfadamw" | "ranger") {
+            return Err("--backend cuda: --opt takes muon (default, MuonAdamW), sfadamw, or ranger (legacy, --experiment only)".into());
+        }
+        let exp = f("--experiment");
+        if exp.is_none() && opt_name == "ranger" {
+            return Err("--opt ranger is legacy/suboptimal and forbidden on the standard path (LAWS D5/A13: default is muon [MuonAdamW]; sfadamw also allowed); pass --experiment NAME".into());
         }
         // D1553/D1554 (user, LAWS C15 + D5): the run stops after 4 consecutive epochs of data without a val gain >= 1e-5; the LR
-        // comes from the optimiser (best adaptive method), never a hand rule: no step cap, no cosine horizon, no checkpoint patience, no
+        // comes from the optimiser, never a hand rule: no step cap, no cosine horizon, no checkpoint patience, no
         // 'stop after N drops'. Other schedules only with --experiment NAME (output under an experiments/ folder).
-        let exp = f("--experiment");
         let legacy: Vec<&str> = ["--patience", "--plateau", "--max-drops", "--lr-min", "--steps", "--min-delta"]
             .into_iter()
             .filter(|k| f(k).is_some())
@@ -232,6 +237,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 return Err(format!("--experiment {n}: --out must be under a folder named 'experiments'"));
             }
         }
+        #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
         let epoch_rule = exp.is_none();
         #[cfg(feature = "gpu")]
         {
@@ -271,8 +277,8 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 result_weight: targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?,
                 loss_weight: targets::parse_lw(f("--loss-weight-buckets"))?,
                 keep_all: crate::has_flag(args, "--keep-all"),
-                sf: f("--opt").as_deref() == Some("sfadamw"),
-                muon: if f("--opt").as_deref() == Some("muon") {
+                sf: opt_name == "sfadamw",
+                muon: if opt_name == "muon" {
                     Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
                 } else {
                     None
@@ -282,22 +288,35 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         #[cfg(not(feature = "gpu"))]
         return Err("this ti was built without --features cuda".into());
     }
-    // engine D427: the champion recipe (rwphase9 0.55/0.55/0.25) now also trains on the CPU backend
+    // engine D427: standard CPU trainer enforces MuonAdamW + LAWS C15 unless --experiment NAME under experiments/
+    let exp = f("--experiment");
     let result_weight: Option<targets::Rw> = targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
     let loss_weight: Option<targets::Rw> = targets::parse_lw(f("--loss-weight-buckets"))?;
     let data = f("--data").ok_or("--data <stem> required (ti data pack output)")?;
     let val_stem = f("--val").ok_or("--val <stem> required")?;
     let out = f("--out").ok_or("--out <dir> required")?;
+    let opt_kind = f("--opt").unwrap_or_else(|| "muonadamw".into());
+    if exp.is_none() {
+        let legacy: Vec<&str> = ["--steps", "--lr-min", "--patience"].into_iter().filter(|k| f(k).is_some()).collect();
+        if !legacy.is_empty() {
+            return Err(format!("{legacy:?} refused on standard CPU run (LAWS C15/D5); use --experiment NAME under experiments/"));
+        }
+        if opt_kind == "adamw" {
+            return Err("--opt adamw is legacy/suboptimal on the standard path (LAWS D5/A13: default is muonadamw); pass --experiment NAME".into());
+        }
+    } else if !out.replace('\\', "/").split('/').any(|c| c.eq_ignore_ascii_case("experiments")) {
+        return Err(format!("--experiment {}: --out must be under a folder named 'experiments'", exp.as_deref().unwrap_or("")));
+    }
     let init = f("--init").unwrap_or_else(|| "bundled".into());
     let bs = crate::flag_u64(args, "--bs").unwrap_or(16384) as usize;
-    let steps = crate::flag_u64(args, "--steps").unwrap_or(1000) as usize;
     let lr = crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32;
-    let lr_min = crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32;
+    let epoch_rule = exp.is_none();
+    let steps = if epoch_rule { usize::MAX } else { crate::flag_u64(args, "--steps").unwrap_or(1000) as usize };
+    let lr_min = if epoch_rule { lr } else { crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32 };
     let warmup = crate::flag_u64(args, "--warmup").unwrap_or(200) as usize;
     let wd = crate::flag_f64(args, "--wd").unwrap_or(0.0) as f32;
     let threads = crate::flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
     let val_rows = crate::flag_u64(args, "--val-rows").unwrap_or(65536) as usize;
-    let eval_every = crate::flag_u64(args, "--eval-every").unwrap_or(250) as usize;
     let save_every = crate::flag_u64(args, "--save-every").unwrap_or(500) as usize;
     let seed = crate::flag_u64(args, "--seed").unwrap_or(7);
     let d4 = !crate::has_flag(args, "--no-d4");
@@ -320,9 +339,11 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         }
     }
     let mut train = if crate::has_flag(args, "--ram") { Tdat::open_ram(&data)? } else { Tdat::open(&data)? };
+    let epoch_batches = train.rows.div_ceil(bs).max(1);
+    let eval_every = if epoch_rule { epoch_batches } else { crate::flag_u64(args, "--eval-every").unwrap_or(250) as usize };
     let mut valf = Tdat::open(&val_stem)?;
     let val = load_val(&mut valf, val_rows)?;
-    println!("[train] rows {} val {} bs {bs} steps {steps} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len());
+    println!("[train] rows {} val {} bs {bs} {} lr {lr}->{lr_min} warmup {warmup} threads {threads} d4 {d4}", train.rows, val.len(), if epoch_rule { format!("epoch_batches {epoch_batches} (LAWS C15)") } else { format!("steps {steps}") });
     let v0 = evaluate(&net, &val, threads);
     if !std::path::Path::new(&format!("{out}/best.tnn")).exists() {
         // a best snapshot exists from the first second on (the init), however short the run (LAWS A14)
@@ -337,18 +358,16 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     }
 
     let mut opt = SparseAdamW::new(&net);
-    // D1162 (user: "same trainer, only the optimiser changed"): --opt muonadamw = Muon on the l1 / l2 bucket blocks
-    // (D1159), AdamW unchanged for everything else; Muon's lr follows the same schedule factor as the AdamW lr.
-    let opt_kind = f("--opt").unwrap_or_else(|| "adamw".into());
+    // D1159 / D1162: MuonAdamW (Muon on the l1 / l2 bucket blocks, AdamW on the rest) is the standard CPU optimiser
     let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32;
     match opt_kind.as_str() {
         "adamw" => {}
         "muonadamw" => {
             let mom = crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32;
             opt.muon = Some(crate::train::Muon::new(&net, muon_lr, mom));
-            println!("[train] EXPERIMENT optimiser: MuonAdamW (Muon lr {muon_lr} x schedule, momentum {mom}, on l1/l2; AdamW on the rest)");
+            println!("[train] optimiser: MuonAdamW (Muon lr {muon_lr}, momentum {mom}, on l1/l2; AdamW on the rest)");
         }
-        k => return Err(format!("--opt {k}: use adamw or muonadamw")),
+        k => return Err(format!("--opt {k}: use muonadamw (default) or adamw (--experiment)")),
     }
     let mut grads: Vec<BatchGradients> = (0..threads).map(|_| BatchGradients::new(&net)).collect();
     let mut main_grad = BatchGradients::new(&net);
@@ -359,6 +378,8 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     let nblk = train.rows / BLOCK;
     let mut buf: Vec<Rec> = Vec::new();
     let mut best = v0.mse;
+    let mut best_saved = v0.mse;
+    let mut flat_epochs = 0usize;
     let t0 = Instant::now();
     let (mut run_loss, mut run_w, mut run_n) = (0f64, 0f64, 0usize);
     for step in step0..steps {
@@ -439,11 +460,21 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             if guard > 0.0 && v.mse > v0.mse * guard {
                 return Err(format!("GUARD TRIPPED at step {done}: val mse {:.6} > {guard} x init {:.6} (Mistake 39)", v.mse, v0.mse));
             }
-            if v.mse < best {
-                best = v.mse;
+            if v.mse < best_saved {
+                best_saved = v.mse;
                 let b = net.to_tnn_bytes();
                 crate::stopctl::write_atomic(&format!("{out}/best.tnn"), &b)?;
                 crate::prov::record(&out, "best.tnn", &b, v.mse, &val_stem, val_rows, done);
+            }
+            if v.mse <= best - 1e-5 {
+                best = v.mse;
+                flat_epochs = 0;
+            } else if epoch_rule {
+                flat_epochs += 1;
+                if flat_epochs >= 4 {
+                    println!("[epoch rule] SATURATED (LAWS C15, D1553): 4 epochs without a val gain >= 1e-5 (best {best:.6}, saved {best_saved:.6})");
+                    break;
+                }
             }
         }
         if done % save_every == 0 || done == steps {
