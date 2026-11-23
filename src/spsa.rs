@@ -6,7 +6,7 @@
 //! gives R = 2s - 1 in [-1, 1] and the update is theta_i += a_k R delta_i, the standard fishtest rule.
 //!
 //! The engine must be the tunable build (exp/tune): `<exe> tune-list` prints "name default" for every knob and `--tune a=1,b=2`
-//! sets them. Nodes per move alternate through `--nodes 5000,50000` (user D1326: >= 1000 nodes).
+//! sets them. Nodes per move alternate through `--nodes 5000,50000` (LAWS D20, user D1635: >= 5000 nodes).
 //!
 //!   ti spsa --exe titanium-cli.exe --net nnue_main.tnn --book book50k_std5k.txt --knobs knobs.txt --out run.log \
 //!           --nodes 5000,50000 --pairs 50 --iters 200 --threads 7 [--book0 60000] [--seed 1] [--resume]
@@ -17,7 +17,7 @@
 //! through tanh) blended with the match R (--stage-weight, default 0.5); games are kept in <out dir>/spsa_games/.
 //! Approximation: a knob of bucket b also acts inside searches from roots of later buckets (fewer empties deeper in the
 //! tree), so its credit is not exclusively its own bucket's. `--engine-args "..."` / `--rules botzone` go to both sides /
-//! the sprt child. Nodes per move >= 1000 (user D1326).
+//! the sprt child. Nodes per move >= 5000 (LAWS D20, user D1635).
 //!
 //! knobs.txt: one knob per line, `name lo hi c [a]` (c = perturbation size in knob units, a = step size, default c). `#` comments.
 use std::collections::HashMap;
@@ -146,9 +146,9 @@ fn run(args: &[String]) -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let warm_nodes: Option<u64> = flag(args, "--warm-nodes").and_then(|x| x.parse().ok());
     let warm_iters: usize = if warm_nodes.is_some() { flag(args, "--warm-iters").and_then(|x| x.parse().ok()).unwrap_or(100) } else { 0 };
-    // floor 1000 nodes per move (user D1324/D1326: tune at 1000 or 5000 nodes per move; was 5000, user 2026-11-01)
-    if nodes.iter().chain(warm_nodes.iter()).any(|&n| n < 1000) {
-        return Err("--nodes / --warm-nodes entries must be >= 1000 (user D1326)".into());
+    // floor 5000 nodes per move (LAWS D20, user D1635: lower budgets overfit margins)
+    if nodes.iter().chain(warm_nodes.iter()).any(|&n| n < 5000) {
+        return Err("--nodes / --warm-nodes entries must be >= 5000 (LAWS D20, user D1635: lower budgets overfit)".into());
     }
     // --fitness score (default, unchanged) = match score R for every knob; --fitness stage (D1326) = each knob `name@b` is
     // moved by its own NNUE bucket's paired value-lost difference (ti insight --by-bucket, plus vs minus) blended with R.
@@ -336,5 +336,25 @@ mod tests {
         assert_eq!(k_next, 4);
         assert!((th[0] - 1.25).abs() < 1e-6);
         assert!((th[1] - 57.375).abs() < 1e-6);
+    }
+
+    #[test]
+    fn refuses_nodes_below_5000() {
+        let base: Vec<String> = [
+            "--exe", "a", "--net", "b", "--book", "c", "--knobs", "d", "--out", "e",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let mut args1 = base.clone();
+        args1.extend(["--nodes".into(), "4999".into()]);
+        let err1 = run(&args1).unwrap_err();
+        assert!(err1.contains("5000"), "expected 5000 floor error, got: {err1}");
+
+        let mut args2 = base;
+        args2.extend(["--nodes".into(), "5000".into(), "--warm-nodes".into(), "1000".into()]);
+        let err2 = run(&args2).unwrap_err();
+        assert!(err2.contains("5000"), "expected 5000 warm floor error, got: {err2}");
     }
 }
