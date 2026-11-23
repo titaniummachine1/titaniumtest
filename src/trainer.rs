@@ -196,6 +196,16 @@ fn tensor_report(n: &TrainableNet) -> String {
     format!("max|w| ft {:.3} ftb {:.3} psqt {:.3} l1 {:.3} l2 {:.3} out {:.3}", m(&n.ft), m(&n.ftb), m(&n.psqt), m(&n.l1_w), m(&n.l2_w), m(&n.out_w))
 }
 
+pub const DEFAULT_LR: f64 = 5e-5;
+pub const DEFAULT_MUON_LR: f64 = 1e-3;
+pub const DEFAULT_MUON_MOM: f64 = 0.95;
+pub const DEFAULT_WARMUP: u64 = 500;
+pub const DEFAULT_WSUM_CLIP: f64 = 4.0;
+pub const DEFAULT_EMA: f64 = 0.9;
+pub const DEFAULT_VAL_ROWS: u64 = 131_072;
+pub const DEFAULT_EVAL_EVERY_CUDA: u64 = 3840;
+pub const DEFAULT_PROOF_BLEND: f64 = 1.0;
+
 pub fn run_train(args: &[String]) -> ExitCode {
     match run_train_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -258,15 +268,15 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 init: f("--init").unwrap_or_else(|| "bundled".into()),
                 bs: g("--bs", 16384),
                 steps: if epoch_rule { 1usize << 40 } else { g("--steps", 1000) },
-                lr: crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32,
+                lr: crate::flag_f64(args, "--lr").unwrap_or(DEFAULT_LR) as f32,
                 lr_min: if epoch_rule {
-                    crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32
+                    crate::flag_f64(args, "--lr").unwrap_or(DEFAULT_LR) as f32
                 } else {
                     crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32
                 },
-                warmup: g("--warmup", 200),
-                eval_every: g("--eval-every", 500),
-                val_rows: g("--val-rows", 65536),
+                warmup: g("--warmup", DEFAULT_WARMUP),
+                eval_every: g("--eval-every", DEFAULT_EVAL_EVERY_CUDA),
+                val_rows: g("--val-rows", DEFAULT_VAL_ROWS),
                 threads: g("--threads", 8),
                 seed: g("--seed", 7) as u64,
                 d4,
@@ -274,8 +284,8 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 holdout,
                 resume: crate::has_flag(args, "--resume"),
                 ram: crate::has_flag(args, "--ram"),
-                wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32,
-                ema: crate::flag_f64(args, "--ema").unwrap_or(0.0) as f32,
+                wsum_clip: crate::flag_f64(args, "--wsum-clip").unwrap_or(DEFAULT_WSUM_CLIP) as f32,
+                ema: crate::flag_f64(args, "--ema").unwrap_or(DEFAULT_EMA) as f32,
                 guard: crate::flag_f64(args, "--guard").unwrap_or(1.15) as f32,
                 patience: if epoch_rule { 0 } else { g("--patience", 0) },
                 min_delta: if epoch_rule { 1e-5 } else { crate::flag_f64(args, "--min-delta").unwrap_or(2e-6) },
@@ -283,13 +293,13 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 lr_factor: crate::flag_f64(args, "--lr-factor").unwrap_or(0.5) as f32,
                 max_drops: if epoch_rule { 0 } else { g("--max-drops", 3) },
                 epoch_rule,
-                proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(1.0) as f32,
+                proof_blend: crate::flag_f64(args, "--proof-blend").unwrap_or(DEFAULT_PROOF_BLEND) as f32,
                 result_weight: targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?,
                 loss_weight: targets::parse_lw(f("--loss-weight-buckets"))?,
                 keep_all: crate::has_flag(args, "--keep-all"),
                 sf: opt_name == "sfadamw",
                 muon: if opt_name == "muon" {
-                    Some((crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32))
+                    Some((crate::flag_f64(args, "--muon-lr").unwrap_or(DEFAULT_MUON_LR) as f32, crate::flag_f64(args, "--muon-mom").unwrap_or(DEFAULT_MUON_MOM) as f32))
                 } else {
                     None
                 },
@@ -320,18 +330,18 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     }
     let init = f("--init").unwrap_or_else(|| "bundled".into());
     let bs = crate::flag_u64(args, "--bs").unwrap_or(16384) as usize;
-    let lr = crate::flag_f64(args, "--lr").unwrap_or(1e-3) as f32;
+    let lr = crate::flag_f64(args, "--lr").unwrap_or(DEFAULT_LR) as f32;
     let epoch_rule = exp.is_none();
     let steps = if epoch_rule { usize::MAX } else { crate::flag_u64(args, "--steps").unwrap_or(1000) as usize };
     let lr_min = if epoch_rule { lr } else { crate::flag_f64(args, "--lr-min").unwrap_or(2e-5) as f32 };
-    let warmup = crate::flag_u64(args, "--warmup").unwrap_or(200) as usize;
+    let warmup = crate::flag_u64(args, "--warmup").unwrap_or(DEFAULT_WARMUP) as usize;
     let wd = crate::flag_f64(args, "--wd").unwrap_or(0.0) as f32;
     let threads = crate::flag_u64(args, "--threads").unwrap_or(4).max(1) as usize;
-    let val_rows = crate::flag_u64(args, "--val-rows").unwrap_or(65536) as usize;
+    let val_rows = crate::flag_u64(args, "--val-rows").unwrap_or(DEFAULT_VAL_ROWS) as usize;
     let save_every = crate::flag_u64(args, "--save-every").unwrap_or(500) as usize;
     let seed = crate::flag_u64(args, "--seed").unwrap_or(7);
     let resume = crate::has_flag(args, "--resume");
-    let wsum_clip = crate::flag_f64(args, "--wsum-clip").unwrap_or(0.0) as f32;
+    let wsum_clip = crate::flag_f64(args, "--wsum-clip").unwrap_or(DEFAULT_WSUM_CLIP) as f32;
     let guard = crate::flag_f64(args, "--guard").unwrap_or(1.15);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
 
@@ -370,14 +380,14 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
 
     let mut opt = SparseAdamW::new(&net);
     // D1159 / D1162 / D1629: Muon + Schedule-Free AdamW is the mandatory standard CPU optimiser
-    let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32;
+    let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(DEFAULT_MUON_LR) as f32;
     match opt_kind.as_str() {
         "adamw" | "sfadamw" => {
             opt.muon = None;
             println!("[train] EXPERIMENT optimiser: Schedule-Free AdamW ONLY (NO MUON)");
         }
         "muonadamw" | "muon" | "muonsfadamw" => {
-            let mom = crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32;
+            let mom = crate::flag_f64(args, "--muon-mom").unwrap_or(DEFAULT_MUON_MOM) as f32;
             opt.muon = Some(crate::train::Muon::new(&net, muon_lr, mom));
             println!("[train] optimiser: Muon + Schedule-Free AdamW (Muon lr {muon_lr}, momentum {mom}, on l1/l2; Schedule-Free AdamW on the rest; eval/export on x)");
         }
@@ -811,10 +821,26 @@ fn bucket_plan(st: &[[f64; 6]], only_k: Option<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::run_train_inner;
+    use super::*;
 
     fn args(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_hyperparams_match_winning_recipe() {
+        assert!((DEFAULT_LR - 5e-5).abs() < 1e-12);
+        assert!((DEFAULT_MUON_LR - 1e-3).abs() < 1e-12);
+        assert!((DEFAULT_MUON_MOM - 0.95).abs() < 1e-12);
+        assert_eq!(DEFAULT_WARMUP, 500);
+        assert!((DEFAULT_WSUM_CLIP - 4.0).abs() < 1e-12);
+        assert!((DEFAULT_EMA - 0.9).abs() < 1e-12);
+        assert_eq!(DEFAULT_VAL_ROWS, 131_072);
+        assert_eq!(DEFAULT_EVAL_EVERY_CUDA, 3840);
+        assert!((DEFAULT_PROOF_BLEND - 1.0).abs() < 1e-12);
+        // Flat w_res = 0.25 everywhere: 0.75 * sigmoid(0) + 0.25 * 1.0 = 0.625
+        let t = crate::targets::make_target(0.0, 1.0, None);
+        assert!((t.target - 0.625).abs() < 1e-6);
     }
 
     #[test]
