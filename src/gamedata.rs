@@ -1050,34 +1050,49 @@ pub fn run_proof_wdl(args: &[String]) -> ExitCode {
 /// `ti data lambda`: copy of a `.tdat` whose `outcome` holds the truncated lambda return of the row's own run.
 pub fn run_lambda(args: &[String]) -> ExitCode {
     let (Some(tdat), Some(out)) = (crate::flag_str(args, "--tdat"), crate::flag_str(args, "--out")) else {
-        eprintln!("usage: ti data lambda --tdat X.tdat --out STEM --lambda 0.7 [--chains X.chains] [--horizon 64]");
+        eprintln!("usage: ti data lambda --tdat X.tdat --out STEM --preserve-tail N [--lambda 0.7] [--chains X.chains] [--horizon 64]");
         return ExitCode::FAILURE;
     };
     let idx = crate::flag_str(args, "--chains").unwrap_or_else(|| format!("{}.chains", tdat.trim_end_matches(".tdat")));
     let lambda = crate::flag_str(args, "--lambda").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.7).clamp(0.0, 1.0);
     let horizon: usize = crate::flag_str(args, "--horizon").and_then(|v| v.parse().ok()).unwrap_or(64);
+    let Some(tail) = crate::flag_str(args, "--preserve-tail").and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("data lambda: --preserve-tail N is required (the held-out validation tail is never rewritten)");
+        return ExitCode::FAILURE;
+    };
     let out_tdat = format!("{}.tdat", out.trim_end_matches(".tdat"));
+    if std::path::Path::new(&out_tdat) == std::path::Path::new(&tdat) {
+        eprintln!("data lambda: --out must differ from --tdat (LAWS A10)");
+        return ExitCode::FAILURE;
+    }
     let t0 = std::time::Instant::now();
     let work = || -> Result<(u64, u64, f64, f64), String> {
         let (idx_rows, chains) = read_chains(&idx)?;
         let mut rs = RowStream::open(&tdat)?;
         check_index(rs.rows, idx_rows, &chains)?;
+        let head = rs.rows.saturating_sub(tail);
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&out_tdat).map_err(|e| format!("{out_tdat}: {e}"))?);
         let (mut changed, mut moved, mut tail_sum) = (0u64, 0f64, 0f64);
         for c in &chains {
-            rs.advance(c.start as u64, Some(&mut w as &mut dyn Write))?;
-            let mut rows = rs.take(c.len as usize)?;
+            let cs = c.start as u64;
+            if cs >= head {
+                break;
+            }
+            let ce = (cs + c.len as u64).min(head);
+            let mod_len = (ce - cs) as usize;
+            rs.advance(cs, Some(&mut w as &mut dyn Write))?;
+            let mut rows = rs.take(mod_len)?;
             let orig = rows.clone();
             for t in 0..rows.len() {
                 if row_value(&orig[t]).1 {
                     continue; // a proven row trains on its proof, the outcome is not used
                 }
-                let (fut, tail) = future_mix(&orig, t, lambda, horizon);
-                let g = fut + tail * orig[t].outcome;
-                if tail < 1.0 {
+                let (fut, tail_w) = future_mix(&orig, t, lambda, horizon);
+                let g = fut + tail_w * orig[t].outcome;
+                if tail_w < 1.0 {
                     changed += 1;
                     moved += (g - orig[t].outcome).abs() as f64;
-                    tail_sum += tail as f64;
+                    tail_sum += tail_w as f64;
                 }
                 rows[t].outcome = g;
             }
@@ -1092,12 +1107,12 @@ pub fn run_lambda(args: &[String]) -> ExitCode {
     };
     match work() {
         Ok((total, changed, moved, tail_sum)) => {
-            let desc = format!("{tdat} with outcome := truncated lambda return over {idx} (lambda {lambda}, horizon {horizon}); ti data lambda");
+            let desc = format!("{tdat} with outcome := truncated lambda return over {idx} (lambda {lambda}, horizon {horizon}, tail {tail} unchanged); ti data lambda");
             if let Err(e) = crate::data::write_tdat_manifest(out.trim_end_matches(".tdat"), &desc, total as usize) {
                 eprintln!("data lambda: manifest: {e}");
                 return ExitCode::FAILURE;
             }
-            println!("data lambda: {tdat} -> {out_tdat}: {total} rows in {:.1}s, lambda {lambda}, horizon {horizon}", t0.elapsed().as_secs_f64());
+            println!("data lambda: {tdat} -> {out_tdat}: {total} rows (tail {tail} unchanged) in {:.1}s, lambda {lambda}, horizon {horizon}", t0.elapsed().as_secs_f64());
             println!(
                 "  rows whose outcome now carries the future: {changed} ({:.1}%); mean |new - old outcome| {:.4}; mean weight left on the game result {:.3}",
                 100.0 * changed as f64 / total.max(1) as f64,
