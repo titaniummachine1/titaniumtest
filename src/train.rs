@@ -561,26 +561,37 @@ impl BatchGradients {
 }
 
 pub struct SparseAdamW {
-    /// D1159: Some = MuonAdamW (Muon on the l1 / l2 bucket blocks, AdamW on the rest)
+    /// D1159/D1629: Some = Muon + Schedule-Free AdamW (mandatory default: Muon on l1/l2 bucket blocks, SfAdamW on the rest)
     pub muon: Option<Muon>,
     step: u32,
-    m_ft: Vec<f32>,
+    sum_lr2: f64,
+    ft_ever: Vec<bool>,
+    z_ft: Vec<f32>,
+    x_ft: Vec<f32>,
     v_ft: Vec<f32>,
-    m_ftb: Vec<f32>,
+    z_ftb: Vec<f32>,
+    x_ftb: Vec<f32>,
     v_ftb: Vec<f32>,
-    m_psqt: Vec<f32>,
+    z_psqt: Vec<f32>,
+    x_psqt: Vec<f32>,
     v_psqt: Vec<f32>,
-    m_l1_w: Vec<f32>,
+    z_l1_w: Vec<f32>,
+    x_l1_w: Vec<f32>,
     v_l1_w: Vec<f32>,
-    m_l1_b: Vec<f32>,
+    z_l1_b: Vec<f32>,
+    x_l1_b: Vec<f32>,
     v_l1_b: Vec<f32>,
-    m_l2_w: Vec<f32>,
+    z_l2_w: Vec<f32>,
+    x_l2_w: Vec<f32>,
     v_l2_w: Vec<f32>,
-    m_l2_b: Vec<f32>,
+    z_l2_b: Vec<f32>,
+    x_l2_b: Vec<f32>,
     v_l2_b: Vec<f32>,
-    m_out_w: Vec<f32>,
+    z_out_w: Vec<f32>,
+    x_out_w: Vec<f32>,
     v_out_w: Vec<f32>,
-    m_out_b: Vec<f32>,
+    z_out_b: Vec<f32>,
+    x_out_b: Vec<f32>,
     v_out_b: Vec<f32>,
 }
 
@@ -716,27 +727,71 @@ impl Muon {
 impl SparseAdamW {
     pub fn new(net: &TrainableNet) -> Self {
         SparseAdamW {
-            muon: None,
+            muon: Some(Muon::new(net, 1e-3, 0.95)),
             step: 0,
-            m_ft: vec![0.0; net.ft.len()],
+            sum_lr2: 0.0,
+            ft_ever: vec![false; net.num_feats],
+            z_ft: net.ft.clone(),
+            x_ft: net.ft.clone(),
             v_ft: vec![0.0; net.ft.len()],
-            m_ftb: vec![0.0; net.ftb.len()],
+            z_ftb: net.ftb.clone(),
+            x_ftb: net.ftb.clone(),
             v_ftb: vec![0.0; net.ftb.len()],
-            m_psqt: vec![0.0; net.psqt.len()],
+            z_psqt: net.psqt.clone(),
+            x_psqt: net.psqt.clone(),
             v_psqt: vec![0.0; net.psqt.len()],
-            m_l1_w: vec![0.0; net.l1_w.len()],
+            z_l1_w: net.l1_w.clone(),
+            x_l1_w: net.l1_w.clone(),
             v_l1_w: vec![0.0; net.l1_w.len()],
-            m_l1_b: vec![0.0; net.l1_b.len()],
+            z_l1_b: net.l1_b.clone(),
+            x_l1_b: net.l1_b.clone(),
             v_l1_b: vec![0.0; net.l1_b.len()],
-            m_l2_w: vec![0.0; net.l2_w.len()],
+            z_l2_w: net.l2_w.clone(),
+            x_l2_w: net.l2_w.clone(),
             v_l2_w: vec![0.0; net.l2_w.len()],
-            m_l2_b: vec![0.0; net.l2_b.len()],
+            z_l2_b: net.l2_b.clone(),
+            x_l2_b: net.l2_b.clone(),
             v_l2_b: vec![0.0; net.l2_b.len()],
-            m_out_w: vec![0.0; net.out_w.len()],
+            z_out_w: net.out_w.clone(),
+            x_out_w: net.out_w.clone(),
             v_out_w: vec![0.0; net.out_w.len()],
-            m_out_b: vec![0.0; net.out_b.len()],
+            z_out_b: net.out_b.clone(),
+            x_out_b: net.out_b.clone(),
             v_out_b: vec![0.0; net.out_b.len()],
         }
+    }
+
+    /// D1554/D1629: copy Schedule-Free averaged weights `x` into `net` before validation, checkpoints, or export.
+    pub fn sync_eval(&self, net: &mut TrainableNet) {
+        net.ft.copy_from_slice(&self.x_ft);
+        net.ftb.copy_from_slice(&self.x_ftb);
+        net.psqt.copy_from_slice(&self.x_psqt);
+        net.l1_w.copy_from_slice(&self.x_l1_w);
+        net.l1_b.copy_from_slice(&self.x_l1_b);
+        net.l2_w.copy_from_slice(&self.x_l2_w);
+        net.l2_b.copy_from_slice(&self.x_l2_b);
+        net.out_w.copy_from_slice(&self.x_out_w);
+        net.out_b.copy_from_slice(&self.x_out_b);
+    }
+
+    /// D1554/D1629: restore Schedule-Free gradient evaluation point `y = (1 - beta1) * z + beta1 * x` into `net`.
+    pub fn sync_train(&self, net: &mut TrainableNet) {
+        let b1 = 0.9f32;
+        let fill_y = |w: &mut [f32], z: &[f32], x: &[f32], clamp_qa: bool| {
+            for ((wi, &zi), &xi) in w.iter_mut().zip(z.iter()).zip(x.iter()) {
+                let yi = (1.0 - b1) * zi + b1 * xi;
+                *wi = if clamp_qa { yi.clamp(-QA_CLAMP, QA_CLAMP) } else { yi };
+            }
+        };
+        fill_y(&mut net.ft, &self.z_ft, &self.x_ft, true);
+        fill_y(&mut net.ftb, &self.z_ftb, &self.x_ftb, true);
+        fill_y(&mut net.psqt, &self.z_psqt, &self.x_psqt, false);
+        fill_y(&mut net.l1_w, &self.z_l1_w, &self.x_l1_w, false);
+        fill_y(&mut net.l1_b, &self.z_l1_b, &self.x_l1_b, false);
+        fill_y(&mut net.l2_w, &self.z_l2_w, &self.x_l2_w, false);
+        fill_y(&mut net.l2_b, &self.z_l2_b, &self.x_l2_b, false);
+        fill_y(&mut net.out_w, &self.z_out_w, &self.x_out_w, false);
+        fill_y(&mut net.out_b, &self.z_out_b, &self.x_out_b, false);
     }
 
     pub fn step_batch(
@@ -751,63 +806,85 @@ impl SparseAdamW {
         let inv_n = 1.0 / (batch_size.max(1) as f32);
         let b1 = 0.9f32;
         let b2 = 0.999f32;
-        let corr1 = 1.0 - b1.powi(self.step as i32);
         let corr2 = 1.0 - b2.powi(self.step as i32);
-        let step_lr = lr / corr1;
+        self.sum_lr2 += (lr as f64) * (lr as f64);
+        let c = (((lr as f64) * (lr as f64)) / self.sum_lr2.max(1e-30)) as f32;
 
-        let update_slice = |w: &mut [f32],
-                            m: &mut [f32],
-                            v: &mut [f32],
-                            g: &[f32],
-                            clamp_qa: bool| {
-            for i in 0..w.len() {
-                let gi = g[i] * inv_n;
-                m[i] = b1 * m[i] + (1.0 - b1) * gi;
-                v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
-                let denom = (v[i] / corr2).sqrt() + 1e-8;
-                w[i] = w[i] * (1.0 - lr * wd) - step_lr * (m[i] / denom);
-                if clamp_qa {
-                    w[i] = w[i].clamp(-QA_CLAMP, QA_CLAMP);
-                }
+        let sf_avg = |w: &mut [f32], z: &[f32], x: &mut [f32], clamp_qa: bool| {
+            for ((wi, &zi), xi) in w.iter_mut().zip(z.iter()).zip(x.iter_mut()) {
+                *xi += c * (zi - *xi);
+                let yi = (1.0 - b1) * zi + b1 * (*xi);
+                *wi = if clamp_qa { yi.clamp(-QA_CLAMP, QA_CLAMP) } else { yi };
             }
         };
 
-        update_slice(&mut net.ftb, &mut self.m_ftb, &mut self.v_ftb, &grad.ftb, true);
-        if let Some(mu) = self.muon.as_mut() {
-            // D1159 MuonAdamW: the dense hidden matrices by Muon, one block per phase bucket
-            let din = net.l1_w.len() / (net.buckets * net.l1).max(1);
-            Muon::step_blocks(&mut net.l1_w, &mut mu.m_l1, &grad.l1_w, net.l1, din, inv_n, mu.lr, mu.mu, wd);
-            Muon::step_blocks(&mut net.l2_w, &mut mu.m_l2, &grad.l2_w, net.l2, net.l1, inv_n, mu.lr, mu.mu, wd);
-        } else {
-            update_slice(&mut net.l1_w, &mut self.m_l1_w, &mut self.v_l1_w, &grad.l1_w, false);
-            update_slice(&mut net.l2_w, &mut self.m_l2_w, &mut self.v_l2_w, &grad.l2_w, false);
-        }
-        update_slice(&mut net.l1_b, &mut self.m_l1_b, &mut self.v_l1_b, &grad.l1_b, false);
-        update_slice(&mut net.l2_b, &mut self.m_l2_b, &mut self.v_l2_b, &grad.l2_b, false);
-        update_slice(&mut net.out_w, &mut self.m_out_w, &mut self.v_out_w, &grad.out_w, false);
-        update_slice(&mut net.out_b, &mut self.m_out_b, &mut self.v_out_b, &grad.out_b, false);
+        let update_sf = |w: &mut [f32],
+                         z: &mut [f32],
+                         x: &mut [f32],
+                         v: &mut [f32],
+                         g: &[f32],
+                         clamp_qa: bool| {
+            for i in 0..z.len() {
+                let gi = g[i] * inv_n;
+                v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
+                let denom = (v[i] / corr2).sqrt() + 1e-8;
+                z[i] = z[i] * (1.0 - lr * wd) - lr * (gi / denom);
+                if clamp_qa {
+                    z[i] = z[i].clamp(-QA_CLAMP, QA_CLAMP);
+                }
+            }
+            sf_avg(w, z, x, clamp_qa);
+        };
 
-        // Sparse update: ONLY touch active feature rows in `ft` and `psqt`!
+        update_sf(&mut net.ftb, &mut self.z_ftb, &mut self.x_ftb, &mut self.v_ftb, &grad.ftb, true);
+        if let Some(mu) = self.muon.as_mut() {
+            // D1159/D1629 Muon + Schedule-Free AdamW: Muon updates primary iterate z for dense l1/l2 blocks,
+            // while Schedule-Free averaging x and gradient point y track all parameters uniformly.
+            let din = self.z_l1_w.len() / (net.buckets * net.l1).max(1);
+            Muon::step_blocks(&mut self.z_l1_w, &mut mu.m_l1, &grad.l1_w, net.l1, din, inv_n, mu.lr, mu.mu, wd);
+            Muon::step_blocks(&mut self.z_l2_w, &mut mu.m_l2, &grad.l2_w, net.l2, net.l1, inv_n, mu.lr, mu.mu, wd);
+            sf_avg(&mut net.l1_w, &self.z_l1_w, &mut self.x_l1_w, false);
+            sf_avg(&mut net.l2_w, &self.z_l2_w, &mut self.x_l2_w, false);
+        } else {
+            update_sf(&mut net.l1_w, &mut self.z_l1_w, &mut self.x_l1_w, &mut self.v_l1_w, &grad.l1_w, false);
+            update_sf(&mut net.l2_w, &mut self.z_l2_w, &mut self.x_l2_w, &mut self.v_l2_w, &grad.l2_w, false);
+        }
+        update_sf(&mut net.l1_b, &mut self.z_l1_b, &mut self.x_l1_b, &mut self.v_l1_b, &grad.l1_b, false);
+        update_sf(&mut net.l2_b, &mut self.z_l2_b, &mut self.x_l2_b, &mut self.v_l2_b, &grad.l2_b, false);
+        update_sf(&mut net.out_w, &mut self.z_out_w, &mut self.x_out_w, &mut self.v_out_w, &grad.out_w, false);
+        update_sf(&mut net.out_b, &mut self.z_out_b, &mut self.x_out_b, &mut self.v_out_b, &grad.out_b, false);
+
+        // Sparse update on z for active feature rows in `ft` and `psqt`, then Schedule-Free x/y sync on active rows.
         let width = net.width;
         let buckets = net.buckets;
         for &f in &grad.touched_feats {
             let fi = f as usize;
+            if fi < self.ft_ever.len() {
+                self.ft_ever[fi] = true;
+            }
             let ft_range = fi * width..(fi + 1) * width;
-            update_slice(
-                &mut net.ft[ft_range.clone()],
-                &mut self.m_ft[ft_range.clone()],
-                &mut self.v_ft[ft_range.clone()],
-                &grad.ft[ft_range],
-                true,
-            );
+            for i in ft_range {
+                let gi = grad.ft[i] * inv_n;
+                self.v_ft[i] = b2 * self.v_ft[i] + (1.0 - b2) * gi * gi;
+                let denom = (self.v_ft[i] / corr2).sqrt() + 1e-8;
+                self.z_ft[i] = (self.z_ft[i] * (1.0 - lr * wd) - lr * (gi / denom)).clamp(-QA_CLAMP, QA_CLAMP);
+            }
             let ps_range = fi * buckets..(fi + 1) * buckets;
-            update_slice(
-                &mut net.psqt[ps_range.clone()],
-                &mut self.m_psqt[ps_range.clone()],
-                &mut self.v_psqt[ps_range.clone()],
-                &grad.psqt[ps_range],
-                false,
-            );
+            for i in ps_range {
+                let gi = grad.psqt[i] * inv_n;
+                self.v_psqt[i] = b2 * self.v_psqt[i] + (1.0 - b2) * gi * gi;
+                let denom = (self.v_psqt[i] / corr2).sqrt() + 1e-8;
+                self.z_psqt[i] = self.z_psqt[i] * (1.0 - lr * wd) - lr * (gi / denom);
+            }
+        }
+        for fi in 0..self.ft_ever.len() {
+            if !self.ft_ever[fi] {
+                continue;
+            }
+            let ft_range = fi * width..(fi + 1) * width;
+            sf_avg(&mut net.ft[ft_range.clone()], &self.z_ft[ft_range.clone()], &mut self.x_ft[ft_range], true);
+            let ps_range = fi * buckets..(fi + 1) * buckets;
+            sf_avg(&mut net.psqt[ps_range.clone()], &self.z_psqt[ps_range.clone()], &mut self.x_psqt[ps_range], false);
         }
     }
 }
@@ -928,6 +1005,7 @@ pub fn run_train_cli(
     );
 
     let mut opt = SparseAdamW::new(&net);
+    opt.muon = Some(Muon::new(&net, lr, 0.95));
     let mut master_grad = BatchGradients::new(&net);
     let mut rng_state = 0x853C_49E6_748F_EA9Bu64;
     let mut indices: Vec<usize> = (0..samples.len()).collect();
@@ -943,9 +1021,11 @@ pub fn run_train_cli(
             indices.swap(i, j);
         }
 
-        // Cosine LR decay across epochs
-        let progress = (ep - 1) as f32 / (epochs.max(1) as f32);
-        let cur_lr = lr * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos()).max(0.05);
+        // LAWS D5/D1554/D1629: Schedule-Free LR (constant base LR; iterate averaging replaces manual cosine decay)
+        let cur_lr = lr;
+        if let Some(m) = opt.muon.as_mut() {
+            m.lr = lr;
+        }
 
         let mut total_loss = 0.0f64;
         let mut total_seen = 0usize;
@@ -991,6 +1071,7 @@ pub fn run_train_cli(
             "[Epoch {ep:>2}/{epochs}] loss={mean_loss:.6} | lr={cur_lr:.6} | speed={pos_per_sec:.0} pos/s ({dt:.1}s)"
         );
 
+        opt.sync_eval(&mut net);
         let bytes = net.to_tnn_bytes();
         if let Some(parent) = Path::new(out_path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -999,6 +1080,7 @@ pub fn run_train_cli(
         }
         let mut f = fs::File::create(out_path).expect("create out tnn");
         f.write_all(&bytes).expect("write out tnn");
+        opt.sync_train(&mut net);
     }
 
     println!("[Train] Saved quantized-ready TNN network to {out_path}");
@@ -1031,12 +1113,47 @@ mod tests {
         );
 
         let mut opt = SparseAdamW::new(&tnet);
+        assert!(opt.muon.is_some(), "SparseAdamW must enable Muon by default");
         opt.step_batch(&mut tnet, &grad, 1, 1e-3, 0.0);
         grad.clear_sparse(tnet.width, tnet.buckets);
         let loss1 = tnet.forward_backward_sample(&b, target_p, &mut grad);
         assert!(
             loss1 < loss0,
             "loss did not decrease after SparseAdamW step: {loss1} >= {loss0}"
+        );
+    }
+
+    #[test]
+    fn sf_muon_adamw_decreases_loss() {
+        let mut tnet = TrainableNet::from_tnn_bytes(BUNDLED_NNUE).expect("parse bundled");
+        let b = Board::start();
+        let mut grad = BatchGradients::new(&tnet);
+        let target_p = 0.85f32;
+        let loss0 = tnet.forward_backward_sample(&b, target_p, &mut grad);
+
+        let mut opt = SparseAdamW::new(&tnet);
+        assert!(opt.muon.is_some());
+        opt.step_batch(&mut tnet, &grad, 1, 5e-4, 0.0);
+        for _ in 0..7 {
+            grad.clear_sparse(tnet.width, tnet.buckets);
+            let _ = tnet.forward_backward_sample(&b, target_p, &mut grad);
+            opt.step_batch(&mut tnet, &grad, 1, 5e-4, 0.0);
+        }
+
+        opt.sync_eval(&mut tnet);
+        grad.clear_sparse(tnet.width, tnet.buckets);
+        let loss_eval = tnet.forward_backward_sample(&b, target_p, &mut grad);
+        assert!(
+            loss_eval < loss0,
+            "Schedule-Free Muon+AdamW averaged iterate x did not decrease loss: {loss_eval} >= {loss0}"
+        );
+
+        opt.sync_train(&mut tnet);
+        grad.clear_sparse(tnet.width, tnet.buckets);
+        let loss_y = tnet.forward_backward_sample(&b, target_p, &mut grad);
+        assert!(
+            loss_y < loss0,
+            "Schedule-Free Muon+AdamW training iterate y did not decrease loss: {loss_y} >= {loss0}"
         );
     }
 }

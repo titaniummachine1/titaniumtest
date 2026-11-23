@@ -209,15 +209,17 @@ pub fn run_train(args: &[String]) -> ExitCode {
 fn run_train_inner(args: &[String]) -> Result<(), String> {
     let f = |n: &str| crate::flag_str(args, n);
     if f("--backend").as_deref() == Some("cuda") {
-        // LAWS D5 / D1159 / D1554 + LAWS A13: MuonAdamW (`--opt muon`) is the default GPU optimiser; `--opt sfadamw`
-        // (Schedule-Free AdamW) is supported; legacy `--opt ranger` requires `--experiment NAME`.
+        // LAWS D5 / D1159 / D1260 / D1554 / D1629 + LAWS A13: combined Muon + Schedule-Free AdamW (`--opt muon`)
+        // is the MANDATORY default GPU optimiser; standalone `--opt sfadamw` or `--opt ranger` requires `--experiment NAME`.
         let opt_name = f("--opt").unwrap_or_else(|| "muon".into());
         if !matches!(opt_name.as_str(), "muon" | "sfadamw" | "ranger") {
-            return Err("--backend cuda: --opt takes muon (default, MuonAdamW), sfadamw, or ranger (legacy, --experiment only)".into());
+            return Err("--backend cuda: --opt takes muon (default, Muon + Schedule-Free AdamW), sfadamw (--experiment only), or ranger (--experiment only)".into());
         }
         let exp = f("--experiment");
-        if exp.is_none() && opt_name == "ranger" {
-            return Err("--opt ranger is legacy/suboptimal and forbidden on the standard path (LAWS D5/A13: default is muon [MuonAdamW]; sfadamw also allowed); pass --experiment NAME".into());
+        if exp.is_none() && opt_name != "muon" {
+            return Err(format!(
+                "--opt {opt_name} is forbidden on standard CUDA training (LAWS D5/D1260/D1629: mandatory default is --opt muon [Muon + Schedule-Free AdamW]); pass --experiment NAME under experiments/"
+            ));
         }
         // D1553/D1554 (user, LAWS C15 + D5): the run stops after 4 consecutive epochs of data without a val gain >= 1e-5; the LR
         // comes from the optimiser, never a hand rule: no step cap, no cosine horizon, no checkpoint patience, no
@@ -288,7 +290,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         #[cfg(not(feature = "gpu"))]
         return Err("this ti was built without --features cuda".into());
     }
-    // engine D427: standard CPU trainer enforces MuonAdamW + LAWS C15 unless --experiment NAME under experiments/
+    // engine D427 / D1629: standard CPU trainer enforces Muon + Schedule-Free AdamW + LAWS C15 unless --experiment NAME under experiments/
     let exp = f("--experiment");
     let result_weight: Option<targets::Rw> = targets::parse_rw(f("--result-weight-phase"), f("--result-weight-buckets"))?;
     let loss_weight: Option<targets::Rw> = targets::parse_lw(f("--loss-weight-buckets"))?;
@@ -301,8 +303,10 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         if !legacy.is_empty() {
             return Err(format!("{legacy:?} refused on standard CPU run (LAWS C15/D5); use --experiment NAME under experiments/"));
         }
-        if opt_kind == "adamw" {
-            return Err("--opt adamw is legacy/suboptimal on the standard path (LAWS D5/A13: default is muonadamw); pass --experiment NAME".into());
+        if !matches!(opt_kind.as_str(), "muonadamw" | "muon" | "muonsfadamw") {
+            return Err(format!(
+                "--opt {opt_kind} is forbidden on the standard path (LAWS D5/D1260/D1629: mandatory default is muonadamw/muon [Muon + Schedule-Free AdamW]); pass --experiment NAME under experiments/"
+            ));
         }
     } else if !out.replace('\\', "/").split('/').any(|c| c.eq_ignore_ascii_case("experiments")) {
         return Err(format!("--experiment {}: --out must be under a folder named 'experiments'", exp.as_deref().unwrap_or("")));
@@ -358,16 +362,19 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
     }
 
     let mut opt = SparseAdamW::new(&net);
-    // D1159 / D1162: MuonAdamW (Muon on the l1 / l2 bucket blocks, AdamW on the rest) is the standard CPU optimiser
+    // D1159 / D1162 / D1629: Muon + Schedule-Free AdamW is the mandatory standard CPU optimiser
     let muon_lr = crate::flag_f64(args, "--muon-lr").unwrap_or(1e-3) as f32;
     match opt_kind.as_str() {
-        "adamw" => {}
-        "muonadamw" => {
+        "adamw" | "sfadamw" => {
+            opt.muon = None;
+            println!("[train] EXPERIMENT optimiser: Schedule-Free AdamW ONLY (NO MUON)");
+        }
+        "muonadamw" | "muon" | "muonsfadamw" => {
             let mom = crate::flag_f64(args, "--muon-mom").unwrap_or(0.95) as f32;
             opt.muon = Some(crate::train::Muon::new(&net, muon_lr, mom));
-            println!("[train] optimiser: MuonAdamW (Muon lr {muon_lr}, momentum {mom}, on l1/l2; AdamW on the rest)");
+            println!("[train] optimiser: Muon + Schedule-Free AdamW (Muon lr {muon_lr}, momentum {mom}, on l1/l2; Schedule-Free AdamW on the rest; eval/export on x)");
         }
-        k => return Err(format!("--opt {k}: use muonadamw (default) or adamw (--experiment)")),
+        k => return Err(format!("--opt {k}: use muonadamw/muon (default, Muon + Schedule-Free AdamW) or sfadamw/adamw (--experiment)")),
     }
     let mut grads: Vec<BatchGradients> = (0..threads).map(|_| BatchGradients::new(&net)).collect();
     let mut main_grad = BatchGradients::new(&net);
@@ -442,6 +449,7 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
         let done = step + 1;
         // LAWS A14 (user D1307): STOP in --out or C:/gitProjects/STOP_ALL: save the exact step as a checkpoint and exit
         if let Some(f) = crate::stopctl::requested(Some(std::path::Path::new(&out))) {
+            opt.sync_eval(&mut net);
             let p = format!("{out}/ckpt_{done}.tnn");
             crate::stopctl::write_atomic(&p, &net.to_tnn_bytes())?;
             crate::stopctl::write_atomic(&state, format!("{done} {p}").as_bytes())?;
@@ -454,7 +462,13 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
             run_w = 0.0;
             run_n = 0;
         }
-        if done % eval_every == 0 || done == steps {
+        let need_eval = done % eval_every == 0 || done == steps;
+        let need_save = done % save_every == 0 || done == steps;
+        if need_eval || need_save {
+            opt.sync_eval(&mut net);
+        }
+        let mut saturated = false;
+        if need_eval {
             let v = evaluate(&net, &val, threads);
             println!("[val step {done}] mse {:.6} proven {:.6} other {:.6}", v.mse, v.mse_proven, v.mse_other);
             if guard > 0.0 && v.mse > v0.mse * guard {
@@ -473,17 +487,24 @@ fn run_train_inner(args: &[String]) -> Result<(), String> {
                 flat_epochs += 1;
                 if flat_epochs >= 4 {
                     println!("[epoch rule] SATURATED (LAWS C15, D1553): 4 epochs without a val gain >= 1e-5 (best {best:.6}, saved {best_saved:.6})");
-                    break;
+                    saturated = true;
                 }
             }
         }
-        if done % save_every == 0 || done == steps {
+        if need_save {
             let p = format!("{out}/ckpt_{done}.tnn");
             crate::stopctl::write_atomic(&p, &net.to_tnn_bytes())?;
             crate::stopctl::write_atomic(&state, format!("{done} {p}").as_bytes())?;
         }
+        if saturated {
+            break;
+        }
+        if need_eval || need_save {
+            opt.sync_train(&mut net);
+        }
     }
     let _ = run_n;
+    opt.sync_eval(&mut net);
     std::fs::write(format!("{out}/final.tnn"), net.to_tnn_bytes()).map_err(|e| e.to_string())?;
     println!("[done] {} | {}", tensor_report(&net), targets::MATE);
     Ok(())
@@ -755,4 +776,26 @@ fn bucket_plan(st: &[[f64; 6]], only_k: Option<usize>) {
         println!("{k:>3}   {best:.5}    {ev:.5}    {:>+7.1}%      {:?}", 100.0 * (best - ev) / ev, starts);
     }
     println!("  E16 map (current plan) mse {:.5}", eval_map(&mapper::E16_STARTS) / total);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_train_inner;
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn refuses_suboptimal_opt_without_experiment() {
+        for bad in [
+            vec!["--backend", "cuda", "--opt", "sfadamw", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--backend", "cuda", "--opt", "ranger", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--opt", "adamw", "--data", "d", "--val", "v", "--out", "o"],
+            vec!["--opt", "sfadamw", "--data", "d", "--val", "v", "--out", "o"],
+        ] {
+            let err = run_train_inner(&args(&bad)).expect_err("suboptimal --opt must be refused");
+            assert!(err.contains("--experiment"), "expected --experiment hint in: {err}");
+        }
+    }
 }

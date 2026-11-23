@@ -251,41 +251,38 @@ fn run_on<G: Gpu>(device: Arc<Device<G>>, c: GpuCfg) -> Result<(), String> {
     let mut weights = ModelWeights::new(&defn, c.seed);
     load_into(&mut weights, &base);
     let params = RangerParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 };
+    if let Some((muon_lr, mom)) = c.muon {
+        // D1181/D1262/D1629: mandatory default: Muon (NS5) on dense hidden matrices l1w/l2w + Schedule-Free AdamW on all
+        // other tensors, with Schedule-Free iterate averaging x across every tensor (validated and exported on x).
+        let (nb, l1, l2) = (base.buckets, base.l1, base.l2);
+        let din = base.l1_w.len() / (nb * l1).max(1);
+        let shapes = vec![
+            crate::gpumuon::MuonShape { name: "l1w".into(), size: nb * l1 * din, rows: l1, cols: din, buckets: nb },
+            crate::gpumuon::MuonShape { name: "l2w".into(), size: nb * l2 * l1, rows: l2, cols: l1, buckets: nb },
+        ];
+        for s in &shapes {
+            let same: Vec<String> = weights.iter().filter(|(_, v)| v.values.size() == s.size).map(|(id, _)| id.clone()).collect();
+            if same != vec![s.name.clone()] {
+                return Err(format!("--opt muon: tensor size {} of {} is not unique in the graph ({same:?})", s.size, s.name));
+            }
+        }
+        let reg = crate::gpusf::SfReg::<G>::default();
+        let sf = crate::gpusf::SfParams { reg: reg.clone(), ..Default::default() };
+        println!("[opt] MUON + SCHEDULE-FREE ADAMW (D1181/D1554/D1629): Muon lr {muon_lr} (momentum {mom}, Nesterov, NS5) on {nb} blocks of l1w {l1}x{din} & l2w {l2}x{l1}; Schedule-Free AdamW (beta1 {} beta2 {} eps {} decay {} clip +-{} lr {} constant after warmup {}) on every other tensor; iterate average x evaluated & exported across ALL tensors", sf.beta1, sf.beta2, sf.eps, sf.decay, sf.max_weight, c.lr, c.warmup);
+        let p = crate::gpumuon::MuonSfParams { sf, shapes, muon_lr, lr0: c.lr, mom };
+        let opt = Optimiser::<G, crate::gpumuon::MuonSfAdamW<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
+        return train_with(opt, c, base, mapper, Some(reg));
+    }
     if c.sf {
-        // D1554: Schedule-Free AdamW (Defazio et al. 2024) on every tensor; the averaged iterate x is validated and exported
+        // EXPERIMENTAL ONLY (--opt sfadamw --experiment): Schedule-Free AdamW without Muon
         let reg = crate::gpusf::SfReg::<G>::default();
         let p = crate::gpusf::SfParams { reg: reg.clone(), ..Default::default() };
-        println!("[opt] SCHEDULE-FREE ADAMW (D1554): beta1 {} beta2 {} eps {} decay {} clip +-{}; lr {} constant after warmup {} (no schedule); eval/export on the averaged iterate x", p.beta1, p.beta2, p.eps, p.decay, p.max_weight, c.lr, c.warmup);
+        println!("[opt] EXPERIMENT SCHEDULE-FREE ADAMW ONLY (NO MUON): beta1 {} beta2 {} eps {} decay {} clip +-{}; lr {} constant after warmup {} (no schedule); eval/export on the averaged iterate x", p.beta1, p.beta2, p.eps, p.decay, p.max_weight, c.lr, c.warmup);
         let opt = Optimiser::<G, crate::gpusf::SfAdamW<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
         return train_with(opt, c, base, mapper, Some(reg));
     }
-    match c.muon {
-        // default (no --opt): Ranger on every tensor, exactly as before D1181
-        None => {
-            let opt = Optimiser::<G, Ranger<G>>::new(defn, weights, device, params).map_err(|e| format!("{e:?}"))?;
-            train_with(opt, c, base, mapper, None)
-        }
-        Some((muon_lr, mom)) => {
-            // D1181: Muon on the dense hidden matrices, recognised by size (refused unless each size is unique)
-            let (nb, l1, l2) = (base.buckets, base.l1, base.l2);
-            let din = base.l1_w.len() / (nb * l1).max(1);
-            let shapes = vec![
-                crate::gpumuon::MuonShape { name: "l1w".into(), size: nb * l1 * din, rows: l1, cols: din, buckets: nb },
-                crate::gpumuon::MuonShape { name: "l2w".into(), size: nb * l2 * l1, rows: l2, cols: l1, buckets: nb },
-            ];
-            for s in &shapes {
-                let same: Vec<String> = weights.iter().filter(|(_, v)| v.values.size() == s.size).map(|(id, _)| id.clone()).collect();
-                if same != vec![s.name.clone()] {
-                    return Err(format!("--opt muon: tensor size {} of {} is not unique in the graph ({same:?})", s.size, s.name));
-                }
-            }
-            let adam = bullet_trainer::optimiser::adam::AdamWParams { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98 };
-            println!("[opt] MUON-ADAMW (D1181/D1262): Muon lr {muon_lr} (x the lr schedule factor), momentum {mom}, Nesterov, NS5 on {nb} blocks of l1w {l1}x{din} and l2w {l2}x{l1}; AdamW (beta1=0.9, beta2=0.999, decay=0.0, clip +-1.98) on every other tensor");
-            let p = crate::gpumuon::MuonRangerParams { adam, shapes, muon_lr, lr0: c.lr, mom };
-            let opt = Optimiser::<G, crate::gpumuon::MuonRanger<G>>::new(defn, weights, device, p).map_err(|e| format!("{e:?}"))?;
-            train_with(opt, c, base, mapper, None)
-        }
-    }
+    let opt = Optimiser::<G, Ranger<G>>::new(defn, weights, device, params).map_err(|e| format!("{e:?}"))?;
+    train_with(opt, c, base, mapper, None)
 }
 
 /// the training loop of `run_on`, generic over the optimiser state (Ranger by default, Muon + Ranger with --opt muon)
