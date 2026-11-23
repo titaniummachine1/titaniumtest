@@ -87,6 +87,36 @@ fn key(b: &Board) -> u64 {
     crate::gamedata::pos_key(b.me(), b.opp(), 0)
 }
 
+/// D1615: ONE Zataxx annotation per finished search, written to `STEM.zxlabels.tsv` and NOTHING else touched.
+///
+/// The solver is the stronger teacher (1 s in an endgame is millions of nodes against Titanium's 15,000), but its score
+/// is in Zataxx units with Zataxx's own (unproven) semantics, so it is stored raw, in a separate file, keyed by position:
+/// it is never written into `cp`/`cp5k`/`p3`, never weighted into the outcome, and never converted "by a constant".
+/// `kind` = `proof` (score is exact, |score| >= 31,000 = mate) or `drop` (budget spent, score is an estimate at `depth`).
+/// The move is scale-free: whichever side of the scale argument one takes, a winning move is a winning move.
+fn zx_label(f: &mut std::io::BufWriter<std::fs::File>, b: &Board, ply: u32, kind: &str, a: &Ans) -> Result<(), String> {
+    let code = b.parse_uai_move(&a.best).map(move_code).unwrap_or(0);
+    let stones = (b.occ[0] | b.occ[1]).count_ones();
+    writeln!(
+        f,
+        "{:016x}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{code}",
+        b.me(),
+        b.opp(),
+        key(b),
+        ply,
+        stones,
+        b.turn,
+        kind,
+        a.score,
+        a.depth,
+        a.nodes,
+        a.ms,
+        if a.best.is_empty() { "-" } else { a.best.as_str() }
+    )
+    .map_err(|e| format!("zxlabels: {e}"))?;
+    Ok(())
+}
+
 struct Ans {
     score: i32,
     proven: bool,
@@ -98,6 +128,8 @@ struct Ans {
     /// wall time of this search, and whether the queue stopped it (D1602)
     ms: u64,
     stopped: bool,
+    /// D1615: nodes Zataxx spent on this search (last completed iteration), for weighting its annotation
+    nodes: u64,
 }
 
 /// D206 calibrated early bail (zataxx-bz ZAX_ABORT, 0 of 625 proofs lost): a search not heading for a proof stops
@@ -159,7 +191,7 @@ impl Zx {
         self.wait_for("readyok")?;
         let t0 = std::time::Instant::now();
         self.send(&format!("go movetime {}\n", ms.max(20)))?;
-        let (mut a, mut run, mut line) = (Ans { score: 0, proven: false, best: String::new(), depth: 0, line: Vec::new(), ms: 0, stopped: false }, 0u32, String::new());
+        let (mut a, mut run, mut line) = (Ans { score: 0, proven: false, best: String::new(), depth: 0, line: Vec::new(), ms: 0, stopped: false, nodes: 0 }, 0u32, String::new());
         loop {
             line.clear();
             if self.out.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -186,6 +218,7 @@ impl Zx {
             let (Some(d), Some(s)) = (get("depth"), get("score")) else { continue };
             a.depth = d as u32;
             a.score = s as i32;
+            a.nodes = get("nodes").unwrap_or(a.nodes as i64) as u64;
             a.line = t.iter().position(|&x| x == "pv").map(|i| t[i + 1..].iter().map(|x| x.to_string()).collect()).unwrap_or_default();
             run = if a.score.abs() >= ZX_PROVEN { run + 1 } else { 0 };
             if !a.stopped && run < self.confirm && !go_on(a.depth, a.score, t0.elapsed().as_millis() as u64) {
@@ -230,6 +263,8 @@ struct Counts {
     lines_joined: AtomicU64,
     /// searches stopped at a completed depth because a waiting candidate promised more proofs per ms (D1602)
     switches: AtomicU64,
+    /// D1615: Zataxx annotations written (proven + dropped), STEM.zxlabels.tsv
+    zx_written: AtomicU64,
     positions_written: AtomicU64,
     covered_skips: AtomicU64,
     conflicts: AtomicU64,
@@ -541,6 +576,14 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         return Err(format!("{out}.tgam exists: refusing to overwrite it"));
     }
     let w = Mutex::new(crate::gen::BinOut::create(&out).map_err(|e| format!("{out}: {e}"))?);
+    // D1615: Zataxx's own annotation of every finished search, a separate file (never mixed into the row's cp)
+    let zl_path = format!("{out}.zxlabels.tsv");
+    let zl = Mutex::new({
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&zl_path).map_err(|e| format!("{zl_path}: {e}"))?);
+        writeln!(f, "occ0\tocc1\tkey\tply\tstones\tturn\tkind\tscore_zx\tdepth\tnodes\tms\tmove\tcode")
+            .map_err(|e| e.to_string())?;
+        f
+    });
     // position -> proven sign for its side to move (first proof wins; a later opposite proof is a conflict)
     let covered: Mutex<HashMap<u64, i8>> = Mutex::new(HashMap::new());
     let conflicts: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -622,6 +665,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     let r = z.prove_dyn(&ctx.moves[..i as usize], budget, false, &mut go_on).and_then(|a| {
                         if a.proven {
                             c.proven_roots.fetch_add(1, Relaxed);
+                            // D1615: the exact annotation first (score in Zataxx units, its own depth/nodes, its move)
+                            zx_label(&mut zl.lock().unwrap(), &b, i, "proof", &a)?;
+                            c.zx_written.fetch_add(1, Relaxed);
                             done_n.fetch_add(1, Relaxed);
                             play_out(&mut z, ctx, i as usize, a, max_ms, ci as usize, &c, &covered, &conflicts, &w)
                         } else if covered.lock().unwrap().contains_key(&k) {
@@ -637,7 +683,11 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                                 let cost = (reached_ms.max(1) as f64) * (EBF - 1.0);
                                 own.push(QItem { prio: rate(chance_zx(a.score.abs()), cost), cand: it.cand, used_ms: used as u32, reached_ms: reached_ms as u32 });
                             } else {
+                                // D1615: budget spent without a proof: the search is not wasted, its last completed
+                                // answer (score/depth/nodes/move) is kept as a Zataxx annotation
                                 c.dropped_budget.fetch_add(1, Relaxed);
+                                zx_label(&mut zl.lock().unwrap(), &b, i, "drop", &a)?;
+                                c.zx_written.fetch_add(1, Relaxed);
                                 done_n.fetch_add(1, Relaxed);
                             }
                             Ok(())
@@ -670,8 +720,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
     });
     let e = errs.into_inner().unwrap();
+    let _ = zl.lock().unwrap().flush();
     let rep = format!(
-        "proof-lines report ({:.0}s)\ngames {} (not from the start position, skipped: {}, replay errors: {})\ncandidate positions {}, searches started {} (switched away at a completed depth {}), skipped as already on a proof line {}, dropped at the per-position budget {}\nproven roots {}\nlines written {} (to the real end {}, proof stopped earlier {}), positions written {} (of them also on an earlier line {}: removed by games-tdat --dedup)\nDISCARDED: final count disagrees with the proof {}, proven sign flipped mid-line {}, illegal / unparsable move {}, repetition-banned move {}\nconflicting proofs for the same position {} (isolated: STEM.conflicts.tsv / .keys, the line not written)\nsearches inside lines {}, complete lines whose length != proven distance {}\nerrors: {}\n",
+        "proof-lines report ({:.0}s)\ngames {} (not from the start position, skipped: {}, replay errors: {})\ncandidate positions {}, searches started {} (switched away at a completed depth {}), skipped as already on a proof line {}, dropped at the per-position budget {}\nproven roots {}\nlines written {} (to the real end {}, proof stopped earlier {}), positions written {} (of them also on an earlier line {}: removed by games-tdat --dedup)\nDISCARDED: final count disagrees with the proof {}, proven sign flipped mid-line {}, illegal / unparsable move {}, repetition-banned move {}\nconflicting proofs for the same position {} (isolated: STEM.conflicts.tsv / .keys, the line not written)\nsearches inside lines {}, complete lines whose length != proven distance {}\nZataxx annotations {} -> STEM.zxlabels.tsv (its OWN score in Zataxx units, depth, nodes, its move; separate file, never blended into cp)\nerrors: {}\n",
         t0.elapsed().as_secs_f64(),
         c.games.load(Relaxed),
         c.not_startpos.load(Relaxed),
@@ -694,6 +745,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         c.conflicts.load(Relaxed),
         c.researches.load(Relaxed),
         c.dist_mismatch.load(Relaxed),
+        c.zx_written.load(Relaxed),
         if e.is_empty() { "none".to_string() } else { e.join(" | ") }
     );
     eprint!("{rep}");
