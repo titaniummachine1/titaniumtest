@@ -94,9 +94,10 @@ def sh(cmd):
     return r.returncode
 
 
-# GPU fallback list: L4 queues sometimes (2026-10-31: 6+ min); the net is tiny so any of them is enough. Memory: the whole
-# training .tdat (1.4 GB) lives in RAM (`--ram`), 16 GiB is plenty.
-@app.function(gpu=["L4", "T4", "A10G"], cpu=CPU, memory=16384, timeout=3 * 3600, volumes={"/vol": vol})
+# GPU fallback list (D1632): L4 is cheapest per position for --opt muon (~990k pos/s @ $0.96/h = $0.27/1B),
+# A10G is #2 (~1.01M pos/s @ $1.26/h = $0.35/1B). T4 is excluded (~497k pos/s = $0.42/1B, 2x slower & +55% cost).
+# Memory: the whole training .tdat (~2.88 GB) lives in RAM (`--ram`), 16 GiB is plenty.
+@app.function(gpu=["L4", "A10G"], cpu=CPU, memory=16384, timeout=3 * 3600, volumes={"/vol": vol})
 def run(tag: str, args: str, timeout_min: int = 30) -> int:
     """Run `ti <args>` under a hard `timeout`; outputs belong in /vol/runs/<tag> (the caller puts --out there)."""
     sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; nproc")

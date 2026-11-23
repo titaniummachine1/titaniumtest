@@ -372,6 +372,26 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
     let mut best = f64::MAX;
     let mut last: Option<String> = None;
     let mut ema_net: Option<TrainableNet> = None;
+    if c.resume {
+        if let Ok(b) = std::fs::read(format!("{out}/best.tnn")) {
+            if let Ok(bn) = TrainableNet::from_tnn_bytes(&b) {
+                best = trainer::evaluate(&bn, &val, threads).mse;
+                ema_net = Some(bn);
+                println!("[resume] preserved best.tnn baseline val mse {best:.6}");
+            }
+        }
+        if let Ok(es) = std::fs::read_to_string(format!("{out}/eval_state.txt")) {
+            let mut it = es.split_whitespace();
+            if let Some(bv) = it.next().and_then(|s| s.parse::<f64>().ok()) {
+                best = best.min(bv);
+            }
+            batches_flat = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            flat_epochs_done = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            since_best = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            drops = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("[resume] eval_state: best {best:.6}, batches_flat {batches_flat}, flat_epochs {flat_epochs_done}");
+        }
+    }
     // fixed probe of TRAINING rows (same size as val): val - train gap = overfit signal
     let probe = {
         let mut t = trainer::Tdat::open(&c.data)?;
@@ -440,10 +460,6 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
         } else {
             since_best += 1;
         }
-        let _ = std::fs::create_dir_all(&ckpt);
-        if o.write_to_checkpoint(&ckpt).is_ok() {
-            let _ = std::fs::write(format!("{out}/gpu_state.txt"), format!("{sbn}"));
-        }
         if guard > 0.0 && v.mse > init_mse * guard as f64 {
             let msg = format!("GUARD TRIPPED at superbatch {sbn}: live val mse {:.6} > {:.2} x init {:.6}. Run aborted to save money (Mistake 39: lower the LR / check the data).", v.mse, guard, init_mse);
             eprintln!("{msg}");
@@ -469,6 +485,11 @@ fn train_with<G: Gpu, S: bullet_trainer::optimiser::OptimiserState<G>>(mut opt: 
                 flat_epochs_done = flat_epochs;
                 println!("[epoch rule] {flat_epochs} epoch(s) of data without a val gain >= {min_delta:e} (val {pick_mse:.6}, best {best:.6}); stop at 4");
             }
+        }
+        let _ = std::fs::create_dir_all(&ckpt);
+        if o.write_to_checkpoint(&ckpt).is_ok() {
+            let _ = std::fs::write(format!("{out}/gpu_state.txt"), format!("{sbn}"));
+            let _ = std::fs::write(format!("{out}/eval_state.txt"), format!("{best:.12} {batches_flat} {flat_epochs_done} {since_best} {drops}"));
         }
         // reduce-on-plateau: `plateau` checkpoints without a val gain -> lr x factor; after `max_drops` drops that still do not
         // help, stop (best.tnn keeps the best weights)
