@@ -270,7 +270,7 @@ struct Counts {
     conflicts: AtomicU64,
 }
 
-fn list_tgams(spec: &str) -> Result<Vec<String>, String> {
+pub fn list_tgams(spec: &str) -> Result<Vec<String>, String> {
     let mut v = Vec::new();
     for p in spec.split(',').filter(|s| !s.is_empty()) {
         let path = std::path::Path::new(p);

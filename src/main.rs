@@ -41,6 +41,7 @@ mod policy;
 mod policy2;
 mod ordfit;
 mod proofline; // D1590-D1596: Botzone-exact proof lines (Zataxx with the whole game history, lines played out)
+mod ltc; // D1618: Titanium 1-second LTC labels for positions without a proof (separate file, cp is never touched)
 mod smallnet;
 mod snarch;
 mod bzupload;
@@ -85,6 +86,13 @@ fn main() -> ExitCode {
         "policy2" => policy2::run(&args[1..]),
         "ordfit" => ordfit::run(&args[1..]),
         "proof-lines" => proofline::run(&args[1..]),
+        "ltc" => match ltc::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         "policy-rl" => policy2::run_rl(&args[1..]),
         "botzone-upload" => bzupload::run(&args[1..]),
         "botzone" => botzone::run_botzone(&args[1..]),
