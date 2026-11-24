@@ -888,6 +888,20 @@ fn parse_uai_move(b: &Board, text: &str) -> Option<Move> {
     None
 }
 
+/// Per-iteration snapshot recorded from `info depth ...` lines before `bestmove` (`D1668`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IterThought {
+    pub depth: u32,
+    pub score: Option<i32>,
+    pub mate: Option<i32>,
+    pub nodes: u64,
+    pub ms: u64,
+    pub rfh: u8,
+    pub mirage: bool,
+    pub pv0: String,
+    pub pv1: String,
+}
+
 /// What the engine reported for one move: score from the MOVER's view (cp, or `mate` in moves when proven:
 /// + = mover mates, - = mover is mated; `score` is then None), depth,
 /// nodes, wall time measured by the hub, principal variation. External engines: the last `info ... score`
@@ -900,6 +914,7 @@ pub struct Thought {
     pub nodes: Option<u64>,
     pub ms: u64,
     pub pv: String,
+    pub iters: Vec<IterThought>,
 }
 
 /// One played move with the mover's thought.
@@ -915,10 +930,16 @@ pub struct MoveRec {
 fn parse_info(line: &str, t: &mut Thought) {
     let tok: Vec<&str> = line.split_whitespace().collect();
     let mut i = 0;
+    let mut it_ms: u64 = 0;
+    let mut it_rfh: u8 = 0;
+    let mut it_mir = false;
     while i < tok.len() {
         match tok[i] {
             "depth" => t.depth = tok.get(i + 1).and_then(|v| v.parse().ok()),
             "nodes" => t.nodes = tok.get(i + 1).and_then(|v| v.parse().ok()),
+            "time" => it_ms = tok.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+            "rfh" => it_rfh = tok.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+            "mir" => it_mir = tok.get(i + 1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) > 0,
             "score" => match tok.get(i + 1).copied() {
                 Some("cp") => {
                     t.score = tok.get(i + 2).and_then(|v| v.parse().ok());
@@ -938,6 +959,27 @@ fn parse_info(line: &str, t: &mut Thought) {
             _ => {}
         }
         i += 1;
+    }
+    if let Some(d) = t.depth {
+        let mut pv_toks = t.pv.split_whitespace();
+        let pv0 = pv_toks.next().unwrap_or("").to_string();
+        let pv1 = pv_toks.next().unwrap_or("").to_string();
+        let snap = IterThought {
+            depth: d,
+            score: t.score,
+            mate: t.mate,
+            nodes: t.nodes.unwrap_or(0),
+            ms: it_ms,
+            rfh: it_rfh,
+            mirage: it_mir,
+            pv0,
+            pv1,
+        };
+        if let Some(last) = t.iters.last_mut().filter(|prev| prev.depth == d) {
+            *last = snap;
+        } else {
+            t.iters.push(snap);
+        }
     }
 }
 
@@ -960,13 +1002,42 @@ fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
     v.as_ref().map(|x| x.to_string()).unwrap_or_else(|| "null".into())
 }
 
+fn fmt_iters(iters: &[IterThought]) -> String {
+    let mut out = String::new();
+    for (idx, it) in iters.iter().enumerate() {
+        if idx > 0 {
+            out.push(';');
+        }
+        let sc = it
+            .mate
+            .map(|m| format!("m{m}"))
+            .or_else(|| it.score.map(|s| s.to_string()))
+            .unwrap_or_default();
+        let mir = if it.mirage { "!" } else { "" };
+        if it.pv1.is_empty() {
+            out.push_str(&format!("{}:{sc}:{}:{}:{}{mir}:{}", it.depth, it.nodes, it.ms, it.rfh, it.pv0));
+        } else {
+            out.push_str(&format!(
+                "{}:{sc}:{}:{}:{}{mir}:{} {}",
+                it.depth, it.nodes, it.ms, it.rfh, it.pv0, it.pv1
+            ));
+        }
+    }
+    out
+}
+
 /// One JSON line per game: everything needed to replay it and to see what each engine thought on every move.
 fn game_json(pair: usize, book_idx: usize, start: &Board, cand_seat: &str, pts_x2: u8, bl: u32, wh: u32, moves: &[MoveRec]) -> String {
     let mv: Vec<String> = moves
         .iter()
         .map(|m| {
+            let it_field = if m.thought.iters.is_empty() {
+                String::new()
+            } else {
+                format!(",\"it\":{}", json_str(&fmt_iters(&m.thought.iters)))
+            };
             format!(
-                "{{\"ply\":{},\"side\":\"{}\",\"mover\":\"{}\",\"move\":{},\"score\":{},\"mate\":{},\"depth\":{},\"nodes\":{},\"ms\":{},\"pv\":{}}}",
+                "{{\"ply\":{},\"side\":\"{}\",\"mover\":\"{}\",\"move\":{},\"score\":{},\"mate\":{},\"depth\":{},\"nodes\":{},\"ms\":{},\"pv\":{}{}}}",
                 m.ply,
                 if m.side == 0 { "x" } else { "o" },
                 m.mover,
@@ -976,7 +1047,8 @@ fn game_json(pair: usize, book_idx: usize, start: &Board, cand_seat: &str, pts_x
                 opt(&m.thought.depth),
                 opt(&m.thought.nodes),
                 m.thought.ms,
-                json_str(&m.thought.pv)
+                json_str(&m.thought.pv),
+                it_field,
             )
         })
         .collect();
@@ -1042,6 +1114,7 @@ impl PlayerSlot {
                     nodes: Some(r.nodes),
                     ms: r.elapsed.as_millis() as u64,
                     pv: String::new(),
+                    iters: Vec::new(),
                 };
                 Ok((r.best, t))
             }
@@ -2230,19 +2303,35 @@ mod thought_tests {
     #[test]
     fn parses_cp_and_mate_info_lines() {
         let mut t = Thought::default();
-        parse_info("info depth 9 seldepth 12 score cp -37 nodes 5000 time 41 pv b6 a2 f2", &mut t);
+        parse_info("info depth 5 score cp 10 nodes 400 time 2 rfh 0 pv b6 a2", &mut t);
+        parse_info("info depth 9 seldepth 12 score cp -37 nodes 5000 time 41 rfh 2 mir 1 pv b6 a2 f2", &mut t);
         assert_eq!((t.depth, t.score, t.mate, t.nodes), (Some(9), Some(-37), None, Some(5000)));
         assert_eq!(t.pv, "b6 a2 f2");
-        parse_info("info depth 20 score mate -3 nodes 900 pv c3", &mut t);
+        assert_eq!(t.iters.len(), 2);
+        assert_eq!((t.iters[1].rfh, t.iters[1].mirage, t.iters[1].pv0.as_str(), t.iters[1].pv1.as_str()), (2, true, "b6", "a2"));
+        parse_info("info depth 20 score mate -3 nodes 900 time 42 rfh 0 pv c3", &mut t);
         assert_eq!((t.score, t.mate), (None, Some(-3)));
+        assert_eq!(t.iters.len(), 3);
     }
 
     #[test]
     fn game_json_is_one_valid_line() {
-        let m = MoveRec { ply: 0, side: 0, mover: "candidate", mv: "b6".into(), thought: Thought { score: Some(12), mate: None, depth: Some(5), nodes: Some(2000), ms: 3, pv: "b6 \"x\"".into() } };
+        let mut t = Thought {
+            score: Some(12),
+            mate: None,
+            depth: Some(5),
+            nodes: Some(2000),
+            ms: 3,
+            pv: "b6 \"x\"".into(),
+            iters: Vec::new(),
+        };
+        parse_info("info depth 5 score cp 12 nodes 2000 time 3 rfh 1 pv b6 f6", &mut t);
+        t.pv = "b6 \"x\"".into();
+        let m = MoveRec { ply: 0, side: 0, mover: "candidate", mv: "b6".into(), thought: t };
         let j = game_json(0, 7, &Board::start(), "x", 2, 30, 19, &[m]);
         assert!(!j.contains('\n'));
         assert!(j.contains("\"book\":7") && j.contains("\"score\":12") && j.contains("\"mate\":null") && j.contains("\\\"x\\\""));
+        assert!(j.contains("\"it\":\"5:12:2000:3:1:b6 f6\""));
     }
 
     #[test]
