@@ -219,8 +219,12 @@ fn go(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     eprintln!("setting keep-running ...");
+    // D1679: never touch the bot's public description or open-source flag on upload.
+    // The bot page must keep showing "Titanium Ataxx: Rust engine (persistent)
+    // https://github.com/titaniummachine1/titanium-ataxx" with source viewable.
+    // Only keep-running + simpleio are the upload's business.
     let m = curl(
-        &format!("url = \"{BASE}/mybots/modify\"\ndata = \"botid={BOT_ID}&enable_keep_running=true&simpleio=true&opensource=false&description=Titanium+Ataxx%3A+Python+driver+%2B+Rust+engine+%28persistent%29\"\n"),
+        &format!("url = \"{BASE}/mybots/modify\"\ndata = \"botid={BOT_ID}&enable_keep_running=true&simpleio=true&opensource=true&description=Titanium+Ataxx%3A+Rust+engine+%28persistent%29+https%3A%2F%2Fgithub.com%2Ftitaniummachine1%2Ftitanium-ataxx\"\n"),
         &["-b", &jar_s],
         false,
     )?;
@@ -229,7 +233,7 @@ fn go(args: &[String]) -> Result<(), String> {
     let py_form = py_path.display().to_string().replace('\\', "/");
     let r = curl(
         &format!(
-            "url = \"{BASE}/mybots/create\"\nform = \"id={BOT_ID}\"\nform = \"name={BOT_NAME}\"\nform = \"game={GAME_ID}\"\nform = \"extension=py36\"\nform = \"simpleio=true\"\nform = \"enable_keep_running=true\"\nform = \"opensource=false\"\nform = \"description={desc}\"\nform = \"source=@{py_form};type=text/x-python;filename=titanium_botzone.py\"\n"
+            "url = \"{BASE}/mybots/create\"\nform = \"id={BOT_ID}\"\nform = \"name={BOT_NAME}\"\nform = \"game={GAME_ID}\"\nform = \"extension=py36\"\nform = \"simpleio=true\"\nform = \"enable_keep_running=true\"\nform = \"opensource=true\"\nform = \"description={desc}\"\nform = \"source=@{py_form};type=text/x-python;filename=titanium_botzone.py\"\n"
         ),
         &["-b", &jar_s],
         false,
